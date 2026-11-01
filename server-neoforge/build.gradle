@@ -3,7 +3,7 @@ plugins {
     id 'net.neoforged.moddev' version '2.0.148'
 }
 group = 'dev.minecraftsdk'
-version = '0.1.0-alpha.1'
+version = '0.1.0-alpha.2'
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 repositories { mavenCentral() }
 neoForge {
@@ -12,5 +12,8 @@ neoForge {
     runs { server { server(); programArgument '--nogui'; gameDirectory = file('run') } }
 }
 tasks.withType(JavaCompile).configureEach { options.encoding='UTF-8' }
-tasks.named('processResources') { filesMatching('META-INF/neoforge.mods.toml') { expand(mod_version:project.version) } }
+tasks.named('processResources') {
+    inputs.property 'mod_version', project.version
+    filesMatching('META-INF/neoforge.mods.toml') { expand(mod_version:project.version) }
+}
 tasks.named('jar') { from('../LICENSE') }
