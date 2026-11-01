@@ -1,0 +1,10 @@
+**/.git
+.state
+target
+server-neoforge
+**/build
+**/.gradle
+**/run
+*.key
+*.token
+*.sqlite*

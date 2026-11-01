@@ -1,0 +1,9 @@
+/target/
+/.state/
+*.sqlite*
+*.key
+*.token
+**/build/
+**/.gradle/
+**/run/
+.env

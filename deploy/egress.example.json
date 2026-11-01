@@ -1,0 +1,5 @@
+{
+  "listen": "0.0.0.0:8080",
+  "allow": ["your-sdk.example:443", "index.crates.io:443", "static.crates.io:443"],
+  "sdk_exception": null
+}

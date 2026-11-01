@@ -1,0 +1,19 @@
+[package]
+name = "minecraft-sdk-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minecraft SDK CLI and gameplay-only stdio MCP server"
+
+[[bin]]
+name = "mc-sdk"
+path = "src/main.rs"
+
+[dependencies]
+minecraft-sdk.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tokio.workspace = true
+libc = "0.2"

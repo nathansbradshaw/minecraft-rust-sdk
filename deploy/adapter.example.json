@@ -1,0 +1,5 @@
+{
+  "backend": "127.0.0.1:25565",
+  "native_endpoint": "http://127.0.0.1:19135/",
+  "native_token": "/srv/minecraft/server/minecraft-sdk/native.token"
+}
