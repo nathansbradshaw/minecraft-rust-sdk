@@ -55,6 +55,22 @@ fn load(path: &Path) -> std::result::Result<Profile, Box<dyn std::error::Error>>
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("import-profile") && args.len() == 5 {
+        Client::new(&args[1])?;
+        let info: ServerInfo = serde_json::from_slice(&std::fs::read(&args[2])?)?;
+        let response: Value = serde_json::from_slice(&std::fs::read(&args[3])?)?;
+        let credential: Credential =
+            serde_json::from_value(response.get("ok").cloned().unwrap_or(response))?;
+        let profile = Profile {
+            endpoint: args[1].clone(),
+            instance_id: info.instance_id,
+            credential,
+            session: None,
+        };
+        save(Path::new(&args[4]), &profile, true)?;
+        println!("Private profile saved for {}", profile.credential.bot_id);
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("discover") && args.len() == 2 {
         println!(
             "{}",

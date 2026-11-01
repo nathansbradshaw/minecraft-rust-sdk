@@ -5,8 +5,7 @@ integration for coding agents. Bot programs run on their author's compute;
 operators do not execute public users' code.
 
 **Development alpha.** Java 1.21.1 / NeoForge 21.1.233 is the first adapter.
-The v0.1 acceptance gates in [docs/acceptance.md](docs/acceptance.md) must pass
-before a stable release or unrestricted public endpoint is announced.
+See [docs/acceptance.md](docs/acceptance.md) for observed release checks and limits.
 Vanilla without the integration, Paper, Fabric and Bedrock are not supported.
 
 The core contracts contain no server address, block/item catalogs, bot strategies,
@@ -63,7 +62,8 @@ reconciliation. Code editing/execution uses the agent's container terminal.
 
 ## Gameplay and receipts
 
-Actions cover bounded level movement, looking, jumping, sprint/sneak, staged
+Actions cover collision-limited walking, short drops, explicit jumping movement,
+looking, sprint/sneak, staged
 mining, block use/placement, held item use, entity interaction/combat, hotbar
 selection, menu/inventory clicks (including equipment), recipe placement, chat,
 own-player commands and respawn. Runtime recipe/block/item IDs remain namespaced
@@ -92,6 +92,8 @@ it does not impose a Survival strategy.
 ## Operator security
 
 See [runner setup](docs/runner-admin-setup.md) and [architecture](docs/architecture.md).
+The [operator installation guide](docs/operator-setup.md) covers deployment,
+key recovery, existing-character imports and editable workspaces.
 The gateway and native credentials belong outside coding containers. Put the
 loopback gateway behind a TLS proxy. Never expose port 19135 or its native token.
 Install plugins as an operator; capability manifests and bot requests cannot

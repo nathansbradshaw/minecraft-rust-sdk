@@ -8,6 +8,7 @@ use tokio::{
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    Inspect,
     ImportLegacy {
         label: String,
         player_uuid: String,
@@ -107,6 +108,7 @@ pub async fn serve(gateway: Shared, server: OperatorListener) -> std::io::Result
 }
 async fn execute(g: &Shared, request: Request) -> Result<serde_json::Value> {
     match request {
+        Request::Inspect => g.db()?.operator_summary(),
         Request::ImportLegacy {
             label,
             player_uuid,

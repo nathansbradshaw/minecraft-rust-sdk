@@ -158,6 +158,7 @@ async fn main() -> AnyResult<()> {
                         z: f64::from(block.z) + 0.5,
                     },
                     on_ground: false,
+                    jump: false,
                 })
                 .await?;
             tokio::time::sleep(Duration::from_millis(600)).await;
@@ -169,6 +170,7 @@ async fn main() -> AnyResult<()> {
                         z: position[2].as_f64().unwrap(),
                     },
                     on_ground: false,
+                    jump: false,
                 })
                 .await?;
         }

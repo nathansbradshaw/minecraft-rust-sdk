@@ -17,6 +17,7 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo run --locked -p minecraft-sdk-xtask -- .
+      - run: cargo run --locked -p minecraft-sdk-xtask -- --licenses target/dependency-licenses
   neoforge:
     runs-on: ubuntu-latest
     steps:

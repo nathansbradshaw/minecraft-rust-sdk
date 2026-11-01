@@ -347,6 +347,8 @@ fn launch(config: Launch) -> Result<()> {
             "64",
             "--memory",
             "128m",
+            "--memory-swap",
+            "128m",
             "--cpus",
             "0.25",
             "--log-opt",

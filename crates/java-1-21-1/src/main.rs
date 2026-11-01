@@ -1,4 +1,5 @@
 use minecraft_sdk_core::*;
+mod chat;
 use minecraft_sdk_java_1_21_1::{Wire, encode_signed_varint as vi};
 use minecraft_sdk_wire::{decode_string_prefix, decode_varint_prefix, encode_string as text};
 use serde::Deserialize;
@@ -135,6 +136,7 @@ struct Player {
     alive: Arc<AtomicBool>,
     tables: Tables,
     sequence: i32,
+    chat: Arc<Mutex<chat::ChatState>>,
 }
 impl Drop for Player {
     fn drop(&mut self) {
@@ -250,12 +252,28 @@ fn connect(
         let writer = wire.clone();
         let reader_alive = alive.clone();
         let reader_tables = tables.clone();
+        let chat = Arc::new(Mutex::new(chat::ChatState::default()));
+        let reader_chat = chat.clone();
         thread::spawn(move || {
             let mut reader = Wire::new(stream);
             let _ = reader.set_compression(compression.map(|n| n as i32));
             while reader_alive.load(Ordering::Acquire) {
                 let result = (|| -> AnyResult<()> {
                     let packet = reader.receive()?;
+                    if reader_tables.name("play", packet.id) == "player_chat" {
+                        let mut chat = reader_chat.lock().map_err(|_| "Chat state unavailable")?;
+                        if let Some(count) = chat.receive(&packet.payload)? {
+                            let mut writer =
+                                writer.lock().map_err(|_| "Player writer unavailable")?;
+                            reader_tables.send(
+                                &mut writer,
+                                "play",
+                                "message_acknowledgement",
+                                &vi(count),
+                            )?;
+                        }
+                        return Ok(());
+                    }
                     let mut writer = writer.lock().map_err(|_| "Player writer unavailable")?;
                     match reader_tables.name("play", packet.id) {
                         "keep_alive" => reader_tables.send(
@@ -313,6 +331,7 @@ fn connect(
             alive,
             tables,
             sequence: 0,
+            chat,
         })
     };
     run().map_err(|e| {
@@ -442,12 +461,13 @@ impl Player {
         if !self.alive.load(Ordering::Acquire) {
             return Err("Player connection closed".into());
         }
-        self.tables.send(
-            &mut *self.wire.lock().map_err(|_| "Player writer unavailable")?,
-            "play",
-            name,
-            body,
-        )
+        let mut wire = self.wire.lock().map_err(|_| "Player writer unavailable")?;
+        let result = self.tables.send(&mut wire, "play", name, body);
+        if result.is_err() {
+            self.alive.store(false, Ordering::Release);
+            let _ = wire.connection().shutdown(std::net::Shutdown::Both);
+        }
+        result
     }
     fn action(&mut self, action: &Action, before: &Observation) -> AnyResult<()> {
         let entity = before.player["entity_id"]
@@ -459,8 +479,8 @@ impl Player {
             .checked_add(1)
             .ok_or("Sequence exhausted; reconnect")?;
         let name = match action {
-            Action::Move { target, .. } => {
-                for (p, ground) in motion_plan(before, [target.x, target.y, target.z], false)? {
+            Action::Move { target, jump, .. } => {
+                for (p, ground) in motion_plan(before, [target.x, target.y, target.z], *jump)? {
                     let mut bytes = Vec::new();
                     for v in p {
                         bytes.extend(v.to_be_bytes());
@@ -529,6 +549,12 @@ impl Player {
                 "block_dig"
             }
             Action::Place {
+                block: pos,
+                face,
+                hand: h,
+                hit,
+            }
+            | Action::UseBlock {
                 block: pos,
                 face,
                 hand: h,
@@ -615,9 +641,12 @@ impl Player {
                 );
                 body.extend(0i64.to_be_bytes());
                 body.push(0);
-                body.extend(vi(0));
-                body.extend([0, 0, 0]);
-                "chat_message"
+                let mut chat = self.chat.lock().map_err(|_| "Chat state unavailable")?;
+                body.extend(vi(chat.pending));
+                body.extend(chat.bits());
+                self.send("chat_message", &body)?;
+                chat.pending = 0;
+                return Ok(());
             }
             Action::Command { command } => {
                 body.extend(text(command)?);
@@ -643,7 +672,8 @@ fn motion_plan(
     let start = position(observation)?;
     if (target[0] - start[0]).abs() > 3.5
         || (target[2] - start[2]).abs() > 3.5
-        || (target[1] - start[1]).abs() > 1.25
+        || target[1] - start[1] > 1.25
+        || start[1] - target[1] > 3.
     {
         return Err("Waypoint exceeds observed terrain".into());
     }
@@ -800,6 +830,7 @@ fn dispatch(
                     "minecraft:movement",
                     "minecraft:mining",
                     "minecraft:placement",
+                    "minecraft:block_use",
                     "minecraft:item_use",
                     "minecraft:entities",
                     "minecraft:inventory",
@@ -811,7 +842,7 @@ fn dispatch(
                 .into_iter()
                 .map(String::from)
                 .collect(),
-                limits: json!({"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"observation_radius":4}),
+                limits: json!({"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4}),
             })),
             AdapterOperation::Connect => {
                 if players.contains_key(&request.bot_id) {
@@ -828,11 +859,24 @@ fn dispatch(
                 players.remove(&request.bot_id);
                 Ok(AdapterResponse::Disconnected)
             }
-            AdapterOperation::Observe => Ok(AdapterResponse::Observation(
-                native.observe(&request.player_uuid).map_err(|_| {
+            AdapterOperation::Observe => {
+                let mut observation = native.observe(&request.player_uuid).map_err(|_| {
                     ApiError::new(ErrorCode::NotReady, "Native observation unavailable")
-                })?,
-            )),
+                })?;
+                if let Some(player) = players.get(&request.bot_id) {
+                    observation.world["chat"] = json!(
+                        player
+                            .chat
+                            .lock()
+                            .map_err(|_| ApiError::new(
+                                ErrorCode::Internal,
+                                "Chat observation unavailable"
+                            ))?
+                            .messages
+                    );
+                }
+                Ok(AdapterResponse::Observation(observation))
+            }
             AdapterOperation::Action { request: action } => {
                 action.action.validate()?;
                 let player = players.get_mut(&request.bot_id).ok_or_else(|| {
@@ -852,6 +896,72 @@ fn dispatch(
                         "Character is dead; explicitly respawn before acting",
                     ));
                 }
+                match &action.action {
+                    Action::Move { target, jump, .. } => {
+                        if *jump && before.player["on_ground"] != true {
+                            return Err(ApiError::new(
+                                ErrorCode::Conflict,
+                                "Jumping movement requires observed ground support",
+                            ));
+                        }
+                        motion_plan(&before, [target.x, target.y, target.z], *jump).map_err(
+                            |_| {
+                                ApiError::new(
+                                    ErrorCode::InvalidRequest,
+                                    "No supported collision-safe trajectory reaches this waypoint",
+                                )
+                            },
+                        )?;
+                    }
+                    Action::Jump => {
+                        if before.player["on_ground"] != true {
+                            return Err(ApiError::new(
+                                ErrorCode::Conflict,
+                                "Jump requires observed ground support",
+                            ));
+                        }
+                        motion_plan(
+                            &before,
+                            position(&before).map_err(|_| {
+                                ApiError::new(ErrorCode::NotReady, "Player position unavailable")
+                            })?,
+                            true,
+                        )
+                        .map_err(|_| {
+                            ApiError::new(ErrorCode::InvalidRequest, "No supported jump trajectory")
+                        })?;
+                    }
+                    Action::Dig { block, .. }
+                    | Action::Place { block, .. }
+                    | Action::UseBlock { block, .. } => {
+                        if !(-30_000_000..=30_000_000).contains(&block.x)
+                            || !(-30_000_000..=30_000_000).contains(&block.z)
+                            || !(-2048..=2047).contains(&block.y)
+                        {
+                            return Err(ApiError::new(
+                                ErrorCode::InvalidRequest,
+                                "Block coordinates exceed the Java 767 wire range",
+                            ));
+                        }
+                    }
+                    Action::Extension { .. } => {
+                        return Err(ApiError::new(
+                            ErrorCode::UnsupportedCapability,
+                            "No operator-installed adapter implements this extension",
+                        ));
+                    }
+                    Action::ClickSlot {
+                        menu_id, state_id, ..
+                    } if before.menu["menu_id"] != *menu_id
+                        || before.menu["state_id"] != *state_id =>
+                    {
+                        return Err(ApiError::new(
+                            ErrorCode::Conflict,
+                            "Menu revision changed; observe again",
+                        ));
+                    }
+                    _ => {}
+                }
                 // A send failure may be partial. Never return a definite rejection after entering dispatch.
                 let sent = player.action(&action.action, &before);
                 thread::sleep(Duration::from_millis(150));
@@ -868,7 +978,7 @@ fn dispatch(
                         Outcome::Uncertain
                     },
                     adapter_version: VERSION.into(),
-                    evidence: json!({"before":before,"after":after,"dispatch_completed":sent.is_ok(),"native_effect_verified":verified}),
+                    evidence: json!({"before":compact(&action.action,&before),"after":after.as_ref().map(|o|compact(&action.action,o)),"dispatch_completed":sent.is_ok(),"native_effect_verified":verified}),
                     error: if verified {
                         None
                     } else {
@@ -965,6 +1075,11 @@ fn verified_effect(action: &Action, before: &Observation, after: &Observation) -
             block_state(before, &adjacent)
                 .zip(block_state(after, &adjacent))
                 .is_some_and(|(b, a)| b != a)
+        }
+        Action::UseBlock { block, .. } => {
+            block_state(before, block)
+                .zip(block_state(after, block))
+                .is_some_and(|(b, a)| b != a)
                 || (before.menu["menu_id"] != after.menu["menu_id"] && after.menu["menu_id"] != 0)
         }
         Action::ClickSlot { slot, .. } => {
@@ -1005,4 +1120,72 @@ fn block_state<'a>(observation: &'a Observation, pos: &BlockPos) -> Option<&'a V
         .iter()
         .find(|b| b["position"] == json!([pos.x, pos.y, pos.z]))
         .map(|b| &b["state"])
+}
+fn compact(action: &Action, o: &Observation) -> Value {
+    let positions = match action {
+        Action::Dig { block, .. } | Action::UseBlock { block, .. } => {
+            vec![[block.x, block.y, block.z]]
+        }
+        Action::Place { block, face, .. } => {
+            let mut p = [block.x, block.y, block.z];
+            match face {
+                0 => p[1] -= 1,
+                1 => p[1] += 1,
+                2 => p[2] -= 1,
+                3 => p[2] += 1,
+                4 => p[0] -= 1,
+                5 => p[0] += 1,
+                _ => {}
+            }
+            vec![[block.x, block.y, block.z], p]
+        }
+        _ => Vec::new(),
+    };
+    let blocks: Vec<_> = o.world["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| positions.iter().any(|p| b["position"] == json!(p)))
+        .cloned()
+        .collect();
+    json!({"revision":o.revision,"player":o.player,"menu":o.menu,"world":{"game_time":o.world["game_time"],"day_time":o.world["day_time"],"blocks":blocks}})
+}
+
+#[cfg(test)]
+mod movement_tests {
+    use super::*;
+    #[test]
+    fn explicit_jump_crosses_a_gap_while_grounded_walk_refuses_it() {
+        let observation = Observation {
+            revision: "fixture".into(),
+            player: json!({"position":[0.5,1.,0.5]}),
+            world: json!({"blocks":[
+                {"position":[0,0,0],"collision":[[0.,0.,0.,1.,1.,1.]]},
+                {"position":[2,0,0],"collision":[[0.,0.,0.,1.,1.,1.]]}
+            ]}),
+            menu: Value::Null,
+        };
+        assert!(motion_plan(&observation, [2.5, 1., 0.5], false).is_err());
+        let frames = motion_plan(&observation, [2.5, 1., 0.5], true).unwrap();
+        assert!(frames.iter().any(|(p, _)| p[1] > 2.));
+        assert!(frames.last().unwrap().1);
+    }
+    #[test]
+    fn short_drop_lands_on_observed_support_and_deeper_drop_is_refused() {
+        let observation = Observation {
+            revision: "fixture".into(),
+            player: json!({"position":[0.5,4.,0.5]}),
+            world: json!({"blocks":[
+                {"position":[0,3,0],"collision":[[0.,0.,0.,1.,1.,1.]]},
+                {"position":[1,0,0],"collision":[[0.,0.,0.,1.,1.,1.]]}
+            ]}),
+            menu: Value::Null,
+        };
+        let frames = motion_plan(&observation, [1.5, 1., 0.5], false).unwrap();
+        let (last, grounded) = frames.last().unwrap();
+        assert!(*grounded);
+        assert!((last[1] - 1.).abs() < 1e-8);
+        assert!(frames.iter().all(|(p, _)| p[1] >= 1.));
+        assert!(motion_plan(&observation, [1.5, 0., 0.5], false).is_err());
+    }
 }

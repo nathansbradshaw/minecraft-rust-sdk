@@ -1,5 +1,6 @@
 //! Source-only publication audit, independent of the private parent history.
 use sha2::{Digest, Sha256};
+mod licenses;
 use std::{collections::HashSet, path::Path, process::Command};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -40,7 +41,10 @@ fn allowed(path: &str) -> bool {
         return path.ends_with(".md");
     }
     if path.starts_with("examples/") {
-        return path.ends_with(".rs");
+        return path.ends_with(".rs")
+            || path == "examples/coding-bot/Cargo.toml"
+            || path == "examples/coding-bot/Cargo.lock"
+            || path == "examples/coding-bot/README.md";
     }
     if path.starts_with("licenses/") {
         return path.ends_with(".txt");
@@ -154,10 +158,20 @@ fn audit(root: &Path) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
-    let root = std::env::args_os()
-        .nth(1)
-        .ok_or("Pass the standalone repository path")?;
-    audit(Path::new(&root))
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--licenses") {
+        return licenses::collect(Path::new(
+            args.get(1).ok_or("License output directory required")?,
+        ));
+    }
+    let root = if args.len() == 2 && !Path::new(&args[0]).is_dir() {
+        std::env::current_dir()?
+    } else {
+        args.first()
+            .map(std::path::PathBuf::from)
+            .ok_or("Pass the standalone repository path")?
+    };
+    audit(&root)
 }
 #[cfg(test)]
 mod tests {

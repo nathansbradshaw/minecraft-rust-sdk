@@ -25,10 +25,22 @@ Container launch requires the `mc-bots` identity and a rootless daemon with
 cgroup v2. Each bot gets its own internal network and a reviewed egress proxy.
 The coding image receives no host bind mounts or Docker socket. It runs UID
 1000 with capabilities dropped, no new privileges and a read-only root.
-Workspace/cache writes use separately sized tmpfs mounts under the memory
-budget; logs rotate under an explicit budget. Workspaces survive while the
-container exists but **must be exported before stopping/recreating it**.
-Persistent quota-backed workspaces remain a deployment acceptance gate.
+Workspace/cache writes use separately sized executable tmpfs mounts under the
+memory budget; logs rotate under an explicit budget. Stop the bot program and
+checkpoint its idle workspace before stopping/recreating the container:
+
+```sh
+minecraft-sdk-runner snapshot BOT_NAME 448
+minecraft-sdk-runner restore BOT_NAME 448
+```
+
+The explicit MiB budget bounds each archive; one previous archive is retained.
+Archives are private and never unpacked on the host. Restore uses the immutable
+archiver inside the unprivileged container while the root remains read-only.
+The live tmpfs contents are read from inside the container; Docker's filesystem
+archive API does not include them. A tested stop/restore round trip preserves
+source and binary hashes. Uncheckpointed work is lost when tmpfs is cleared.
+Checkpoint automation and persistent quota-backed volumes are deployment choices.
 
 The egress proxy permits exact operator-configured HTTPS `host:port` pairs.
 It validates every DNS result, rejects private/LAN/link-local/metadata and

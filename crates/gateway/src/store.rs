@@ -94,7 +94,11 @@ impl Store {
               uuid TEXT NOT NULL UNIQUE,name TEXT NOT NULL COLLATE NOCASE UNIQUE,key_hash TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS reserved(name TEXT PRIMARY KEY COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS sessions(bot TEXT PRIMARY KEY REFERENCES bots(id),id TEXT NOT NULL,request_id TEXT NOT NULL,adapter TEXT NOT NULL,state TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS actions(bot TEXT NOT NULL REFERENCES bots(id),id TEXT NOT NULL,intent TEXT NOT NULL,receipt TEXT NOT NULL,unresolved INTEGER NOT NULL,PRIMARY KEY(bot,id));").map_err(internal)?;
+            CREATE TABLE IF NOT EXISTS actions(bot TEXT NOT NULL REFERENCES bots(id),id TEXT NOT NULL,intent TEXT NOT NULL,receipt TEXT NOT NULL,unresolved INTEGER NOT NULL,PRIMARY KEY(bot,id));
+            CREATE TABLE IF NOT EXISTS legacy_bindings(bot TEXT PRIMARY KEY,path TEXT NOT NULL,identity TEXT NOT NULL,rows INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS legacy_overrides(bot TEXT NOT NULL,id TEXT NOT NULL,receipt TEXT NOT NULL,PRIMARY KEY(bot,id));
+            INSERT OR IGNORE INTO legacy_overrides SELECT bot,id,receipt FROM actions WHERE intent LIKE 'legacy:%' AND json_extract(receipt,'$.outcome')='reconciled';
+            DELETE FROM actions WHERE intent LIKE 'legacy:%' AND bot IN(SELECT bot FROM legacy_bindings);").map_err(internal)?;
         let existing: Option<String> = db
             .query_row("SELECT value FROM metadata WHERE key='instance'", [], |r| {
                 r.get(0)
@@ -128,6 +132,9 @@ impl Store {
         };
         for (bot, id, json) in pending {
             let mut receipt: Receipt = serde_json::from_str(&json).map_err(internal)?;
+            if receipt.outcome == Outcome::Uncertain {
+                continue;
+            }
             receipt.outcome = Outcome::Uncertain;
             receipt.error = Some(ApiError::new(
                 ErrorCode::UncertainOutcome,
@@ -144,6 +151,37 @@ impl Store {
     pub fn reserve(&self, name: &str) -> Result<()> {
         self.db
             .execute("INSERT OR IGNORE INTO reserved VALUES(?1)", [name])
+            .map_err(internal)?;
+        Ok(())
+    }
+    /// A deployment storage limit, independent of registry/player counts. FULL
+    /// rejects an intent before dispatch, or leaves its existing intent uncertain.
+    pub fn set_budget_mib(&self, mib: u32) -> Result<()> {
+        if !(1..=65536).contains(&mib) {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Journal budget must be 1–65536 MiB",
+            ));
+        }
+        let size: i64 = self
+            .db
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .map_err(internal)?;
+        let maximum = i64::from(mib) * 1024 * 1024 / size;
+        let actual: i64 = self
+            .db
+            .query_row(&format!("PRAGMA max_page_count={maximum}"), [], |r| {
+                r.get(0)
+            })
+            .map_err(internal)?;
+        if actual > maximum {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Existing journal exceeds the configured storage budget",
+            ));
+        }
+        self.db
+            .execute_batch("PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304;")
             .map_err(internal)?;
         Ok(())
     }
@@ -252,6 +290,39 @@ impl Store {
             .map_err(internal)?
             .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "Unknown bot"))
     }
+    pub fn operator_summary(&self) -> Result<serde_json::Value> {
+        let mut query=self.db.prepare("SELECT b.id,b.label,b.uuid,b.name,coalesce(l.rows,0),EXISTS(SELECT 1 FROM sessions s WHERE s.bot=b.id) FROM bots b LEFT JOIN legacy_bindings l ON l.bot=b.id ORDER BY b.label").map_err(internal)?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, bool>(5)?,
+                ))
+            })
+            .map_err(internal)?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, label, uuid, name, count, connected) = row.map_err(internal)?;
+            let pending = if let Some(legacy) = self.legacy(&id)? {
+                legacy
+                    .query_row(
+                        "SELECT id FROM actions WHERE result IS NULL LIMIT 1",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(internal)?
+            } else {
+                None
+            };
+            result.push(serde_json::json!({"bot_id":id,"label":label,"player_uuid":uuid,"player_name":name,"legacy_actions":count,"connected":connected,"legacy_pending":pending}));
+        }
+        Ok(serde_json::json!(result))
+    }
     pub fn import_legacy(
         &mut self,
         label: &str,
@@ -309,52 +380,11 @@ impl Store {
         )
         .map_err(internal)?;
         tx.execute("CREATE TABLE IF NOT EXISTS legacy_bindings(bot TEXT PRIMARY KEY,path TEXT NOT NULL,identity TEXT NOT NULL,rows INTEGER NOT NULL)",[]).map_err(internal)?;
-        let mut query = legacy
-            .prepare("SELECT id,digest,result IS NULL FROM actions ORDER BY id")
+        // Keep authoritative histories in place. An indexed lookup fences old
+        // IDs and pending work without copying gigabytes of historical receipts.
+        let count: i64 = legacy
+            .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
             .map_err(internal)?;
-        let rows = query
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, bool>(2)?,
-                ))
-            })
-            .map_err(internal)?;
-        let mut count = 0i64;
-        for row in rows {
-            let (action_id, digest, pending) = row.map_err(internal)?;
-            let receipt = Receipt {
-                action_id: action_id.clone(),
-                outcome: if pending {
-                    Outcome::Uncertain
-                } else {
-                    Outcome::Imported
-                },
-                adapter_version: "legacy-import-v1".into(),
-                evidence: serde_json::json!({"imported":true,"original_intent_digest":digest,"historical_effect_verified":false}),
-                error: if pending {
-                    Some(ApiError::new(
-                        ErrorCode::UncertainOutcome,
-                        "Imported unfinished action; reconcile without replay",
-                    ))
-                } else {
-                    None
-                },
-            };
-            tx.execute(
-                "INSERT INTO actions VALUES(?1,?2,?3,?4,?5)",
-                params![
-                    id,
-                    action_id,
-                    format!("legacy:{digest}"),
-                    serde_json::to_string(&receipt).map_err(internal)?,
-                    pending
-                ],
-            )
-            .map_err(internal)?;
-            count += 1;
-        }
         tx.execute(
             "INSERT INTO legacy_bindings VALUES(?1,?2,?3,?4)",
             params![
@@ -484,8 +514,61 @@ impl Store {
             )
             .optional()
             .map_err(internal)?;
-        json.map(|s| serde_json::from_str(&s).map_err(internal))
-            .transpose()
+        if let Some(json) = json {
+            return serde_json::from_str(&json).map(Some).map_err(internal);
+        }
+        let override_json: Option<String> = self
+            .db
+            .query_row(
+                "SELECT receipt FROM legacy_overrides WHERE bot=?1 AND id=?2",
+                params![bot, id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some(json) = override_json {
+            return serde_json::from_str(&json).map(Some).map_err(internal);
+        }
+        self.legacy_receipt(bot, id)
+    }
+    fn legacy(&self, bot: &str) -> Result<Option<Connection>> {
+        let binding: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT path,identity FROM legacy_bindings WHERE bot=?1",
+                [bot],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let Some((path, expected)) = binding else {
+            return Ok(None);
+        };
+        let legacy = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(internal)?;
+        let current: String = legacy
+            .query_row("SELECT value FROM meta WHERE key='identity'", [], |r| {
+                r.get(0)
+            })
+            .map_err(internal)?;
+        if current != expected {
+            return Err(conflict("Authoritative legacy journal identity changed"));
+        }
+        Ok(Some(legacy))
+    }
+    fn legacy_receipt(&self, bot: &str, id: &str) -> Result<Option<Receipt>> {
+        let Some(legacy) = self.legacy(bot)? else {
+            return Ok(None);
+        };
+        let row: Option<(String, bool)> = legacy
+            .query_row(
+                "SELECT digest,result IS NULL FROM actions WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        Ok(row.map(|(digest,pending)|Receipt{action_id:id.into(),outcome:if pending{Outcome::Uncertain}else{Outcome::Imported},adapter_version:"legacy-import-v1".into(),evidence:serde_json::json!({"imported":true,"original_intent_digest":digest,"historical_effect_verified":false}),error:if pending{Some(ApiError::new(ErrorCode::UncertainOutcome,"Imported unfinished action; reconcile without replay"))}else{None}}))
     }
     pub fn prepare(
         &mut self,
@@ -500,6 +583,29 @@ impl Store {
             ));
         }
         request.action.validate()?;
+        if self.legacy_receipt(bot, &request.action_id)?.is_some() {
+            return Err(conflict("Historical action IDs remain permanently fenced"));
+        }
+        if let Some(legacy) = self.legacy(bot)? {
+            let pending: Option<String> = legacy
+                .query_row(
+                    "SELECT id FROM actions WHERE result IS NULL LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            if let Some(id) = pending
+                && self
+                    .receipt(bot, &id)?
+                    .is_none_or(|r| r.outcome != Outcome::Reconciled)
+            {
+                return Err(ApiError::new(
+                    ErrorCode::UncertainOutcome,
+                    "Reconcile the imported unfinished action before new mutations",
+                ));
+            }
+        }
         let intent = serde_json::to_string(&request.action).map_err(internal)?;
         let tx = self.db.transaction().map_err(internal)?;
         let old: Option<(String, String)> = tx
@@ -555,6 +661,10 @@ impl Store {
         if receipt.action_id != id {
             return Err(internal("Adapter action identity mismatch"));
         }
+        if self.legacy_receipt(bot, id)?.is_some() {
+            self.db.execute("INSERT INTO legacy_overrides VALUES(?1,?2,?3) ON CONFLICT(bot,id) DO UPDATE SET receipt=excluded.receipt",params![bot,id,serde_json::to_string(receipt).map_err(internal)?]).map_err(internal)?;
+            return Ok(());
+        }
         let unresolved = matches!(
             receipt.outcome,
             Outcome::Prepared | Outcome::Dispatched | Outcome::Uncertain
@@ -589,6 +699,42 @@ mod tests {
             .unwrap();
         let actor = s.authenticate(&key.bot_id, &key.key).unwrap();
         (dir, s, key, actor)
+    }
+    #[test]
+    fn storage_budget_preserves_intent_when_receipt_cannot_fit() {
+        let (_dir, mut store, _key, actor) = setup();
+        store.set_budget_mib(1).unwrap();
+        let request = ActionRequest {
+            action_id: "bounded".into(),
+            action: Action::Respawn,
+        };
+        let (mut receipt, new) = store.prepare(&actor.bot_id, &request, "fixture").unwrap();
+        assert!(new);
+        receipt.outcome = Outcome::Observed;
+        receipt.evidence = serde_json::json!("x".repeat(2 * 1024 * 1024));
+        assert!(
+            store
+                .save_receipt(&actor.bot_id, &request.action_id, &receipt)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .receipt(&actor.bot_id, &request.action_id)
+                .unwrap()
+                .unwrap()
+                .outcome,
+            Outcome::Prepared
+        );
+        assert!(!store.prepare(&actor.bot_id, &request, "fixture").unwrap().1);
+        let maximum: i64 = store
+            .db
+            .query_row("PRAGMA max_page_count", [], |r| r.get(0))
+            .unwrap();
+        let count: i64 = store
+            .db
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        assert!(count <= maximum);
     }
     #[test]
     fn identity_keys_reservation_and_rotation() {

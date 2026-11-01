@@ -29,6 +29,16 @@ pub struct Config {
     #[serde(default)]
     pub reserved_names: Vec<String>,
     pub registrations_per_minute: u32,
+    #[serde(default = "default_journal_budget")]
+    pub journal_max_mib: u32,
+    #[serde(default = "default_adapter_queue")]
+    pub adapter_queue_capacity: usize,
+}
+fn default_adapter_queue() -> usize {
+    64
+}
+fn default_journal_budget() -> u32 {
+    1024
 }
 pub struct Gateway {
     store: Mutex<Store>,
@@ -38,6 +48,7 @@ pub struct Gateway {
     registration_limit: u32,
     lanes: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     health: Arc<std::sync::atomic::AtomicBool>,
+    adapter_budget: Arc<tokio::sync::Semaphore>,
 }
 type Shared = Arc<Gateway>;
 struct HttpError(ApiError);
@@ -68,6 +79,12 @@ impl IntoResponse for HttpError {
 }
 impl Gateway {
     pub async fn start(config: Config) -> Result<Shared> {
+        if !(1..=1024).contains(&config.adapter_queue_capacity) {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Adapter queue capacity must be 1–1024",
+            ));
+        }
         if !config.listen.ip().is_loopback() {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
@@ -75,6 +92,7 @@ impl Gateway {
             ));
         }
         let store = Store::open(&config.journal)?;
+        store.set_budget_mib(config.journal_max_mib)?;
         for name in &config.reserved_names {
             store.reserve(name)?;
         }
@@ -106,6 +124,8 @@ impl Gateway {
             ));
         }
         info.instance_id = store.instance_id.clone();
+        info.limits["journal_max_mib"] = serde_json::json!(config.journal_max_mib);
+        info.limits["adapter_queue_capacity"] = serde_json::json!(config.adapter_queue_capacity);
         let health = adapter.health.clone();
         Ok(Arc::new(Self {
             store: Mutex::new(store),
@@ -115,6 +135,7 @@ impl Gateway {
             registration_limit: config.registrations_per_minute,
             lanes: Mutex::new(HashMap::new()),
             health,
+            adapter_budget: Arc::new(tokio::sync::Semaphore::new(config.adapter_queue_capacity)),
         }))
     }
     fn db(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
@@ -152,6 +173,11 @@ impl Gateway {
         actor: &Actor,
         operation: AdapterOperation,
     ) -> Result<AdapterResponse> {
+        let permit = self
+            .adapter_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::new(ErrorCode::RateLimited, "Adapter request queue is full"))?;
         let request = AdapterRequest {
             protocol: ADAPTER_VERSION,
             instance_id: self.info.instance_id.clone(),
@@ -163,11 +189,12 @@ impl Gateway {
         let gateway = self.clone();
         // Drain exactly one reply even if its HTTP client disconnects. Otherwise an
         // orphaned observation could be consumed by another character's request.
-        tokio::spawn(async move { gateway.adapter.lock().await.request(&request).await })
-            .await
-            .map_err(|_| {
-                ApiError::new(ErrorCode::UncertainOutcome, "Adapter exchange interrupted")
-            })?
+        tokio::spawn(async move {
+            let _permit = permit;
+            gateway.adapter.lock().await.request(&request).await
+        })
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::UncertainOutcome, "Adapter exchange interrupted"))?
     }
     fn ready(&self) -> Result<()> {
         if self.info.ready && self.health.load(std::sync::atomic::Ordering::Acquire) {
@@ -191,7 +218,20 @@ pub fn router(gateway: Shared) -> Router {
         .route("/v1/bots/{bot}/actions/{id}", get(status))
         .route("/v1/bots/{bot}/actions/{id}/reconcile", post(reconcile))
         .layer(DefaultBodyLimit::max(16384))
+        .layer(axum::middleware::from_fn(no_store))
         .with_state(gateway)
+}
+async fn no_store(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 async fn discover(State(g): State<Shared>) -> Json<ServerInfo> {
     let mut info = g.info.clone();

@@ -14,3 +14,7 @@ See `licenses/Gradle-Apache-2.0.txt` and the wrapper's embedded notices.
 
 Cargo dependencies keep their own licenses. `Cargo.lock` pins the dependency
 closure; release checks must review licenses and advisories for that closure.
+`cargo run --locked -p minecraft-sdk-xtask -- --licenses OUTPUT_DIRECTORY`
+collects sanitized SPDX declarations and packaged license texts for the pinned
+Linux dependency closure. Binary distributions and the supplied Docker images
+include this collection. No installed game/mod JAR is embedded in this project.

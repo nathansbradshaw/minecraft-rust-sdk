@@ -6,5 +6,7 @@
     "args": ["/etc/minecraft-sdk/adapter.json"]
   },
   "reserved_names": [],
-  "registrations_per_minute": 10
+  "registrations_per_minute": 10,
+  "journal_max_mib": 1024,
+  "adapter_queue_capacity": 64
 }

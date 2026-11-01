@@ -124,6 +124,9 @@ pub enum Action {
     Move {
         target: Position,
         on_ground: bool,
+        /// Request a jumping trajectory rather than a grounded walk.
+        #[serde(default)]
+        jump: bool,
     },
     Look {
         yaw: f32,
@@ -149,6 +152,12 @@ pub enum Action {
     },
     UseItem {
         hand: Hand,
+    },
+    UseBlock {
+        block: BlockPos,
+        face: u8,
+        hand: Hand,
+        hit: [f32; 3],
     },
     Interact {
         entity: i32,
@@ -198,6 +207,7 @@ impl Action {
             | Self::Sneak { .. } => "minecraft:movement",
             Self::Dig { .. } => "minecraft:mining",
             Self::Place { .. } => "minecraft:placement",
+            Self::UseBlock { .. } => "minecraft:block_use",
             Self::UseItem { .. } => "minecraft:item_use",
             Self::Interact { .. } | Self::Attack { .. } => "minecraft:entities",
             Self::SelectSlot { .. } | Self::ClickSlot { .. } | Self::CloseMenu { .. } => {
@@ -217,7 +227,7 @@ impl Action {
                 .all(|x| x.is_finite() && x.abs() <= 30_000_000.),
             Self::Look { yaw, pitch } => yaw.is_finite() && pitch.is_finite() && pitch.abs() <= 90.,
             Self::Dig { face, .. } => *face <= 5,
-            Self::Place { face, hit, .. } => {
+            Self::Place { face, hit, .. } | Self::UseBlock { face, hit, .. } => {
                 *face <= 5 && hit.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v))
             }
             Self::SelectSlot { slot } => *slot < 9,
@@ -280,7 +290,7 @@ pub fn registry_id(s: &str) -> bool {
 }
 pub fn valid_id(s: &str) -> bool {
     !s.is_empty()
-        && s.len() <= 64
+        && s.len() <= 128
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
@@ -382,7 +392,8 @@ mod tests {
                     y: 0.,
                     z: 0.
                 },
-                on_ground: false
+                on_ground: false,
+                jump: false,
             }
             .validate()
             .is_err()
