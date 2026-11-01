@@ -85,11 +85,15 @@ impl Client {
                 .join(path)
                 .map_err(|_| ApiError::new(ErrorCode::InvalidRequest, "Invalid API path"))?,
         );
-        if let Some(c) = &self.credential {
-            request = request.bearer_auth(&c.key);
-        }
-        if let Some(s) = &self.session {
-            request = request.header("x-minecraft-session", &s.session_id);
+        // Discovery (including instance verification) and registration are public.
+        // Do not disclose an existing key/session to a replacement instance.
+        if path.starts_with("v1/bots/") {
+            if let Some(c) = &self.credential {
+                request = request.bearer_auth(&c.key);
+            }
+            if let Some(s) = &self.session {
+                request = request.header("x-minecraft-session", &s.session_id);
+            }
         }
         if let Some(body) = body {
             request = request.json(&body);
@@ -219,6 +223,55 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn instance_verification_never_discloses_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 8192);
+                header.push(stream.read_u8().await.unwrap());
+            }
+            let body = serde_json::to_vec(&ServerInfo {
+                api_version: API_VERSION,
+                instance_id: "replacement".into(),
+                minecraft_version: "fixture".into(),
+                platform: "fixture".into(),
+                adapter_version: "fixture".into(),
+                ready: true,
+                capabilities: vec![],
+                limits: serde_json::json!({}),
+            })
+            .unwrap();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            String::from_utf8(header).unwrap().to_ascii_lowercase()
+        });
+        let client = Client::with_profile(&Profile {
+            endpoint,
+            instance_id: "original".into(),
+            credential: Credential {
+                bot_id: "fixture".into(),
+                player_uuid: "fixture".into(),
+                key: "private-test-key".into(),
+            },
+            session: Some(Session {
+                session_id: "private-test-session".into(),
+                adapter_version: "fixture".into(),
+            }),
+        })
+        .unwrap();
+        let error = client.verify_instance("original").await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        let header = peer.await.unwrap();
+        assert!(header.starts_with("get /v1/server "));
+        assert!(!header.contains("authorization:"));
+        assert!(!header.contains("x-minecraft-session:"));
+        assert!(!header.contains("private-test-"));
+    }
     #[tokio::test]
     async fn refuses_credential_redirect_and_insecure_remote_origins() {
         for url in [
