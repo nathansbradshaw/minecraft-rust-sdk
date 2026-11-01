@@ -82,8 +82,13 @@ impl Native {
             .send()?;
         let status = response.status();
         let mut bytes = Vec::new();
-        response.take(1_048_577).read_to_end(&mut bytes)?;
-        if bytes.len() > 1_048_576 {
+        let limit = if op == "observe-extension" {
+            8 * 1_048_576
+        } else {
+            1_048_576
+        };
+        response.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
             return Err("Native response too large".into());
         }
         if !status.is_success() {
@@ -132,6 +137,7 @@ impl Tables {
     }
 }
 struct Player {
+    motion: Option<([f64; 3], f64)>,
     wire: Arc<Mutex<Wire<TcpStream>>>,
     alive: Arc<AtomicBool>,
     tables: Tables,
@@ -327,6 +333,7 @@ fn connect(
             thread::sleep(Duration::from_millis(100));
         }
         Ok(Player {
+            motion: None,
             wire,
             alive,
             tables,
@@ -479,6 +486,23 @@ impl Player {
             .checked_add(1)
             .ok_or("Sequence exhausted; reconnect")?;
         let name = match action {
+            Action::MotionFrame { target } => {
+                let (next, ground, velocity) = motion_frame(before, target, self.motion)?;
+                for v in next {
+                    body.extend(v.to_be_bytes());
+                }
+                body.push(u8::from(ground));
+                self.send("position", &body)?;
+                self.motion = Some((next, velocity));
+                return Ok(());
+            }
+            Action::DropSelected { entire_stack } => {
+                body.extend(vi(if *entire_stack { 3 } else { 4 }));
+                body.extend(0i64.to_be_bytes());
+                body.push(0);
+                body.extend(vi(self.sequence));
+                "block_dig"
+            }
             Action::Move { target, jump, .. } => {
                 for (p, ground) in motion_plan(before, [target.x, target.y, target.z], *jump)? {
                     let mut bytes = Vec::new();
@@ -666,9 +690,7 @@ fn motion_plan(
     target: [f64; 3],
     jump: bool,
 ) -> AnyResult<Vec<([f64; 3], bool)>> {
-    let blocks = observation.world["blocks"]
-        .as_array()
-        .ok_or("Terrain unavailable")?;
+    let boxes = collision_boxes(observation)?;
     let start = position(observation)?;
     if (target[0] - start[0]).abs() > 3.5
         || (target[2] - start[2]).abs() > 3.5
@@ -677,6 +699,12 @@ fn motion_plan(
     {
         return Err("Waypoint exceeds observed terrain".into());
     }
+    trajectory(start, target, jump, &boxes)
+}
+fn collision_boxes(observation: &Observation) -> AnyResult<Vec<[f64; 6]>> {
+    let blocks = observation.world["blocks"]
+        .as_array()
+        .ok_or("Terrain unavailable")?;
     let mut boxes = Vec::new();
     for block in blocks {
         let b = &block["position"];
@@ -705,6 +733,58 @@ fn motion_plan(
             boxes.push(bounds);
         }
     }
+    Ok(boxes)
+}
+fn motion_frame(
+    observation: &Observation,
+    target: &Position,
+    previous: Option<([f64; 3], f64)>,
+) -> AnyResult<([f64; 3], bool, f64)> {
+    let start = position(observation)?;
+    let delta = [
+        target.x - start[0],
+        target.y - start[1],
+        target.z - start[2],
+    ];
+    if delta[0] * delta[0] + delta[2] * delta[2] > 0.13 || !(-1.4..=0.43).contains(&delta[1]) {
+        return Err("Motion frame exceeds ordinary player bounds".into());
+    }
+    let boxes = collision_boxes(observation)?;
+    let (support, contact) =
+        minecraft_sdk_java_1_21_1::physics::step(start, [0.; 3], -0.08, &boxes);
+    let supported = contact && (support[1] - start[1]).abs() < 1e-7;
+    let velocity = if supported {
+        if (delta[1] - 0.42).abs() < 0.001 {
+            0.42
+        } else {
+            -0.08
+        }
+    } else {
+        previous
+            .filter(|(p, _)| (0..3).all(|i| (p[i] - start[i]).abs() < 0.05))
+            .ok_or("Airborne motion requires a continuous verified trajectory")?
+            .1
+    };
+    let (next, ground) =
+        minecraft_sdk_java_1_21_1::physics::step(start, [delta[0], 0., delta[2]], velocity, &boxes);
+    let wanted = [target.x, target.y, target.z];
+    if !(0..3).all(|i| (next[i] - wanted[i]).abs() < 0.001) {
+        return Err("Motion frame violates collision or gravity".into());
+    }
+    let clipped = (next[1] - start[1] - velocity).abs() > 1e-7;
+    let following = if ground {
+        -0.08
+    } else {
+        ((if clipped { 0. } else { velocity }) - 0.08) * 0.98
+    };
+    Ok((next, ground, following))
+}
+fn trajectory(
+    start: [f64; 3],
+    target: [f64; 3],
+    jump: bool,
+    boxes: &[[f64; 6]],
+) -> AnyResult<Vec<([f64; 3], bool)>> {
     let mut frames = Vec::new();
     let mut p = start;
     let mut velocity = if jump || target[1] > start[1] + 0.2 {
@@ -722,7 +802,7 @@ fn motion_plan(
             p,
             [dx * factor, 0., dz * factor],
             velocity,
-            &boxes,
+            boxes,
         );
         if next[1] < start[1] - 3. || next[1] > start[1] + 2.5 {
             return Err("Movement leaves observed vertical terrain".into());
@@ -828,6 +908,7 @@ fn dispatch(
                 ready: true,
                 capabilities: [
                     "minecraft:movement",
+                    "minecraft:movement_frames",
                     "minecraft:mining",
                     "minecraft:placement",
                     "minecraft:block_use",
@@ -841,6 +922,15 @@ fn dispatch(
                 ]
                 .into_iter()
                 .map(String::from)
+                .chain(
+                    discovery["observation_capabilities"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|s| registry_id(s))
+                        .map(String::from),
+                )
                 .collect(),
                 limits: json!({"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4}),
             })),
@@ -877,6 +967,30 @@ fn dispatch(
                 }
                 Ok(AdapterResponse::Observation(observation))
             }
+            AdapterOperation::ReadObservation { request: query } => {
+                query.validate()?;
+                if !players.contains_key(&request.bot_id) {
+                    return Err(ApiError::new(
+                        ErrorCode::SessionRequired,
+                        "Player is not connected",
+                    ));
+                }
+                if !discovery["observation_capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| {
+                        caps.iter()
+                            .any(|cap| cap.as_str() == Some(&query.capability))
+                    })
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::UnsupportedCapability,
+                        "Observation provider is not installed",
+                    ));
+                }
+                native.call("observe-extension", json!({"player_uuid":request.player_uuid,"capability":query.capability,"input":query.input}))
+                    .map(AdapterResponse::ObservationData)
+                    .map_err(|_| ApiError::new(ErrorCode::InvalidRequest, "Observation query refused"))
+            }
             AdapterOperation::Action { request: action } => {
                 action.action.validate()?;
                 let player = players.get_mut(&request.bot_id).ok_or_else(|| {
@@ -897,6 +1011,14 @@ fn dispatch(
                     ));
                 }
                 match &action.action {
+                    Action::MotionFrame { target } => {
+                        motion_frame(&before, target, player.motion).map_err(|_| {
+                            ApiError::new(
+                                ErrorCode::InvalidRequest,
+                                "Motion frame violates collision, gravity or trajectory continuity",
+                            )
+                        })?;
+                    }
                     Action::Move { target, jump, .. } => {
                         if *jump && before.player["on_ground"] != true {
                             return Err(ApiError::new(
@@ -1023,11 +1145,13 @@ fn dispatch(
 }
 fn verified_effect(action: &Action, before: &Observation, after: &Observation) -> bool {
     match action {
-        Action::Move { target, .. } => position(after).is_ok_and(|p| {
-            (p[0] - target.x).abs() < 0.08
-                && (p[1] - target.y).abs() < 0.08
-                && (p[2] - target.z).abs() < 0.08
-        }),
+        Action::Move { target, .. } | Action::MotionFrame { target } => {
+            position(after).is_ok_and(|p| {
+                (p[0] - target.x).abs() < 0.08
+                    && (p[1] - target.y).abs() < 0.08
+                    && (p[2] - target.z).abs() < 0.08
+            })
+        }
         Action::Look { yaw, pitch } => {
             after.player["yaw"]
                 .as_f64()
@@ -1076,11 +1200,41 @@ fn verified_effect(action: &Action, before: &Observation, after: &Observation) -
                 .zip(block_state(after, &adjacent))
                 .is_some_and(|(b, a)| b != a)
         }
-        Action::UseBlock { block, .. } => {
+        Action::UseBlock { block, face, .. } => {
+            let mut adjacent = block.clone();
+            match face {
+                0 => adjacent.y -= 1,
+                1 => adjacent.y += 1,
+                2 => adjacent.z -= 1,
+                3 => adjacent.z += 1,
+                4 => adjacent.x -= 1,
+                5 => adjacent.x += 1,
+                _ => return false,
+            };
             block_state(before, block)
                 .zip(block_state(after, block))
                 .is_some_and(|(b, a)| b != a)
+                || block_state(before, &adjacent)
+                    .zip(block_state(after, &adjacent))
+                    .is_some_and(|(b, a)| b != a)
                 || (before.menu["menu_id"] != after.menu["menu_id"] && after.menu["menu_id"] != 0)
+        }
+        Action::DropSelected { entire_stack } => {
+            let selected = &before.player["selected"];
+            let stack = |o: &Observation| {
+                o.player["inventory"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|s| &s["slot"] == selected))
+                    .cloned()
+            };
+            stack(before).zip(stack(after)).is_some_and(|(b, a)| {
+                b["count"]
+                    .as_u64()
+                    .zip(a["count"].as_u64())
+                    .is_some_and(|(old, new)| {
+                        old > 0 && new == if *entire_stack { 0 } else { old - 1 }
+                    })
+            })
         }
         Action::ClickSlot { slot, .. } => {
             let get = |o: &Observation| {
@@ -1154,6 +1308,96 @@ fn compact(action: &Action, o: &Observation) -> Value {
 #[cfg(test)]
 mod movement_tests {
     use super::*;
+    #[test]
+    fn frames_enforce_collision_gravity_and_continuity() {
+        let mut observation = Observation {
+            revision: "test".into(),
+            player: json!({"position":[0.5,1.,0.5],"on_ground":true}),
+            world: json!({"blocks":[{"position":[0,0,0],"collision":[[0.,0.,0.,1.,1.,1.]]}]}),
+            menu: json!({}),
+        };
+        let jump = Position {
+            x: 0.5,
+            y: 1.42,
+            z: 0.5,
+        };
+        let (p, ground, velocity) = motion_frame(&observation, &jump, None).unwrap();
+        assert!(!ground);
+        observation.player["position"] = json!(p);
+        observation.player["on_ground"] = json!(false);
+        observation.player["on_ground"] = json!(true);
+        assert!(
+            motion_frame(
+                &observation,
+                &Position {
+                    x: 0.5,
+                    y: 1.84,
+                    z: 0.5
+                },
+                Some((p, velocity))
+            )
+            .is_err(),
+            "a premature native ground flag cannot authorize an airborne jump"
+        );
+        observation.player["on_ground"] = json!(false);
+        assert!(
+            motion_frame(
+                &observation,
+                &Position {
+                    x: 0.5,
+                    y: 1.84,
+                    z: 0.5
+                },
+                Some((p, velocity))
+            )
+            .is_err(),
+            "repeated upward jump must fail"
+        );
+        assert!(
+            motion_frame(
+                &observation,
+                &Position {
+                    x: 0.5,
+                    y: p[1] + velocity,
+                    z: 0.5
+                },
+                None
+            )
+            .is_err(),
+            "untracked air frame must fail"
+        );
+        assert!(
+            motion_frame(
+                &observation,
+                &Position {
+                    x: 0.5,
+                    y: p[1] + velocity,
+                    z: 0.5
+                },
+                Some((p, velocity))
+            )
+            .is_ok()
+        );
+        observation.player["position"] = json!([0.5, 1., 0.5]);
+        observation.player["on_ground"] = json!(true);
+        observation.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"position":[1,1,0],"collision":[[0.,0.,0.,1.,1.,1.]]}));
+        assert!(
+            motion_frame(
+                &observation,
+                &Position {
+                    x: 0.85,
+                    y: 1.,
+                    z: 0.5
+                },
+                None
+            )
+            .is_err(),
+            "wall clipping must fail"
+        );
+    }
     #[test]
     fn explicit_jump_crosses_a_gap_while_grounded_walk_refuses_it() {
         let observation = Observation {

@@ -214,6 +214,7 @@ pub fn router(gateway: Shared) -> Router {
         .route("/v1/bots/{bot}/key/rotate", post(rotate))
         .route("/v1/bots/{bot}/session", post(connect).delete(disconnect))
         .route("/v1/bots/{bot}/observations", get(observe))
+        .route("/v1/bots/{bot}/observations/query", post(read_observation))
         .route("/v1/bots/{bot}/actions", post(action))
         .route("/v1/bots/{bot}/actions/{id}", get(status))
         .route("/v1/bots/{bot}/actions/{id}/reconcile", post(reconcile))
@@ -349,6 +350,31 @@ async fn observe(
         AdapterResponse::Observation(o) if o.player["uuid"] == actor.uuid => Ok(Json(o)),
         AdapterResponse::Error(e) => Err(e.into()),
         _ => Err(ApiError::new(ErrorCode::Internal, "Unexpected adapter reply").into()),
+    }
+}
+async fn read_observation(
+    State(g): State<Shared>,
+    Path(bot): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ObservationQuery>,
+) -> std::result::Result<Json<serde_json::Value>, HttpError> {
+    let actor = g.actor(&bot, &headers)?;
+    g.controller(&actor, &headers)?;
+    request.validate()?;
+    if !g.info.capabilities.contains(&request.capability) {
+        return Err(ApiError::new(
+            ErrorCode::UnsupportedCapability,
+            "Observation provider is not installed",
+        )
+        .into());
+    }
+    match g
+        .call(&actor, AdapterOperation::ReadObservation { request })
+        .await?
+    {
+        AdapterResponse::ObservationData(value) => Ok(Json(value)),
+        AdapterResponse::Error(e) => Err(e.into()),
+        _ => Err(ApiError::new(ErrorCode::Internal, "Unexpected observation reply").into()),
     }
 }
 async fn action(

@@ -26,6 +26,14 @@ Raw worlds, private profiles and native journals are excluded from source.
 
 ## Reproducing bounded checks
 
+Alpha.3 adds an operator-installed read-only observation-provider interface and
+collision/gravity-checked movement frames. On the minimal installation a real
+frame-by-frame jump returned to its supported origin, a repeated upward frame
+was rejected, and an uninstalled observation provider returned an explicit
+capability error. Regression tests cover premature native ground flags,
+wall collision and missing airborne continuity. This does not establish
+autonomous strategy reliability or claim support for all movement effects.
+
 - `cargo test --workspace --locked` and `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo run --locked -p minecraft-sdk-xtask -- .`
 - `cargo run --locked -p minecraft-sdk-xtask -- --licenses target/dependency-licenses`

@@ -86,7 +86,7 @@ impl Adapter {
                 .position(|b| *b == b'\n')
                 .map(|n| n + 1)
                 .unwrap_or(buffer.len());
-            if line.len() + n > 1_048_576 {
+            if line.len() + n > 8 * 1_048_576 {
                 return Err(std::io::Error::other("Adapter response too large"));
             }
             let end = buffer[n - 1] == b'\n';

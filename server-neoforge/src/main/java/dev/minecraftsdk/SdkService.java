@@ -26,6 +26,12 @@ public final class SdkService implements AutoCloseable {
     private final byte[] token;
     private final Path registryPath;
     private final Map<UUID,String> identities=new HashMap<>();
+    private final Map<String,java.util.function.BiFunction<ServerPlayer,JsonObject,Object>> observationProviders=new TreeMap<>();
+    /** Installed server code only. Requests cannot install providers or select classes. */
+    public synchronized void registerObservationProvider(String capability,java.util.function.BiFunction<ServerPlayer,JsonObject,Object> provider){
+        if(!capability.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")||capability.length()>128||provider==null||observationProviders.putIfAbsent(capability,provider)!=null)
+            throw new IllegalArgumentException("Unique namespaced observation provider required");
+    }
     private final Map<Integer,Ticket> tickets=new HashMap<>();
     private final Map<Connection,UUID> admitted=Collections.synchronizedMap(new WeakHashMap<>());
     private record Ticket(UUID uuid,String name,long expires){}
@@ -69,6 +75,7 @@ public final class SdkService implements AutoCloseable {
                 case "/v1/register"->register(request);
                 case "/v1/admit"->reserve(request);
                 case "/v1/observe"->observe(request);
+                case "/v1/observe-extension"->observeExtension(request);
                 default->throw new IllegalArgumentException("Unknown private operation");
             }).get(5,TimeUnit.SECONDS);
             reply(exchange,200,result);
@@ -77,6 +84,7 @@ public final class SdkService implements AutoCloseable {
     }
     private void reply(HttpExchange exchange,int code,Object value)throws java.io.IOException{
         byte[] bytes=JSON.toJson(value).getBytes(StandardCharsets.UTF_8);
+        if(bytes.length>8*1024*1024){code=413;bytes="{\"error\":\"response_too_large\"}".getBytes(StandardCharsets.UTF_8);}
         exchange.getResponseHeaders().set("Content-Type","application/json");exchange.getResponseHeaders().set("Cache-Control","no-store");
         exchange.sendResponseHeaders(code,bytes.length);exchange.getResponseBody().write(bytes);
     }
@@ -86,7 +94,7 @@ public final class SdkService implements AutoCloseable {
         var channels=new ArrayList<Map<String,Object>>();
         NetworkRegistryAccessor.sdk$registrations().forEach((protocol,values)->values.forEach((id,registration)->channels.add(Map.of("protocol",protocol.id(),"id",id.toString(),"version",registration.version(),"flow",registration.flow().map(Enum::name).orElse("BIDIRECTIONAL"),"optional",registration.optional()))));
         channels.sort(Comparator.comparing(row->row.get("protocol")+":"+row.get("id")));
-        return Map.of("minecraft_version","1.21.1","platform","neoforge","channels",channels,"max_players",server.getMaxPlayers(),"online_mode",server.usesAuthentication());
+        return Map.of("minecraft_version","1.21.1","platform","neoforge","channels",channels,"max_players",server.getMaxPlayers(),"online_mode",server.usesAuthentication(),"observation_capabilities",List.copyOf(observationProviders.keySet()));
     }
     private static void validateIdentity(UUID uuid,String name){if(uuid==null||name.length()>16||!name.matches("(\\.S_[0-9a-f]{12}|\\.AI_[A-Za-z0-9_]{1,12})"))throw new IllegalArgumentException("SDK identity required");}
     private synchronized Object register(JsonObject request){
@@ -118,9 +126,19 @@ public final class SdkService implements AutoCloseable {
         tickets.remove(address.getPort());admitted.put(connection,uuid);return Optional.of(new GameProfile(uuid,name));
     }
     private Object observe(JsonObject request){
-        exact(request,"player_uuid");UUID uuid=UUID.fromString(request.get("player_uuid").getAsString());ServerPlayer player=server.getPlayerList().getPlayer(uuid);
+        exact(request,"player_uuid");return NativeObservation.snapshot(server,observedPlayer(request));
+    }
+    private ServerPlayer observedPlayer(JsonObject request){
+        UUID uuid=UUID.fromString(request.get("player_uuid").getAsString());ServerPlayer player=server.getPlayerList().getPlayer(uuid);
         if(player==null||!uuid.equals(admitted.get(player.connection.getConnection()))||player.hasPermissions(1)||player.gameMode.getGameModeForPlayer()!=GameType.SURVIVAL)throw new IllegalArgumentException("Connected non-operator SDK Survival player required");
-        return NativeObservation.snapshot(server,player);
+        return player;
+    }
+    private Object observeExtension(JsonObject request){
+        exact(request,"player_uuid","capability","input");
+        ServerPlayer player=observedPlayer(request);
+        var provider=observationProviders.get(request.get("capability").getAsString());
+        if(provider==null||!request.get("input").isJsonObject())throw new IllegalArgumentException("Installed observation provider required");
+        return provider.apply(player,request.getAsJsonObject("input").deepCopy());
     }
     public boolean owns(Connection connection,UUID uuid){return uuid!=null&&uuid.equals(admitted.get(connection));}
     public boolean owns(ServerPlayer player){return player.connection!=null&&owns(player.connection.getConnection(),player.getUUID());}

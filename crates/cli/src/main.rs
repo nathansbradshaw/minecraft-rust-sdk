@@ -129,6 +129,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             json!({"disconnected":true})
         }
         "observe" => serde_json::to_value(client.observe().await?)?,
+        "query" => {
+            let query: ObservationQuery = serde_json::from_slice(&std::fs::read(
+                args.get(2).ok_or("Observation query JSON file required")?,
+            )?)?;
+            client.read_observation(&query).await?
+        }
         "act" => {
             let request: ActionRequest = serde_json::from_slice(&std::fs::read(
                 args.get(2).ok_or("Action JSON file required")?,
@@ -211,6 +217,7 @@ async fn mcp(client: &Client) -> std::result::Result<(), Box<dyn std::error::Err
             "tools/list" => Ok(json!({"tools":[
                 {"name":"minecraft_discover","description":"Discover this configured gateway and its installed capabilities","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
                 {"name":"minecraft_observe","description":"Observe your connected Survival character","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+                {"name":"minecraft_observation_query","description":"Read own-player facts from an installed observation provider advertised by discovery. Cannot install providers or execute code.","inputSchema":{"type":"object","required":["capability","input"],"properties":{"capability":{"type":"string"},"input":{"type":"object"}},"additionalProperties":false}},
                 {"name":"minecraft_act","description":"Submit a typed gameplay action with a unique stable action_id. Never retry an uncertain mutation under another ID. Supported kinds are movement, mining, placement, item use, entity interactions, inventory, crafting, chat, commands and respawn; capability discovery determines availability.","inputSchema":{"type":"object","required":["action_id","action"],"properties":{"action_id":{"type":"string"},"action":{"type":"object"}},"additionalProperties":false}},
                 {"name":"minecraft_action_status","description":"Read the durable receipt for an action_id","inputSchema":{"type":"object","required":["action_id"],"properties":{"action_id":{"type":"string"}},"additionalProperties":false}},
                 {"name":"minecraft_reconcile","description":"Explicitly reconcile an uncertain action without replay","inputSchema":{"type":"object","required":["action_id"],"properties":{"action_id":{"type":"string"}},"additionalProperties":false}}
@@ -220,6 +227,15 @@ async fn mcp(client: &Client) -> std::result::Result<(), Box<dyn std::error::Err
                 let result: Result<Value> = match request["params"]["name"].as_str().unwrap_or("") {
                     "minecraft_discover" => client.discover().await.and_then(as_json),
                     "minecraft_observe" => client.observe().await.and_then(as_json),
+                    "minecraft_observation_query" => {
+                        match serde_json::from_value::<ObservationQuery>(args.clone()) {
+                            Ok(query) => client.read_observation(&query).await,
+                            Err(_) => Err(ApiError::new(
+                                ErrorCode::InvalidRequest,
+                                "Invalid observation query",
+                            )),
+                        }
+                    }
                     "minecraft_act" => {
                         match serde_json::from_value::<ActionRequest>(args.clone()) {
                             Ok(r) => client.act(&r).await.and_then(as_json),
