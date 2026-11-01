@@ -121,6 +121,12 @@ pub enum DigStage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
+    MotionFrame {
+        target: Position,
+    },
+    DropSelected {
+        entire_stack: bool,
+    },
     Move {
         target: Position,
         on_ground: bool,
@@ -200,6 +206,8 @@ pub enum Action {
 impl Action {
     pub fn capability(&self) -> &str {
         match self {
+            Self::MotionFrame { .. } => "minecraft:movement_frames",
+            Self::DropSelected { .. } => "minecraft:inventory",
             Self::Move { .. }
             | Self::Look { .. }
             | Self::Jump
@@ -222,9 +230,11 @@ impl Action {
     }
     pub fn validate(&self) -> Result<()> {
         let valid = match self {
-            Self::Move { target, .. } => [target.x, target.y, target.z]
-                .iter()
-                .all(|x| x.is_finite() && x.abs() <= 30_000_000.),
+            Self::Move { target, .. } | Self::MotionFrame { target } => {
+                [target.x, target.y, target.z]
+                    .iter()
+                    .all(|x| x.is_finite() && x.abs() <= 30_000_000.)
+            }
             Self::Look { yaw, pitch } => yaw.is_finite() && pitch.is_finite() && pitch.abs() <= 90.,
             Self::Dig { face, .. } => *face <= 5,
             Self::Place { face, hit, .. } | Self::UseBlock { face, hit, .. } => {
@@ -329,6 +339,29 @@ pub struct Observation {
     pub menu: Value,
 }
 
+/// A read-only query to an operator-installed, namespaced observation provider.
+/// The gateway supplies the authenticated player identity; input never selects an actor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationQuery {
+    pub capability: String,
+    pub input: Value,
+}
+impl ObservationQuery {
+    pub fn validate(&self) -> Result<()> {
+        if !registry_id(&self.capability)
+            || !self.input.is_object()
+            || serde_json::to_vec(&self.input).map_or(true, |v| v.len() > 8192)
+        {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Invalid observation query",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Trusted, length-bounded JSON-line process interface, selected by the operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -347,6 +380,7 @@ pub enum AdapterOperation {
     Connect,
     Disconnect,
     Observe,
+    ReadObservation { request: ObservationQuery },
     Action { request: ActionRequest },
     Reconcile { action_id: String },
 }
@@ -357,6 +391,7 @@ pub enum AdapterResponse {
     Connected,
     Disconnected,
     Observation(Observation),
+    ObservationData(Value),
     Receipt(Receipt),
     Error(ApiError),
 }
@@ -364,6 +399,29 @@ pub enum AdapterResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observation_query_cannot_select_actor_or_plugin_code() {
+        assert!(
+            serde_json::from_str::<ObservationQuery>(
+                r#"{"capability":"demo:view","input":{},"player_uuid":"victim"}"#
+            )
+            .is_err()
+        );
+        for (capability, input) in [
+            ("../host", serde_json::json!({})),
+            ("demo:view", serde_json::json!("path")),
+            ("demo:view", serde_json::json!({"text":"x".repeat(8193)})),
+        ] {
+            assert!(
+                ObservationQuery {
+                    capability: capability.into(),
+                    input
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
     #[test]
     fn rejects_forged_actor_and_privileged_operations() {
         for value in [

@@ -116,6 +116,45 @@ async fn main() -> AnyResult<()> {
         .build()?;
     let endpoint = profile.endpoint.trim_end_matches('/');
     let path = format!("{endpoint}/v1/bots/{}/actions", profile.credential.bot_id);
+    expected(
+        Client::with_profile(&forged)?
+            .read_observation(&ObservationQuery {
+                capability: "probe:view".into(),
+                input: json!({}),
+            })
+            .await,
+        ErrorCode::Unauthorized,
+    )?;
+    expected(
+        client
+            .read_observation(&ObservationQuery {
+                capability: "probe:uninstalled_view".into(),
+                input: json!({}),
+            })
+            .await,
+        ErrorCode::UnsupportedCapability,
+    )?;
+    let forged_query = http
+        .post(format!(
+            "{endpoint}/v1/bots/{}/observations/query",
+            profile.credential.bot_id
+        ))
+        .bearer_auth(&profile.credential.key)
+        .header(
+            "x-minecraft-session",
+            &profile
+                .session
+                .as_ref()
+                .ok_or("Session required")?
+                .session_id,
+        )
+        .json(&json!({"capability":"probe:view","input":{},"player_uuid":"forged-other-player"}))
+        .send()
+        .await?
+        .status();
+    if !matches!(forged_query.as_u16(), 400 | 422) {
+        return Err("Observation query accepted a forged actor field".into());
+    }
     for action in [
         json!({"kind":"chat","message":"must-not-be-dispatched","actor":"forged-other-player"}),
         json!({"kind":"operator_bot_reset"}),

@@ -109,7 +109,12 @@ impl Client {
         while let Some(chunk) = response.chunk().await.map_err(|_| {
             ApiError::new(ErrorCode::UncertainOutcome, "Incomplete gateway response")
         })? {
-            if bytes.len() + chunk.len() > 1_048_576 {
+            let limit = if path.ends_with("/observations/query") {
+                8 * 1_048_576
+            } else {
+                1_048_576
+            };
+            if bytes.len() + chunk.len() > limit {
                 return Err(ApiError::new(
                     ErrorCode::InvalidRequest,
                     "Gateway response too large",
@@ -182,6 +187,17 @@ impl Client {
     pub async fn observe(&self) -> Result<Observation> {
         self.request(Method::GET, &self.bot_path("observations")?, None)
             .await
+    }
+    pub async fn read_observation(&self, query: &ObservationQuery) -> Result<serde_json::Value> {
+        query.validate()?;
+        self.request(
+            Method::POST,
+            &self.bot_path("observations/query")?,
+            Some(serde_json::to_value(query).map_err(|_| {
+                ApiError::new(ErrorCode::InvalidRequest, "Invalid observation query")
+            })?),
+        )
+        .await
     }
     pub async fn act(&self, request: &ActionRequest) -> Result<Receipt> {
         request.action.validate()?;
