@@ -1,0 +1,22 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+[[mods]]
+modId="minecraft_sdk"
+version="${mod_version}"
+displayName="Minecraft Rust SDK integration"
+description='''Private accountless bot admission and own-player observations. Gameplay remains ordinary non-operator player traffic.'''
+[[dependencies.minecraft_sdk]]
+modId="neoforge"
+type="required"
+versionRange="[21.1.233,21.2)"
+ordering="NONE"
+side="SERVER"
+[[dependencies.minecraft_sdk]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1]"
+ordering="NONE"
+side="SERVER"
+[[mixins]]
+config="minecraft_sdk.mixins.json"

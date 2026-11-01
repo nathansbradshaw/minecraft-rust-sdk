@@ -1,0 +1,12 @@
+{
+  "listen": "127.0.0.1:19136",
+  "journal": "/var/lib/minecraft-sdk/private/gateway.sqlite",
+  "adapter": {
+    "executable": "/usr/local/bin/minecraft-sdk-java-1-21-1",
+    "args": ["/etc/minecraft-sdk/adapter.json"]
+  },
+  "reserved_names": [],
+  "registrations_per_minute": 10,
+  "journal_max_mib": 1024,
+  "adapter_queue_capacity": 64
+}

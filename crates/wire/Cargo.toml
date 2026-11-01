@@ -1,0 +1,11 @@
+[package]
+name = "minecraft-sdk-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded Java packet framing and compression"
+[dependencies]
+unsigned-varint = "0.8"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }

@@ -1,0 +1,22 @@
+[package]
+name = "minecraft-sdk-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authenticated Minecraft SDK gateway with durable identity and action journals"
+
+[dependencies]
+minecraft-sdk-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+rusqlite.workspace = true
+axum.workspace = true
+tokio.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

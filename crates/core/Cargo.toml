@@ -1,0 +1,12 @@
+[package]
+name = "minecraft-sdk-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable Minecraft player contracts and versioned adapter protocol"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

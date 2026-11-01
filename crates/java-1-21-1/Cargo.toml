@@ -1,0 +1,16 @@
+[package]
+name = "minecraft-sdk-java-1-21-1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trusted Java 767 player connections for the NeoForge SDK integration"
+[dependencies]
+minecraft-sdk-core.workspace = true
+minecraft-sdk-wire = { path = "../wire" }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+libc = "0.2"

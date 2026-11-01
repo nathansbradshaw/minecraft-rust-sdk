@@ -1,0 +1,12 @@
+{
+  "name": "sdk-builder",
+  "image": "your-reviewed-coding-image@sha256:REPLACE_WITH_VERIFIED_DIGEST",
+  "proxy_image": "your-reviewed-egress-image@sha256:REPLACE_WITH_VERIFIED_DIGEST",
+  "proxy_config": "/srv/mc-bots/config/builder-egress.json",
+  "memory_mb": 768,
+  "cpus": 0.5,
+  "pids": 128,
+  "workspace_mb": 384,
+  "cache_mb": 256,
+  "log_mb": 10
+}

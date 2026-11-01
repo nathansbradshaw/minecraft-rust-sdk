@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/core", "crates/sdk", "crates/gateway", "crates/cli", "crates/runner", "crates/wire", "crates/java-1-21-1", "crates/xtask"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/nathansbradshaw/minecraft-rust-sdk"
+
+[workspace.dependencies]
+minecraft-sdk-core = { path = "crates/core" }
+minecraft-sdk = { path = "crates/sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+getrandom = "0.3"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"

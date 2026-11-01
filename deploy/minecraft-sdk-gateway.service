@@ -1,0 +1,34 @@
+[Unit]
+Description=Minecraft SDK trusted gameplay gateway
+After=network-online.target lazymc.service
+PartOf=lazymc.service
+
+[Service]
+ExecStart=%h/.local/bin/minecraft-sdk-gateway %h/minecraft-sdk/config/gateway.json
+WorkingDirectory=%h/minecraft-server
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGINT
+TimeoutStopSec=45s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=%h/minecraft-sdk/state
+ReadOnlyPaths=%h/minecraft-server/minecraft-sdk
+InaccessiblePaths=-/run/docker.sock -/run/containerd
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=768M
+MemorySwapMax=0
+TasksMax=128
+CPUQuota=100%
+
+[Install]
+WantedBy=default.target
