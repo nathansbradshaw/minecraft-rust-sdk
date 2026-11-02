@@ -45,17 +45,19 @@ impl Handle {
                     journal.event("conversation_started",json!({"event_driven":true,"health_gate":false,"model":"gpt-6-luna"}))?;
                     let mut seen=journal.get("chat_epoch")?.unwrap_or_default();
                     let mut sequence=journal.get("chat_sequence")?.and_then(|s|s.parse::<u64>().ok()).unwrap_or_default();
+                    let mut retry_at=None;
                     while !stopped.load(Ordering::Acquire) {
                         let observed=body.observe()?;
+                        if retry_at.is_some_and(|at|crate::now()<at){tokio::time::sleep(Duration::from_millis(250)).await;continue;}
+                        retry_at=None;
                         let chat_epoch=observed.world["chat_epoch"].as_str().unwrap_or("connection");
                         if seen!=chat_epoch {seen=chat_epoch.into();sequence=0;journal.set("chat_epoch",&seen)?;}
                         let messages:Vec<_>=observed.world["chat"].as_array().into_iter().flatten()
                             .filter(|m|m["sequence"].as_u64().is_some_and(|s|s>sequence)).cloned().collect();
                         if messages.is_empty() {tokio::time::sleep(Duration::from_millis(250)).await;continue;}
-                        sequence=messages.iter().filter_map(|m|m["sequence"].as_u64()).max().unwrap_or(sequence);
-                        journal.set("chat_sequence",&sequence.to_string())?;
+                        let next_sequence=messages.iter().filter_map(|m|m["sequence"].as_u64()).max().unwrap_or(sequence);
                         let incoming:Vec<_>=messages.into_iter().filter(|m|m["sender_uuid"].as_str()!=Some(&own)).collect();
-                        if incoming.is_empty(){continue;}
+                        if incoming.is_empty(){sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;continue;}
                         for message in &incoming {journal.event("chat_received",message.clone())?;}
                         let mut context=json!({"messages":incoming,"goal":brain.get("goal")?.unwrap_or_else(||cfg.goal.clone()),"player":observed.player,"body":body.view()});
                         crate::bound_value(&mut context["messages"],12000);
@@ -79,12 +81,18 @@ impl Handle {
                         let Some(reply)=reply else {break;};
                         let (reply,usage)=match reply {
                             Ok(r)=>r,
-                            Err(e)=>{journal.event("conversation_model_error",json!({"error":e.to_string(),"next_action":"Investigate the failed request; no unchanged automatic retry. A new incoming message is a new event."}))?;continue;}
+                            Err(e)=>{
+                                retry_at=crate::model::retry_at(e.as_ref());
+                                journal.event("conversation_model_error",json!({"error":e.to_string(),"retry_at_utc":retry_at,"next_action":"Wait for the explicit allocation clock event, otherwise investigate; no unchanged automatic retry."}))?;
+                                if retry_at.is_none(){sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;}
+                                continue;
+                            }
                         };
+                        sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;
                         journal.event("conversation_choice",json!({"reply":reply,"usage":usage}))?;
                         if !reply.goal.trim().is_empty() {
                             brain.select_goal(&reply.goal,"player_goal_selected",json!({"goal":reply.goal,"reason":reply.reason,"chat_sequence":sequence}),Some(&context["messages"].to_string()))?;
-                            brain.set("develop_next","true")?;
+                            brain.set("develop_next","false")?;
                             brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Rust program for composed work. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
                         }
                         if !reply.message.is_empty() {

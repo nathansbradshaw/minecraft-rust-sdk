@@ -652,8 +652,9 @@ impl Brain {
             let (choice, usage) = match answer {
                 Ok(v) => v,
                 Err(e) => {
+                    let retry_at = model::retry_at(e.as_ref());
                     self.journal
-                        .event("model_error", json!({"error":e.to_string(),"turn":turn}))?;
+                        .event("model_error", json!({"error":e.to_string(),"turn":turn,"retry_at_utc":retry_at,"unchanged_failure_polling":false}))?;
                     // Preserve responsive gameplay/chat while the operator or a
                     // new player goal supplies a changed condition. Repeating a
                     // rejected inference request is not investigation.
@@ -661,6 +662,9 @@ impl Brain {
                         && self.journal.get("goal_revision")?.unwrap_or_default()
                             == requested_revision
                     {
+                        if retry_at.is_some_and(|at| now() >= at) {
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         self.refresh().await?;
                     }
