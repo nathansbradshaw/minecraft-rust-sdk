@@ -58,7 +58,7 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
     let (mut caller, server) = tokio::net::UnixStream::pair().unwrap();
     let c = client.clone();
     let s = shared.clone();
-    let queued = tokio::spawn(async move { proxy(server, c, s).await });
+    let mut queued = tokio::spawn(async move { proxy(server, c, s).await });
     caller
         .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
         .await
@@ -70,11 +70,18 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
     );
     drop(caller);
     shared.emergency.store(false, Ordering::Release);
-    tokio::time::timeout(Duration::from_secs(1), queued)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(1), &mut queued).await;
+    if ended.is_err() {
+        let forwarded = tokio::time::timeout(Duration::from_millis(10), http.accept())
+            .await
+            .is_ok();
+        panic!(
+            "abandoned caller stuck: forwarded={forwarded}, emergency={}, lock_available={}",
+            shared.urgent(),
+            shared.mutation.try_lock().is_ok()
+        );
+    }
+    ended.unwrap().unwrap().unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(100), http.accept())
             .await

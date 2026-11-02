@@ -55,3 +55,32 @@ and round-trip dispatch. Retain that measurement and its failed thresholds
 independently of eventual native movement, survival and final health. Diagnostic
 phase fields explain a delay; they do not turn an acknowledgement into a verified
 effect or excuse a failed acceptance limit.
+
+NeoForge integration alpha.7 adds `minecraft:native_effect_clock`. Each native
+snapshot includes `world.sample_clock` with a JVM epoch and unsigned nanoseconds
+encoded as a string. Finite controls sample up to three native observations on
+a separate bounded worker after their first submitted frame. A verified
+`first_effect` must match a frame already submitted for that character and
+dimension, with the same clock epoch and no intervening server correction.
+Movement submission continues while sampling. Terminal publication waits for
+the bounded worker, preserving its evidence in the authoritative receipt.
+First movement and final target verification remain separate facts.
+
+```text
+mc-sdk-evidence reaction-latency PRIVATE_TRACE.jsonl NATIVE_REPORT.json NEW_SUMMARY.json
+```
+
+Capture every attempted movement ID in the native report and bind it to the
+complete trace. The Rust summary reports acknowledgement timing separately
+from a conservative physical-reaction bound: the native observation sample
+precedes local receipt, and its same-JVM clock is compared with the first
+verified movement sample. Missing, rejected, unverified or incompatible-clock
+effects stay visible; never omit them to pass a limit. Clock arithmetic retains
+integer precision and handles unsigned wrap. Different epochs cannot be compared.
+Older integrations continue gameplay but cannot supply this measurement.
+
+Native effect clocks are server evidence; controller observation clocks remain
+operator-attested through source/build/trace binding. This is not a cryptographic
+attestation of observation delivery or a competence benchmark. Declare the
+measurement method before a trial, preserve earlier acknowledgement failures,
+and report both metrics alongside deaths, outcomes and interventions.

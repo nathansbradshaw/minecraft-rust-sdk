@@ -2,12 +2,25 @@ use minecraft_sdk_evidence::{Spec, capture, private_file, sha256};
 use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 4 || args[0] != "capture" {
-        return Err("Usage: mc-sdk-evidence capture OPERATOR_GATEWAY.sqlite PRIVATE_SPEC.json NEW_PRIVATE_REPORT.json".into());
+    if args.len() != 4 || (args[0] != "capture" && args[0] != "reaction-latency") {
+        return Err("Usage: mc-sdk-evidence capture GATEWAY.sqlite SPEC.json NEW_REPORT.json | reaction-latency TRACE.jsonl NATIVE_REPORT.json NEW_SUMMARY.json".into());
     }
-    private_file(Path::new(&args[2]), 65536)?;
-    let spec: Spec = serde_json::from_slice(&fs::read(&args[2])?)?;
-    let report = serde_json::to_vec_pretty(&capture(Path::new(&args[1]), &spec)?)?;
+    let value = if args[0] == "capture" {
+        private_file(Path::new(&args[2]), 65536)?;
+        let spec: Spec = serde_json::from_slice(&fs::read(&args[2])?)?;
+        capture(Path::new(&args[1]), &spec)?
+    } else {
+        private_file(Path::new(&args[1]), 16 * 1024 * 1024)?;
+        private_file(Path::new(&args[2]), 8 * 1024 * 1024)?;
+        let native_bytes = fs::read(&args[2])?;
+        let mut summary = minecraft_sdk_evidence::latency::summarize(
+            &fs::read(&args[1])?,
+            &serde_json::from_slice(&native_bytes)?,
+        )?;
+        summary["native_report_file_sha256"] = serde_json::json!(sha256(&native_bytes));
+        summary
+    };
+    let report = serde_json::to_vec_pretty(&value)?;
     if report.len() > 8 * 1024 * 1024 {
         return Err("Evidence report exceeds budget".into());
     }

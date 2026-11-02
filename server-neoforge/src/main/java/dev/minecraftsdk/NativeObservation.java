@@ -18,6 +18,7 @@ import java.util.*;
 /** Bounded observations, always collected together on the authoritative server thread. */
 final class NativeObservation {
     static final int ENTITY_RADIUS=32;
+    private static final String CLOCK_EPOCH=UUID.randomUUID().toString();
     private static final Set<String> RANGED_ANIMATIONS=Set.of("BOW","CROSSBOW","SPEAR");
     private static Map<String,Object> equipment(ItemStack item){return Map.of("item",BuiltInRegistries.ITEM.getKey(item.getItem()).toString(),"use_animation",item.getUseAnimation().name());}
     private static Map<String,Object> stack(ItemStack stack,ServerPlayer player){
@@ -33,6 +34,7 @@ final class NativeObservation {
     }
     static Object snapshot(MinecraftServer server,ServerPlayer player){
         if(!server.isSameThread())throw new IllegalStateException("Main server thread required");
+        var sampleClock=Map.of("epoch",CLOCK_EPOCH,"nanos",Long.toUnsignedString(System.nanoTime()));
         var world=player.serverLevel();var origin=player.blockPosition();var menu=player.containerMenu;
         var inventory=new ArrayList<Map<String,Object>>();
         for(int i=0;i<player.getInventory().getContainerSize();i++){var row=new LinkedHashMap<>(stack(player.getInventory().getItem(i),player));row.put("slot",i);inventory.add(row);}
@@ -72,7 +74,7 @@ final class NativeObservation {
         own.put("attack_speed",player.getAttributeValue(Attributes.ATTACK_SPEED));own.put("max_health",player.getMaxHealth());own.put("armor",player.getArmorValue());
         var mining=(dev.minecraftsdk.mixin.GameModeAccessor)player.gameMode;var target=mining.sdk$miningPosition();own.put("mining",Map.of("active",mining.sdk$mining(),"block",List.of(target.getX(),target.getY(),target.getZ())));own.put("accepted_chat",NativeChat.snapshot(player));
         var chat=NativeChat.inbox(player);
-        return Map.of("revision",Integer.toString(server.getTickCount()),"player",own,"world",Map.of("game_time",world.getGameTime(),"day_time",world.getDayTime(),"blocks",blocks,"entities",entities,"unknown_columns",unknown,"chat",chat.get("messages"),"chat_epoch",chat.get("epoch"),"chat_dropped",chat.get("dropped")),"menu",Map.of("menu_id",menu.containerId,"state_id",menu.getStateId(),"type",menu==player.inventoryMenu?"minecraft:inventory":BuiltInRegistries.MENU.getKey(menu.getType()).toString(),"slots",slots,"carried",stack(menu.getCarried(),player)));
+        return Map.of("revision",Integer.toString(server.getTickCount()),"player",own,"world",Map.of("game_time",world.getGameTime(),"day_time",world.getDayTime(),"blocks",blocks,"entities",entities,"unknown_columns",unknown,"chat",chat.get("messages"),"chat_epoch",chat.get("epoch"),"chat_dropped",chat.get("dropped"),"sample_clock",sampleClock),"menu",Map.of("menu_id",menu.containerId,"state_id",menu.getStateId(),"type",menu==player.inventoryMenu?"minecraft:inventory":BuiltInRegistries.MENU.getKey(menu.getType()).toString(),"slots",slots,"carried",stack(menu.getCarried(),player)));
     }
     private NativeObservation(){}
 }

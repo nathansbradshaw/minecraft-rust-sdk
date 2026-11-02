@@ -1,4 +1,5 @@
 //! Operator-side native receipt capture. Never run against bot-controlled journals.
+pub mod latency;
 use minecraft_sdk_core::{Action, ActionRequest, Outcome, Receipt, valid_id};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
