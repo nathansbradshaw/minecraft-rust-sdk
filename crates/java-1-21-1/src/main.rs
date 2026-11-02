@@ -1215,12 +1215,14 @@ fn dispatch(
                     ));
                 }
                 let correction_epoch = player.corrections.load(Ordering::Acquire);
+                let observation_started = Instant::now();
                 let before = native.observe(&request.player_uuid).map_err(|_| {
                     ApiError::new(
                         ErrorCode::NotReady,
                         "Native observation unavailable before dispatch",
                     )
                 })?;
+                let observation_ms = observation_started.elapsed().as_millis();
                 if before.player["health"].as_f64().is_some_and(|h| h <= 0.)
                     && !matches!(action.action, Action::Respawn)
                 {
@@ -1242,6 +1244,7 @@ fn dispatch(
                             "This finite waypoint adapter currently requires observed ground support",
                         ));
                     }
+                    let planning_started = Instant::now();
                     let job = control::Job::start(
                         player,
                         native.clone(),
@@ -1249,7 +1252,8 @@ fn dispatch(
                         action,
                         correction_epoch,
                     )?;
-                    let receipt = job.status(&action.action_id)?;
+                    let mut receipt = job.status(&action.action_id)?;
+                    receipt.evidence["adapter_dispatch_timing"] = json!({"native_observation_ms":observation_ms,"planning_ms":planning_started.elapsed().as_millis(),"excludes":"wire delivery and game-effect verification"});
                     player.motion = None;
                     player.control = Some(job);
                     return Ok(AdapterResponse::Receipt(receipt));
