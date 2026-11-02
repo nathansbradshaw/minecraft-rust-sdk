@@ -252,6 +252,7 @@ fn compact_history(value: &mut Value) {
     }
 }
 pub struct Brain {
+    pub server: minecraft_sdk::ServerInfo,
     pub body: Option<body::Handle>,
     pub cfg: Config,
     pub client: Client,
@@ -373,6 +374,7 @@ impl Brain {
             let _=client.disconnect().await;return Err(e);
         }
         Ok(Self {
+            server: info,
             body,
             cfg,
             client,
@@ -505,7 +507,7 @@ impl Brain {
                 .get("activity")?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
-            let mut context = json!({"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
+            let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             // Preserve the latest error and player state under pressure; never
             // silently delete all feedback to make a world snapshot fit.
             bound_value(&mut context["memory"], 1000);
@@ -663,7 +665,13 @@ fn shrink_value(value: &mut Value) {
         }
         Value::Object(o) => {
             for (key, v) in o.iter_mut() {
-                if matches!(key.as_str(), "blocks" | "entities")
+                if key == "inventory"
+                    && let Some(a) = v.as_array_mut()
+                {
+                    for row in a {
+                        shrink_value(row);
+                    }
+                } else if matches!(key.as_str(), "blocks" | "entities")
                     && let Some(a) = v.as_array_mut()
                 {
                     // These snapshots prioritize nearest blocks and visible
@@ -719,7 +727,10 @@ mod tests {
         let entities: Vec<_> = (0..64)
             .map(|n| json!({"entity_id":n,"position":[n,64,1],"hostile":n==0}))
             .collect();
-        let mut context = json!({"player":{"position":[12.25,64.0,-9.5],"velocity":[0.1,0.0,0.2],"health":17.0},"blocks":blocks,"entities":entities,"collision":[0.,0.,0.,1.,1.,1.]});
+        let inventory: Vec<_> = (0..6)
+            .map(|slot| json!({"slot":slot,"item":"fixture:item","count":slot+1}))
+            .collect();
+        let mut context = json!({"player":{"position":[12.25,64.0,-9.5],"velocity":[0.1,0.0,0.2],"health":17.0,"inventory":inventory},"blocks":blocks,"entities":entities,"collision":[0.,0.,0.,1.,1.,1.]});
         bound_value(&mut context, 2000);
         assert!(context.to_string().len() <= 2000);
         assert_eq!(context["player"]["position"], json!([12.25, 64.0, -9.5]));
@@ -728,6 +739,8 @@ mod tests {
         assert_eq!(context["blocks"][0]["p"], json!([0, 64, 0]));
         assert_eq!(context["entities"][0]["entity_id"], 0);
         assert_eq!(context["entities"][0]["hostile"], true);
+        assert_eq!(context["player"]["inventory"].as_array().unwrap().len(), 6);
+        assert_eq!(context["player"]["inventory"][0]["count"], 1);
     }
     #[test]
     fn large_observations_cannot_erase_rejection_feedback() {
