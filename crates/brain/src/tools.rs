@@ -244,7 +244,12 @@ mod tests {
             .output()
             .await
             .unwrap();
-        assert!(result.status.success());
+        assert!(
+            result.status.success(),
+            "toolchain PATH probe failed: status={}, stderr={}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
         assert_eq!(result.stdout, b"ready\n");
     }
 }
