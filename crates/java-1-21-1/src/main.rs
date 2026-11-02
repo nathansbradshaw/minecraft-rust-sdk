@@ -1224,11 +1224,14 @@ fn dispatch(
                 })?;
                 let observation_ms = observation_started.elapsed().as_millis();
                 if before.player["health"].as_f64().is_some_and(|h| h <= 0.)
-                    && !matches!(action.action, Action::Respawn)
+                    && !matches!(
+                        action.action,
+                        Action::Respawn | Action::Chat { .. } | Action::Command { .. }
+                    )
                 {
                     return Err(ApiError::new(
                         ErrorCode::Conflict,
-                        "Character is dead; explicitly respawn before acting",
+                        "Character is dead; explicitly respawn before physical gameplay",
                     ));
                 }
                 if let Action::StartMove { max_ticks, .. } = &action.action {
