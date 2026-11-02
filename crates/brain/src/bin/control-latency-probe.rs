@@ -136,14 +136,64 @@ async fn probe(brain: &mut Brain) -> Result<()> {
     }
     Ok(())
 }
+async fn watch(brain: &mut Brain, count: u32) -> Result<()> {
+    let profile: Profile = serde_json::from_slice(&private_read(&brain.cfg.profile, 16384)?)?;
+    let started = Instant::now();
+    brain.journal.event(
+        "lane_watch_started",
+        json!({"uuid":profile.credential.player_uuid,"samples":count,"models_called":0}),
+    )?;
+    let mut timings = Vec::new();
+    for sample in 0..count {
+        let sent_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let sent = Instant::now();
+        let observed = brain.client.observe().await;
+        let ms = sent.elapsed().as_millis();
+        match observed {
+            Ok(o) => {
+                if o.player["uuid"] != profile.credential.player_uuid {
+                    return Err("Observation crossed character identities".into());
+                }
+                brain.journal.event("lane_watch_sample",json!({"sample":sample,"sent_at_unix_ms":sent_at,"latency_ms":ms,"uuid":o.player["uuid"],"revision":o.revision,"health":o.player["health"],"position":o.player["position"]}))?;
+                timings.push(ms);
+            }
+            Err(e) => {
+                brain.journal.event("lane_watch_interrupted",json!({"sample":sample,"sent_at_unix_ms":sent_at,"latency_ms":ms,"code":e.code,"message":e.message,"completed_samples":timings.len()}))?;
+                return Err(e.into());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    timings.sort_unstable();
+    brain.journal.event("lane_watch_finished",json!({"samples":timings.len(),"p50_ms":timings[(timings.len()-1)/2],"p95_ms":timings[(timings.len()*95).div_ceil(100)-1],"max_ms":timings.last(),"elapsed_ms":started.elapsed().as_millis(),"interpretation":"Native transport diagnostic only; not autonomous Survival or threat-reaction evidence"}))?;
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> Result<()> {
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or("Usage: control-latency-probe PRIVATE_CONFIG.json (inside container)")?;
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let path = args.first().ok_or(
+        "Usage: control-latency-probe PRIVATE_CONFIG.json [watch SAMPLE_COUNT] (inside container)",
+    )?;
+    let samples = match args.as_slice() {
+        [_] => None,
+        [_, command, count] if command == "watch" => {
+            let count: u32 = count.parse()?;
+            if !(1..=120).contains(&count) {
+                return Err("Watch samples must be 1–120".into());
+            }
+            Some(count)
+        }
+        _ => return Err("Unexpected diagnostic arguments".into()),
+    };
     let cfg: Config = serde_json::from_slice(&private_read(Path::new(&path), 16384)?)?;
     let mut brain = Brain::open(cfg).await?;
-    let result = probe(&mut brain).await;
+    let result = if let Some(count) = samples {
+        watch(&mut brain, count).await
+    } else {
+        probe(&mut brain).await
+    };
     let disconnected =
         tokio::time::timeout(Duration::from_secs(15), brain.client.disconnect()).await;
     brain.journal.event("control_latency_probe_exit",json!({"disconnected":matches!(disconnected,Ok(Ok(()))),"error":result.as_ref().err().map(ToString::to_string)}))?;
