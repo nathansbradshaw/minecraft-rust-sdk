@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -147,6 +147,8 @@ impl Tables {
     }
 }
 struct Player {
+    corrections: Arc<AtomicU64>,
+    correcting: Arc<AtomicBool>,
     control: Option<control::Job>,
     motion: Option<([f64; 3], f64)>,
     wire: Arc<Mutex<Wire<TcpStream>>>,
@@ -269,9 +271,15 @@ fn connect(
         let compression = wire.compression();
         let wire = Arc::new(Mutex::new(wire));
         let alive = Arc::new(AtomicBool::new(true));
-        let writer = wire.clone();
+        let corrections = Arc::new(AtomicU64::new(0));
+        let correcting = Arc::new(AtomicBool::new(false));
+        let reader_corrections = corrections.clone();
+        let reader_correcting = correcting.clone();
+        let reader_writer = wire.clone();
         let reader_alive = alive.clone();
         let reader_tables = tables.clone();
+        let reader_native = native.clone();
+        let reader_uuid = request.player_uuid.clone();
         let chat = Arc::new(Mutex::new(chat::ChatState::default()));
         let reader_chat = chat.clone();
         thread::spawn(move || {
@@ -283,8 +291,9 @@ fn connect(
                     if reader_tables.name("play", packet.id) == "player_chat" {
                         let mut chat = reader_chat.lock().map_err(|_| "Chat state unavailable")?;
                         if let Some(count) = chat.receive(&packet.payload)? {
-                            let mut writer =
-                                writer.lock().map_err(|_| "Player writer unavailable")?;
+                            let mut writer = reader_writer
+                                .lock()
+                                .map_err(|_| "Player writer unavailable")?;
                             reader_tables.send(
                                 &mut writer,
                                 "play",
@@ -294,7 +303,9 @@ fn connect(
                         }
                         return Ok(());
                     }
-                    let mut writer = writer.lock().map_err(|_| "Player writer unavailable")?;
+                    let mut writer = reader_writer
+                        .lock()
+                        .map_err(|_| "Player writer unavailable")?;
                     match reader_tables.name("play", packet.id) {
                         "keep_alive" => reader_tables.send(
                             &mut writer,
@@ -312,6 +323,8 @@ fn connect(
                             &8f32.to_be_bytes(),
                         )?,
                         "position" => {
+                            reader_correcting.store(true, Ordering::Release);
+                            reader_corrections.fetch_add(1, Ordering::AcqRel);
                             if packet.payload.len() < 34 {
                                 return Err("Malformed player correction".into());
                             }
@@ -322,6 +335,18 @@ fn connect(
                                 "teleport_confirm",
                                 &vi(id as i32),
                             )?;
+                            // A normal client reports its corrected position as
+                            // well as the teleport ID. Without a movement
+                            // report, server chunk tracking can stay at the old
+                            // location indefinitely while this client is idle.
+                            drop(writer);
+                            let observed = reader_native.observe(&reader_uuid).ok();
+                            let body = correction_ack(&packet.payload, observed.as_ref())?;
+                            let mut writer = reader_writer
+                                .lock()
+                                .map_err(|_| "Player writer unavailable")?;
+                            reader_tables.send(&mut writer, "play", "position", &body)?;
+                            reader_correcting.store(false, Ordering::Release);
                         }
                         "kick_disconnect" | "start_configuration" => {
                             return Err("Player disconnected or requires reconfiguration".into());
@@ -335,18 +360,23 @@ fn connect(
                 }
             }
             reader_alive.store(false, Ordering::Release);
-            if let Ok(writer) = writer.lock() {
+            if let Ok(writer) = reader_writer.lock() {
                 let _ = writer.connection().shutdown(std::net::Shutdown::Both);
             }
         });
         let until = Instant::now() + Duration::from_secs(5);
-        while native.observe(&request.player_uuid).is_err() {
+        while correcting.load(Ordering::Acquire) || native.observe(&request.player_uuid).is_err() {
+            if !alive.load(Ordering::Acquire) {
+                return Err("Player connection interrupted during admission".into());
+            }
             if Instant::now() > until {
                 return Err("Player did not enter Survival".into());
             }
             thread::sleep(Duration::from_millis(100));
         }
         Ok(Player {
+            corrections,
+            correcting,
             control: None,
             motion: None,
             wire,
@@ -477,6 +507,44 @@ fn position(o: &Observation) -> AnyResult<[f64; 3]> {
         p[1].as_f64().ok_or("Position missing")?,
         p[2].as_f64().ok_or("Position missing")?,
     ])
+}
+fn correction_ack(payload: &[u8], observed: Option<&Observation>) -> AnyResult<Vec<u8>> {
+    if payload.len() < 34 || payload[32] & !0x1f != 0 {
+        return Err("Malformed player correction".into());
+    }
+    let target = if payload[32] & 7 != 0 {
+        // Native state is already absolute. Adding relative wire offsets again
+        // would move the character twice. Only this admitted UUID is queried.
+        position(observed.ok_or("Relative correction needs native player state")?)?
+    } else {
+        let mut p = [0.; 3];
+        for (i, value) in p.iter_mut().enumerate() {
+            *value = f64::from_be_bytes(payload[i * 8..i * 8 + 8].try_into()?);
+        }
+        p
+    };
+    if target.iter().any(|v| !v.is_finite())
+        || target[0].abs() > 30_000_000.
+        || target[2].abs() > 30_000_000.
+    {
+        return Err("Invalid corrected position".into());
+    }
+    let ground = observed.is_some_and(|o| {
+        position(o).is_ok_and(|p| {
+            (0..3).all(|i| (p[i] - target[i]).abs() < 0.001)
+                && collision_boxes(o).is_ok_and(|boxes| {
+                    let (next, ground) =
+                        minecraft_sdk_java_1_21_1::physics::step(p, [0.; 3], -0.08, &boxes);
+                    ground && (next[1] - p[1]).abs() < 0.001
+                })
+        })
+    });
+    let mut body = Vec::with_capacity(25);
+    for value in target {
+        body.extend(value.to_be_bytes());
+    }
+    body.push(u8::from(ground));
+    Ok(body)
 }
 impl Player {
     fn send(&self, name: &str, body: &[u8]) -> AnyResult<()> {
@@ -1146,6 +1214,7 @@ fn dispatch(
                         "Inspect/cancel the active finite locomotion control first",
                     ));
                 }
+                let correction_epoch = player.corrections.load(Ordering::Acquire);
                 let before = native.observe(&request.player_uuid).map_err(|_| {
                     ApiError::new(
                         ErrorCode::NotReady,
@@ -1160,12 +1229,7 @@ fn dispatch(
                         "Character is dead; explicitly respawn before acting",
                     ));
                 }
-                if let Action::StartMove {
-                    target,
-                    jump,
-                    max_ticks,
-                } = &action.action
-                {
+                if let Action::StartMove { max_ticks, .. } = &action.action {
                     if *max_ticks > config.control_max_ticks {
                         return Err(ApiError::new(
                             ErrorCode::InvalidRequest,
@@ -1183,9 +1247,7 @@ fn dispatch(
                         native.clone(),
                         before,
                         action,
-                        [target.x, target.y, target.z],
-                        *jump,
-                        *max_ticks,
+                        correction_epoch,
                     )?;
                     let receipt = job.status(&action.action_id)?;
                     player.motion = None;
@@ -1508,6 +1570,35 @@ fn compact(action: &Action, o: &Observation) -> Value {
 #[cfg(test)]
 mod movement_tests {
     use super::*;
+    #[test]
+    fn correction_reports_authorized_absolute_position_and_observed_support() {
+        let mut packet = Vec::new();
+        for value in [12.5_f64, 1., -3.5] {
+            packet.extend(value.to_be_bytes());
+        }
+        packet.extend([0; 8]);
+        packet.push(0);
+        packet.extend(vi(7));
+        let o = Observation {
+            revision: "fixture".into(),
+            player: json!({"position":[12.5,1.,-3.5]}),
+            world: json!({"blocks":[{"position":[12,0,-4],"collision":[[0.,0.,0.,1.,1.,1.]]}]}),
+            menu: Value::Null,
+        };
+        let ack = correction_ack(&packet, Some(&o)).unwrap();
+        assert_eq!(&ack[..24], &packet[..24]);
+        assert_eq!(ack[24], 1);
+        assert_eq!(correction_ack(&packet, None).unwrap()[24], 0);
+        packet[32] = 1;
+        let mut corrected = o.clone();
+        corrected.player["position"] = json!([100., 64., -20.]);
+        let ack = correction_ack(&packet, Some(&corrected)).unwrap();
+        assert_eq!(f64::from_be_bytes(ack[..8].try_into().unwrap()), 100.);
+        assert!(correction_ack(&packet, None).is_err());
+        packet[32] = 0;
+        packet[..8].copy_from_slice(&f64::NAN.to_be_bytes());
+        assert!(correction_ack(&packet, Some(&o)).is_err());
+    }
     #[test]
     fn finite_only_discovery_still_allows_sprint_and_sneak() {
         let cfg = Config {
