@@ -145,6 +145,22 @@ impl Journal {
         }
         Ok(json!(records))
     }
+    fn last_result(&self) -> Result<Value> {
+        let data: Option<String> = self
+            .db
+            .query_row(
+                "SELECT data FROM events WHERE kind='tool_result' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut value: Value = data
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or(Value::Null);
+        compact_history(&mut value);
+        Ok(value)
+    }
     fn recent(&self) -> Result<Value> {
         let mut q=self.db.prepare("SELECT kind,data FROM events WHERE kind IN ('choice','tool_result','model_error','model_completion_claim') ORDER BY id DESC LIMIT 6")?;
         let mut rows = q.query([])?;
@@ -368,18 +384,21 @@ impl Brain {
                 .get("activity")?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
-            let mut context = json!({"goal":self.goal,"turn":turn,"workspace":self.cfg.workspace,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"pending_action":pending,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
+            let mut context = json!({"goal":self.goal,"turn":turn,"workspace":self.cfg.workspace,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             // Preserve the latest error and player state under pressure; never
             // silently delete all feedback to make a world snapshot fit.
-            bound_value(&mut context["memory"], 2000);
-            bound_value(&mut context["recent"], 8000);
-            bound_value(&mut context["observation"], 10000);
-            bound_value(&mut context["development_request"], 2000);
-            bound_value(&mut context["completed_tool_activity"], 4000);
+            bound_value(&mut context["memory"], 1000);
+            bound_value(&mut context["recent"], 4000);
+            bound_value(&mut context["observation"], 6000);
+            bound_value(&mut context["development_request"], 1000);
+            bound_value(&mut context["completed_tool_activity"], 2000);
+            bound_value(&mut context["last_tool_result"], 12000);
             ensure(
                 serde_json::to_vec(&context)?.len() <= 32768,
                 "Context budget exceeded",
             )?;
+            self.journal
+                .set("last_model_context", &serde_json::to_string(&context)?)?;
             let develop = self.journal.get("develop_next")?.as_deref() == Some("true");
             let future = model.choose(&context, develop);
             tokio::pin!(future);
@@ -566,6 +585,23 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("durable-native-id")
+        );
+    }
+    #[test]
+    fn latest_source_output_is_preserved_independently_of_recent_summaries() {
+        let t = tempfile::tempdir().unwrap();
+        let j = Journal::open(&t.path().join("brain.sqlite")).unwrap();
+        let text = format!("{}\nfn last_line_is_needed() {{}}", "x".repeat(7500));
+        j.event(
+            "tool_result",
+            json!({"tool":"terminal","result":{"stdout":text,"exit_code":0,"success":true}}),
+        )
+        .unwrap();
+        assert!(
+            j.last_result()
+                .unwrap()
+                .to_string()
+                .contains("last_line_is_needed")
         );
     }
 }

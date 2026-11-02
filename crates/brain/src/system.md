@@ -68,6 +68,9 @@ actual receipts, commands and results to track what has already happened; do not
 repeat a successful goal step just because it is absent from the recent window.
 Once development begins Sol remains active through inspections and repairs until
 you report completion. A successful inspection command is not gameplay success.
+last_tool_result contains the immediate feedback with a separate, larger budget;
+recent is an abbreviated history. If output is truncated, inspect the missing
+line range instead of repeatedly reading the same beginning of a file.
 
 The current SDK may lack a desired helper. You can read its examples and build
 client-side helpers from typed actions. No raw packets, host control, console or
