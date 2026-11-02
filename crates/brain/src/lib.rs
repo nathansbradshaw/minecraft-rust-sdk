@@ -133,6 +133,20 @@ impl Journal {
         self.db.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
         Ok(())
     }
+    fn note_intention(&self, id: &str, independent: bool) -> Result<()> {
+        if !independent || self.get("pending_action")?.unwrap_or_default().is_empty() {
+            self.set("pending_action", id)?;
+        }
+        Ok(())
+    }
+    fn resolve_pending(&self, receipt: &minecraft_sdk::Receipt) -> Result<()> {
+        if receipt.outcome.terminal()
+            && self.get("pending_action")?.as_deref() == Some(&receipt.action_id)
+        {
+            self.set("pending_action", "")?;
+        }
+        Ok(())
+    }
     pub fn remember(&self, kind: &str, text: &str) -> Result<()> {
         ensure(
             ["fact", "report", "hypothesis", "episode", "skill"].contains(&kind),
@@ -427,12 +441,16 @@ impl Brain {
         } else {
             None
         };
-        let previous = self.journal.get("pending_action")?.unwrap_or_default();
+        let mut previous = self.journal.get("pending_action")?.unwrap_or_default();
         let independent = matches!(
             action,
             minecraft_sdk::Action::Chat { .. } | minecraft_sdk::Action::Look { .. }
         );
         let cancelling = matches!(&action,minecraft_sdk::Action::CancelControl{action_id} if action_id==&previous);
+        if !previous.is_empty() && !independent && !cancelling {
+            self.inspect(&previous).await?;
+            previous = self.journal.get("pending_action")?.unwrap_or_default();
+        }
         ensure(
             previous.is_empty() || independent || cancelling,
             "Inspect/reconcile the recorded pending action before submitting another mutation",
@@ -442,7 +460,7 @@ impl Brain {
             json!({"action":action,"before":projection(&self.observed)}),
         )?;
         let id = format!("brain-{}-{sequence}", self.run_id);
-        self.journal.set("pending_action", &id)?;
+        self.journal.note_intention(&id, independent)?;
         let receipt = self
             .client
             .act(&ActionRequest {
@@ -451,15 +469,19 @@ impl Brain {
             })
             .await?;
         drop(_guard);
-        if independent && !previous.is_empty() {
-            self.journal.set("pending_action", &previous)?;
-        } else if receipt.outcome.terminal() {
-            self.journal.set("pending_action", "")?;
-        }
+        self.journal.resolve_pending(&receipt)?;
         self.journal
             .event("action_receipt", serde_json::to_value(&receipt)?)?;
         self.observed = self.client.observe().await?;
         Ok(json!({"receipt":receipt,"after":projection(&self.observed)}))
+    }
+    pub async fn inspect(&mut self, id: &str) -> Result<minecraft_sdk::Receipt> {
+        let receipt = self.client.action_status(id).await?;
+        ensure(receipt.action_id == id, "Status receipt action ID mismatch")?;
+        self.journal.resolve_pending(&receipt)?;
+        self.journal
+            .event("action_status", serde_json::to_value(&receipt)?)?;
+        Ok(receipt)
     }
     pub async fn settle(&mut self, id: &str) -> Result<Value> {
         let receipt = self.client.action_status(id).await?;
@@ -468,10 +490,11 @@ impl Brain {
         } else {
             self.client.reconcile(id).await?
         };
-        if receipt.outcome.terminal() && self.journal.get("pending_action")?.as_deref() == Some(id)
-        {
-            self.journal.set("pending_action", "")?;
-        }
+        ensure(
+            receipt.action_id == id,
+            "Reconciliation receipt action ID mismatch",
+        )?;
+        self.journal.resolve_pending(&receipt)?;
         self.journal
             .event("explicit_reconciliation", serde_json::to_value(&receipt)?)?;
         Ok(serde_json::to_value(receipt)?)
@@ -722,6 +745,52 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_identity_survives_independent_failure_and_only_matching_resolution_clears_it() {
+        let t = tempfile::tempdir().unwrap();
+        let j = Journal::open(&t.path().join("brain.sqlite")).unwrap();
+        j.note_intention("movement", false).unwrap();
+        j.note_intention("independent-chat", true).unwrap();
+        assert_eq!(
+            j.get("pending_action").unwrap().as_deref(),
+            Some("movement")
+        );
+        let mut receipt = minecraft_sdk::Receipt {
+            action_id: "independent-chat".into(),
+            outcome: Outcome::Observed,
+            adapter_version: "fixture".into(),
+            evidence: json!({}),
+            error: None,
+        };
+        j.resolve_pending(&receipt).unwrap();
+        assert_eq!(
+            j.get("pending_action").unwrap().as_deref(),
+            Some("movement")
+        );
+        receipt.action_id = "movement".into();
+        for outcome in [
+            Outcome::Prepared,
+            Outcome::Dispatched,
+            Outcome::Running,
+            Outcome::Uncertain,
+        ] {
+            receipt.outcome = outcome;
+            j.resolve_pending(&receipt).unwrap();
+            assert_eq!(
+                j.get("pending_action").unwrap().as_deref(),
+                Some("movement")
+            );
+        }
+        receipt.outcome = Outcome::Observed;
+        j.resolve_pending(&receipt).unwrap();
+        assert_eq!(j.get("pending_action").unwrap().as_deref(), Some(""));
+        j.note_intention("next-mutation", false).unwrap();
+        j.resolve_pending(&receipt).unwrap();
+        assert_eq!(
+            j.get("pending_action").unwrap().as_deref(),
+            Some("next-mutation")
+        );
+    }
     #[test]
     fn labelled_memory_and_pending_actions_survive_restart() {
         let t = tempfile::tempdir().unwrap();

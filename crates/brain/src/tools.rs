@@ -160,9 +160,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
             Ok(crate::projection(&brain.observed))
         }
         "sdk" => brain.act(serde_json::from_str(&choice.input)?).await,
-        "status" => Ok(serde_json::to_value(
-            brain.client.action_status(&choice.input).await?,
-        )?),
+        "status" => Ok(serde_json::to_value(brain.inspect(&choice.input).await?)?),
         "reconcile" => brain.settle(&choice.input).await,
         "read" => {
             let path = Path::new(&choice.input);
