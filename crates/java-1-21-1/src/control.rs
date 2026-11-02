@@ -3,6 +3,72 @@ use super::*;
 use std::collections::VecDeque;
 
 type Frame = ([f64; 3], bool);
+struct FirstEffectContext {
+    clock: Value,
+    uuid: String,
+    dimension: Value,
+    initial: [f64; 3],
+    frames: Vec<Frame>,
+    corrections: Arc<AtomicU64>,
+    epoch: u64,
+}
+fn first_effect_sample(ctx: &FirstEffectContext, after: &Observation, sent: u32) -> Option<Value> {
+    if ctx.corrections.load(Ordering::Acquire) != ctx.epoch
+        || after.player["uuid"] != ctx.uuid
+        || after.player["dimension"] != ctx.dimension
+        || ctx.clock["epoch"].as_str()? != after.world["sample_clock"]["epoch"].as_str()?
+    {
+        return None;
+    }
+    let start: u64 = ctx.clock["nanos"].as_str()?.parse().ok()?;
+    let end: u64 = after.world["sample_clock"]["nanos"]
+        .as_str()?
+        .parse()
+        .ok()?;
+    let elapsed = end.wrapping_sub(start);
+    if elapsed == 0 || elapsed > 2_000_000_000 {
+        return None;
+    }
+    let p = position(after).ok()?;
+    if (0..3).all(|i| (p[i] - ctx.initial[i]).abs() < 0.08) {
+        return None;
+    }
+    let matched = ctx
+        .frames
+        .iter()
+        .take(sent as usize)
+        .position(|(expected, _)| (0..3).all(|i| (p[i] - expected[i]).abs() < 0.08))?;
+    Some(
+        json!({"verified":true,"pending":false,"sample_clock":after.world["sample_clock"],
+        "revision":after.revision,"position":p,"matched_frame":matched+1,
+        "native_admission_to_sample_ns":elapsed.to_string(),
+        "scope":"First observed pose matching a submitted frame; target completion is separate"}),
+    )
+}
+fn observe_first_effect(native: Native, ctx: FirstEffectContext, state: Arc<Mutex<Receipt>>) {
+    let mut effect = json!({"verified":false,"pending":false,"reason":"No submitted displacement verified within bounded native samples"});
+    for _ in 0..3 {
+        if ctx.corrections.load(Ordering::Acquire) != ctx.epoch {
+            effect["reason"] = json!("Control interrupted by server correction");
+            break;
+        }
+        if let Ok(after) = native.observe_bounded(&ctx.uuid, Duration::from_millis(200)) {
+            let sent = state
+                .lock()
+                .ok()
+                .and_then(|r| r.evidence["progress"]["frames_sent"].as_u64())
+                .unwrap_or(0);
+            if let Some(verified) = first_effect_sample(&ctx, &after, sent as u32) {
+                effect = verified;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if let Ok(mut receipt) = state.lock() {
+        receipt.evidence["first_effect"] = effect;
+    }
+}
 struct Plan {
     frames: VecDeque<Frame>,
     boxes: Vec<[f64; 6]>,
@@ -204,7 +270,8 @@ impl Job {
             action_id: request.action_id.clone(),
             outcome: Outcome::Running,
             adapter_version: VERSION.into(),
-            evidence: json!({"before":compact(&request.action,&before),"native_effect_verified":false,"target":target,"progress":{"frames_sent":0},"max_ticks":max_ticks}),
+            evidence: json!({"before":compact(&request.action,&before),"native_effect_verified":false,"target":target,"progress":{"frames_sent":0},"max_ticks":max_ticks,
+                "first_effect":{"verified":false,"pending":false,"reason":"No submitted displacement sampled"}}),
             error: None,
         };
         let state = Arc::new(Mutex::new(initial));
@@ -224,10 +291,13 @@ impl Job {
             .ok_or_else(|| ApiError::new(ErrorCode::NotReady, "Player UUID unavailable"))?
             .to_owned();
         let action = request.action.clone();
+        let expected_frames: Vec<_> = plan.frames.iter().copied().collect();
+        let initial_position = plan.current;
         thread::spawn(move || {
             let started = Instant::now();
             let expiry = Duration::from_millis(u64::from(max_ticks) * 50);
             let mut sent = 0u32;
+            let mut first_check = None;
             let mut run = || -> AnyResult<(Outcome, Observation, bool)> {
                 loop {
                     if !alive.load(Ordering::Acquire) {
@@ -261,6 +331,27 @@ impl Job {
                     if let Ok(mut r) = state.lock() {
                         r.evidence["progress"] = json!({"frames_sent":sent,"commanded_position":p,"elapsed_ms":started.elapsed().as_millis(),"releasing":plan.outcome.is_some()});
                     }
+                    if sent == 1 && before.world["sample_clock"].is_object() {
+                        let ctx = FirstEffectContext {
+                            clock: before.world["sample_clock"].clone(),
+                            uuid: uuid.clone(),
+                            dimension: before.player["dimension"].clone(),
+                            initial: initial_position,
+                            frames: expected_frames.clone(),
+                            corrections: corrections.clone(),
+                            epoch: correction_epoch,
+                        };
+                        let observer = native.clone();
+                        let progress = state.clone();
+                        if let Ok(mut r) = state.lock() {
+                            r.evidence["first_effect"]["pending"] = json!(true);
+                        }
+                        // Verification never delays submission of the remaining
+                        // movement frames. Join only after input is released.
+                        first_check = Some(thread::spawn(move || {
+                            observe_first_effect(observer, ctx, progress)
+                        }));
+                    }
                     thread::sleep(Duration::from_millis(50));
                 }
                 let after = native.observe(&uuid)?;
@@ -273,7 +364,14 @@ impl Job {
                 Ok((outcome, after, verified))
             };
             let result = run();
+            if let Some(check) = first_check
+                && check.join().is_err()
+                && let Ok(mut r) = state.lock()
+            {
+                r.evidence["first_effect"] = json!({"verified":false,"pending":false,"reason":"Native first-effect observer failed"});
+            }
             if let Ok(mut r) = state.lock() {
+                let first_effect = r.evidence["first_effect"].clone();
                 match result {
                     Ok((outcome, after, verified)) => {
                         r.error = if outcome == Outcome::Failed {
@@ -285,7 +383,7 @@ impl Job {
                             None
                         };
                         r.outcome = outcome;
-                        r.evidence = json!({"before":compact(&action,&before),"after":compact(&action,&after),"native_effect_verified":verified,"input_released":true,"frames_sent":sent,"elapsed_ms":started.elapsed().as_millis(),"last_commanded_position":plan.current});
+                        r.evidence = json!({"before":compact(&action,&before),"after":compact(&action,&after),"native_effect_verified":verified,"input_released":true,"frames_sent":sent,"elapsed_ms":started.elapsed().as_millis(),"last_commanded_position":plan.current,"first_effect":first_effect});
                     }
                     Err(e) => {
                         r.outcome = Outcome::Uncertain;
@@ -306,6 +404,70 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn first_sample_fixture() -> (FirstEffectContext, Observation) {
+        let ctx = FirstEffectContext {
+            clock: json!({"epoch":"clock","nanos":"100"}),
+            uuid: "own".into(),
+            dimension: json!("minecraft:overworld"),
+            initial: [0.; 3],
+            frames: vec![([0.2, 0., 0.], true), ([0.4, 0., 0.], true)],
+            corrections: Arc::new(AtomicU64::new(7)),
+            epoch: 7,
+        };
+        let after = Observation {
+            revision: "2".into(),
+            player: json!({"uuid":"own","dimension":"minecraft:overworld","position":[0.2,0.,0.]}),
+            world: json!({"sample_clock":{"epoch":"clock","nanos":"120"}}),
+            menu: Value::Null,
+        };
+        (ctx, after)
+    }
+    #[test]
+    fn first_effect_requires_an_observed_submitted_displacement() {
+        let (ctx, mut after) = first_sample_fixture();
+        let sample = first_effect_sample(&ctx, &after, 1).unwrap();
+        assert_eq!(sample["matched_frame"], 1);
+        assert_eq!(sample["native_admission_to_sample_ns"], "20");
+        after.player["position"] = json!([0.4, 0., 0.]);
+        assert!(
+            first_effect_sample(&ctx, &after, 1).is_none(),
+            "unsent frame is not evidence"
+        );
+        after.player["position"] = json!([0., 0., 0.]);
+        assert!(
+            first_effect_sample(&ctx, &after, 2).is_none(),
+            "unchanged pose is not movement"
+        );
+    }
+    #[test]
+    fn first_effect_rejects_changed_actor_dimension_clock_or_correction() {
+        let (ctx, after) = first_sample_fixture();
+        for (field, value) in [("uuid", "other"), ("dimension", "minecraft:the_nether")] {
+            let mut changed = after.clone();
+            changed.player[field] = json!(value);
+            assert!(first_effect_sample(&ctx, &changed, 1).is_none());
+        }
+        let mut changed = after.clone();
+        changed.world["sample_clock"]["epoch"] = json!("restarted");
+        assert!(first_effect_sample(&ctx, &changed, 1).is_none());
+        ctx.corrections.fetch_add(1, Ordering::AcqRel);
+        assert!(first_effect_sample(&ctx, &after, 1).is_none());
+    }
+    #[test]
+    fn native_clock_preserves_unsigned_nanoseconds_and_wraps_safely() {
+        let (mut ctx, mut after) = first_sample_fixture();
+        ctx.clock["nanos"] = json!((u64::MAX - 10).to_string());
+        after.world["sample_clock"]["nanos"] = json!("5");
+        assert_eq!(
+            first_effect_sample(&ctx, &after, 1).unwrap()["native_admission_to_sample_ns"],
+            "16"
+        );
+        after.world["sample_clock"]["nanos"] = json!(5);
+        assert!(
+            first_effect_sample(&ctx, &after, 1).is_none(),
+            "numeric JSON loses clock precision"
+        );
+    }
     #[test]
     fn control_and_cancellation_ids_cannot_select_another_action() {
         let mut job = Job {

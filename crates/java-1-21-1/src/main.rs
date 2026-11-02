@@ -84,11 +84,15 @@ impl Native {
         })
     }
     fn call(&self, op: &str, body: Value) -> AnyResult<Value> {
+        self.call_with_timeout(op, body, Duration::from_secs(8))
+    }
+    fn call_with_timeout(&self, op: &str, body: Value, timeout: Duration) -> AnyResult<Value> {
         let response = self
             .http
             .post(format!("{}/v1/{op}", self.endpoint))
             .bearer_auth(&self.token)
             .json(&body)
+            .timeout(timeout)
             .send()?;
         let status = response.status();
         let mut bytes = Vec::new();
@@ -107,9 +111,14 @@ impl Native {
         Ok(serde_json::from_slice(&bytes)?)
     }
     fn observe(&self, uuid: &str) -> AnyResult<Observation> {
-        Ok(serde_json::from_value(
-            self.call("observe", json!({"player_uuid":uuid}))?,
-        )?)
+        self.observe_bounded(uuid, Duration::from_secs(8))
+    }
+    fn observe_bounded(&self, uuid: &str, timeout: Duration) -> AnyResult<Observation> {
+        Ok(serde_json::from_value(self.call_with_timeout(
+            "observe",
+            json!({"player_uuid":uuid}),
+            timeout,
+        )?)?)
     }
 }
 #[derive(Clone)]
@@ -1577,7 +1586,7 @@ fn compact(action: &Action, o: &Observation) -> Value {
         .filter(|b| positions.iter().any(|p| b["position"] == json!(p)))
         .cloned()
         .collect();
-    json!({"revision":o.revision,"player":o.player,"menu":o.menu,"world":{"game_time":o.world["game_time"],"day_time":o.world["day_time"],"blocks":blocks}})
+    json!({"revision":o.revision,"player":o.player,"menu":o.menu,"world":{"game_time":o.world["game_time"],"day_time":o.world["day_time"],"sample_clock":o.world["sample_clock"],"blocks":blocks}})
 }
 
 #[cfg(test)]
