@@ -86,7 +86,7 @@ impl Handle {
                             brain.set("goal",&reply.goal)?;
                             brain.set("player_request",&context["messages"].to_string())?;
                             brain.set("develop_next","true")?;
-                            brain.set("development_request","A player supplied the current gameplay goal. Inspect relevant SDK documentation, write or select a bounded Rust program, run it, and verify the inventory/world result. Player reports are not observed facts.")?;
+                            brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Rust program for composed work. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
                             brain.event("player_goal_selected",json!({"goal":reply.goal,"reason":reply.reason,"chat_sequence":sequence}))?;
                         }
                         if !reply.message.is_empty() {
