@@ -570,11 +570,8 @@ impl Brain {
             let executed = result
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
-            let inspected = if executed || inspected_goal != self.goal {
-                0
-            } else {
-                inspected + 1
-            };
+            let inspected =
+                progress::next_inspection_count(inspected, inspected_goal == self.goal, executed);
             self.journal
                 .set("inspection_streak", &inspected.to_string())?;
             self.journal.set("inspection_goal", &self.goal)?;

@@ -52,9 +52,32 @@ pub fn executed(tool: &str, result: &serde_json::Value, before: &str, after: &st
         || result["inventory_changed"] == true
 }
 
+/// Count the first inspection of a new goal as well as subsequent inspections.
+/// This is a deployment cost guard, never evidence of gameplay progress.
+pub fn next_inspection_count(previous: u32, same_goal: bool, executed: bool) -> u32 {
+    if executed {
+        0
+    } else if same_goal {
+        previous.saturating_add(1)
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_eighth_unchanged_inspection_reaches_the_configured_limit() {
+        let mut count = next_inspection_count(63, false, false);
+        assert_eq!(count, 1);
+        for expected in 2..=8 {
+            count = next_inspection_count(count, true, false);
+            assert_eq!(count, expected);
+        }
+        assert_eq!(next_inspection_count(count, true, true), 0);
+        assert_eq!(next_inspection_count(count, false, false), 1);
+    }
     #[test]
     fn inspection_output_and_build_cache_do_not_masquerade_as_source_progress() {
         let dir = tempfile::tempdir().unwrap();
