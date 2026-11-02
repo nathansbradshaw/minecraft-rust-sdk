@@ -39,3 +39,19 @@ controller and trusted inference logs, binaries and native observations
 separately. A journal controlled by a bot is not an authoritative input. A full
 benchmark still needs its frozen conditions, independent outcome checks,
 complete failure accounting and comparison procedures.
+
+For finite movement, the initial receipt also carries diagnostic dispatch
+phases. `gateway_dispatch_timing` separates character-lane admission, refreshing
+the previous control, durable intent preparation and the adapter call.
+`adapter_dispatch_timing` separates the native observation from trajectory
+planning. These durations use local monotonic clocks; never subtract timestamps
+from different hosts. The gateway timing ends before its final durable receipt
+save and excludes HTTP transport. The adapter timing excludes packet delivery
+and game-effect verification. A `running` receipt still does not prove movement.
+
+The reference body's `body_reaction.reaction_ms` measures local observation
+receipt through the returned start-control acknowledgement, including policy
+and round-trip dispatch. Retain that measurement and its failed thresholds
+independently of eventual native movement, survival and final health. Diagnostic
+phase fields explain a delay; they do not turn an acknowledgement into a verified
+effect or excuse a failed acceptance limit.

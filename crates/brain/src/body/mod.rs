@@ -357,6 +357,7 @@ async fn controller(
         };
         last_error.clear();
         let observed_at = Instant::now();
+        let observation_ms = started.elapsed().as_millis();
         cycles += 1;
         *shared.latest.lock().map_err(|_| "Body cache unavailable")? =
             Some((Instant::now(), Arc::new(observed.clone())));
@@ -392,11 +393,12 @@ async fn controller(
             previous_health = observed.player["health"].clone();
         }
         let danger = dead
-            || nearby.is_some_and(|(_, d)| d < 10.)
+            || geometry::threatened(&observed)
             || escape.is_some()
             || incoming
             || burning
             || observed.player["in_lava"] == true;
+        let policy_ms = observed_at.elapsed().as_millis();
         if danger {
             safe_since = Instant::now();
             if !shared.emergency.swap(true, Ordering::AcqRel) {
@@ -444,16 +446,11 @@ async fn controller(
                             json!({"death_recorded":true,"world_reset":false}),
                         )?;
                     } else if let Some(route) = escape {
-                        if observed.player["sprinting"] != true
-                            && observed.player["food"].as_u64().is_some_and(|n| n > 6)
-                        {
-                            let sprint = send(&client, j, Action::Sprint { enabled: true }).await?;
-                            body_sprint = sprint.outcome == Outcome::Observed;
-                        }
                         let key =
                             geometry::target_key([route.target.x, route.target.y, route.target.z]);
                         *shared.reason.lock().map_err(|_| "Body state unavailable")? =
                             route.reason.clone();
+                        let dispatch_started = Instant::now();
                         let r = send(
                             &client,
                             j,
@@ -470,7 +467,18 @@ async fn controller(
                             rejected_routes.push(key);
                             j.event("body_route_failure",json!({"target":key,"outcome":r.outcome,"error":r.error,"next_action":"try a different observed route; investigate if none works"}))?;
                         }
-                        j.event("body_reaction",json!({"reason":route.reason,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"outcome":r.outcome,"action_id":owned_control,"revision":observed.revision}))?;
+                        j.event("body_reaction",json!({"reason":route.reason,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"policy_ms":policy_ms,"dispatch_ms":dispatch_started.elapsed().as_millis(),"observation_ms":observation_ms,"gateway_dispatch_timing":r.evidence["gateway_dispatch_timing"],"adapter_dispatch_timing":r.evidence["adapter_dispatch_timing"],"outcome":r.outcome,"action_id":owned_control,"revision":observed.revision}))?;
+                        // Start displacement before waiting on the optional
+                        // sprint modifier's effect verification. This first
+                        // trajectory uses its observed walking speed; the next
+                        // one can use the newly observed sprint attribute.
+                        if r.outcome == Outcome::Running
+                            && observed.player["sprinting"] != true
+                            && observed.player["food"].as_u64().is_some_and(|n| n > 6)
+                        {
+                            let sprint = send(&client, j, Action::Sprint { enabled: true }).await?;
+                            body_sprint = sprint.outcome == Outcome::Observed;
+                        }
                     } else if let Some((enemy, d)) = nearby
                         && d <= 3.
                         && last_attack.elapsed() > Duration::from_millis(650)
@@ -491,7 +499,7 @@ async fn controller(
                     }
                 }
             }
-        } else if shared.urgent() && safe_since.elapsed() > Duration::from_secs(1) {
+        } else if shared.urgent() && safe_since.elapsed() > Duration::from_secs(3) {
             if body_sprint {
                 let _guard = shared.mutation.lock().await;
                 send(&client, j, Action::Sprint { enabled: false }).await?;
@@ -516,7 +524,7 @@ async fn controller(
             j.event("body_reconciliation",json!({"action_id":item.receipt.action_id,"outcome":result.as_ref().ok().map(|r|&r.outcome),"error":result.as_ref().err().map(ToString::to_string)}))?;
         }
         if cycles.is_multiple_of(100) {
-            j.event("body_heartbeat",json!({"cycles":cycles,"revision":observed.revision,"observation_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;
+            j.event("body_heartbeat",json!({"cycles":cycles,"revision":observed.revision,"observation_ms":observation_ms,"cycle_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;
         }
         let elapsed = started.elapsed();
         if elapsed < Duration::from_millis(cfg.period_ms) {

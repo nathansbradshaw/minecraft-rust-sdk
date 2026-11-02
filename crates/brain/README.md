@@ -27,6 +27,10 @@ debug information, and development debug symbols are stripped. Keep the harness
 executable outside disposable Cargo output before cleaning that output. Use one
 compatible profile/cache in a storage-limited workspace; building release and
 development dependency trees simultaneously may exceed a deployment's budget.
+The shared development profile optimizes this brain package's reactive geometry;
+it leaves generated bot programs and dependency profiles unchanged. Body reaction
+records separate policy, dispatch and observation durations so a transport stall
+cannot be mistaken for a planning improvement.
 
 The workspace should contain an ordinary Rust Cargo project with the SDK and
 Tokio dependencies and an appropriate dependency cache/vendor configuration.
@@ -109,6 +113,13 @@ vendor configuration; do not download another toolchain or dependency bundle.
 
 The default `body` configuration is `{ "enabled": true, "period_ms": 150 }`.
 It requires finite locomotion, public survival facts and pending-action inspection.
+The current body also requires `minecraft:ranged_observation`: visible entities
+within the installed observation radius include ranged-attack classification and
+visible hand item identifiers/animations. It distinguishes a ranged threat's
+24-block retreat boundary from the melee boundary, values observed cover, and
+checks safe one-block descents instead of treating a step as a diagonal ramp.
+These are replaceable client behaviors; they are not SDK gameplay policy or proof
+that every ranged mod entity, terrain trap or projectile is supported.
 Terminal children inherit `MC_SDK_ARBITER` and run at reduced CPU priority so the
 independent body can preempt gameplay while compilation continues. Use finite
 `start_move` and inspect its eventual receipt. Blocked code requests can resume

@@ -485,6 +485,7 @@ async fn action(
     headers: HeaderMap,
     Json(request): Json<ActionRequest>,
 ) -> std::result::Result<Json<Receipt>, HttpError> {
+    let received = Instant::now();
     g.actor(&bot, &headers)?;
     let guard = g.lane(&bot)?.lock_owned().await;
     let actor = g.actor(&bot, &headers)?;
@@ -504,11 +505,17 @@ async fn action(
     }
     let task = tokio::spawn(async move {
         let _guard = guard;
+        let lane_ms = received.elapsed().as_millis();
+        let phase = Instant::now();
         g.refresh_running(&actor).await?;
+        let refresh_ms = phase.elapsed().as_millis();
+        let phase = Instant::now();
         let (receipt, new) = g.db()?.prepare(&bot, &request, &adapter)?;
+        let prepare_ms = phase.elapsed().as_millis();
         if !new {
             return Ok(receipt);
         }
+        let phase = Instant::now();
         let response = g
             .call(
                 &actor,
@@ -517,7 +524,8 @@ async fn action(
                 },
             )
             .await;
-        let receipt = match response {
+        let adapter_ms = phase.elapsed().as_millis();
+        let mut receipt = match response {
             Ok(AdapterResponse::Receipt(r))
                 if r.action_id == request.action_id
                     && r.adapter_version == adapter
@@ -547,6 +555,13 @@ async fn action(
                 )),
             },
         };
+        if let Some(evidence) = receipt.evidence.as_object_mut() {
+            evidence.insert("gateway_dispatch_timing".into(), serde_json::json!({
+                "lane_ms":lane_ms,"refresh_ms":refresh_ms,"prepare_ms":prepare_ms,
+                "adapter_ms":adapter_ms,"before_receipt_save_ms":received.elapsed().as_millis(),
+                "excludes":"request/response transport and final durable receipt save; not game-effect timing"
+            }));
+        }
         g.db()?.save_receipt(&bot, &request.action_id, &receipt)?;
         Ok::<_, ApiError>(receipt)
     });

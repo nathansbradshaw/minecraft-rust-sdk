@@ -108,6 +108,94 @@ pub struct Escape {
     pub jump: bool,
     pub reason: String,
 }
+/// Client behavior only: ranged actors must not be declared safe at melee range.
+pub fn threat_radius(entity: &Value) -> f64 {
+    if entity["ranged_attack"] == true {
+        24.
+    } else {
+        10.
+    }
+}
+pub fn threatened(o: &Observation) -> bool {
+    let Some(start) = point(&o.player["position"]) else {
+        return false;
+    };
+    o.world["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|e| {
+            e["hostile"] == true
+                && e["visible"] == true
+                && point(&e["position"]).is_some_and(|p| {
+                    (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>()
+                        < threat_radius(e).powi(2)
+                })
+        })
+}
+// A descent is not a diagonal ramp through the ground. Validate the observed
+// surfaces under each footprint sample and its vertical clearance; the finite
+// server control still validates the actual collision/gravity trajectory.
+fn descending_route(
+    cells: &Cells<'_>,
+    start: [f64; 3],
+    target: [f64; 3],
+    obstacles: &[[f64; 6]],
+) -> bool {
+    let mut previous = start[1];
+    (0..=20).all(|i| {
+        let t = f64::from(i) / 20.;
+        let x = start[0] + (target[0] - start[0]) * t;
+        let z = start[2] + (target[2] - start[2]) * t;
+        let mut highest = target[1];
+        for dx in [-0.299, 0.299] {
+            for dz in [-0.299, 0.299] {
+                let (px, pz) = (x + dx, z + dz);
+                let floor = obstacles
+                    .iter()
+                    .filter(|b| {
+                        b[4] >= target[1] - 0.001
+                            && b[4] <= start[1] + 0.001
+                            && px >= b[0]
+                            && px <= b[3]
+                            && pz >= b[2]
+                            && pz <= b[5]
+                            && block(
+                                cells,
+                                [
+                                    px.floor() as i32,
+                                    (b[4] - 0.01).floor() as i32,
+                                    pz.floor() as i32,
+                                ],
+                            )
+                            .is_some_and(|b| !hazardous(b))
+                    })
+                    .map(|b| b[4])
+                    .max_by(f64::total_cmp);
+                let Some(floor) = floor else {
+                    return false;
+                };
+                highest = highest.max(floor);
+            }
+        }
+        if highest > previous + 0.001 {
+            return false;
+        }
+        let safe = if (highest - previous).abs() < 0.001 {
+            clear(cells, [x, highest, z], obstacles)
+        } else {
+            (0..=4).all(|n| {
+                clear(
+                    cells,
+                    [x, previous + (highest - previous) * f64::from(n) / 4., z],
+                    obstacles,
+                )
+            })
+        };
+        previous = highest;
+        safe
+    })
+}
 pub fn incoming(o: &Observation) -> bool {
     let Some(start) = point(&o.player["position"]) else {
         return false;
@@ -160,8 +248,8 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
             .map(|i| (p[i] - start[i]).powi(2))
             .sum::<f64>()
             .sqrt();
-        if e["hostile"] == true && d < 10. {
-            threats.push(p);
+        if e["hostile"] == true && d < threat_radius(e) {
+            threats.push((p, e["ranged_attack"] == true));
         }
         if e["projectile"] == true
             && let Some(v) = point(&e["velocity"])
@@ -178,7 +266,7 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
                     .sqrt();
                 if (0.0..=12.).contains(&t) && miss < 1.5 {
                     projectile_danger = true;
-                    threats.push(p);
+                    threats.push((p, true));
                     incoming_directions.push(v);
                 }
             }
@@ -199,12 +287,13 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
     let score = |p: [f64; 3]| -> f64 {
         let distance = threats
             .iter()
-            .map(|e| ((p[0] - e[0]).powi(2) + (p[2] - e[2]).powi(2)).sqrt())
+            .map(|(e, _)| ((p[0] - e[0]).powi(2) + (p[2] - e[2]).powi(2)).sqrt())
             .fold(30., f64::min);
         let cover = threats
             .iter()
-            .filter(|e| covered(p, **e, &obstacles))
-            .count() as f64;
+            .filter(|(e, _)| covered(p, *e, &obstacles))
+            .map(|(_, ranged)| if *ranged { 24. } else { 4. })
+            .sum::<f64>();
         let sidestep = incoming_directions
             .iter()
             .map(|v| {
@@ -216,7 +305,7 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
                 }
             })
             .fold(0., f64::max);
-        distance * 2. + cover * 4. + sidestep * 8.
+        distance * 2. + cover + sidestep * 8.
     };
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
@@ -237,18 +326,22 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
                     continue;
                 }
                 let jump = dy > 0.1;
-                let route = (0..=20).all(|i| {
-                    let t = f64::from(i) / 20.;
-                    let mut q = [
-                        start[0] + (p[0] - start[0]) * t,
-                        start[1] + dy * t,
-                        start[2] + (p[2] - start[2]) * t,
-                    ];
-                    if jump {
-                        q[1] += 1.25 * (std::f64::consts::PI * t).sin();
-                    }
-                    clear(&cells, q, &obstacles) && (jump || supported(&cells, q, &obstacles))
-                });
+                let route = if dy < 0. {
+                    descending_route(&cells, start, p, &obstacles)
+                } else {
+                    (0..=20).all(|i| {
+                        let t = f64::from(i) / 20.;
+                        let mut q = [
+                            start[0] + (p[0] - start[0]) * t,
+                            start[1] + dy * t,
+                            start[2] + (p[2] - start[2]) * t,
+                        ];
+                        if jump {
+                            q[1] += 1.25 * (std::f64::consts::PI * t).sin();
+                        }
+                        clear(&cells, q, &obstacles) && (jump || supported(&cells, q, &obstacles))
+                    })
+                };
                 if !route {
                     continue;
                 }
@@ -324,5 +417,64 @@ mod tests {
         }
         let e = evade(&o);
         assert!(e.is_none_or(|e| e.target.x >= 0.3));
+    }
+    #[test]
+    fn ranged_threats_remain_active_beyond_the_melee_cutoff() {
+        let mut o = world();
+        o.world["entities"][0]["position"] = json!([18.5, 1., 0.5]);
+        o.world["entities"][0]["ranged_attack"] = json!(true);
+        assert!(threatened(&o));
+        assert!(evade(&o).is_some_and(|e| e.target.x < 0.));
+        o.world["entities"][0]["ranged_attack"] = json!(false);
+        assert!(!threatened(&o));
+        assert!(evade(&o).is_none());
+    }
+    #[test]
+    fn a_one_block_descent_is_not_rejected_as_an_unsupported_diagonal_ramp() {
+        let mut o = world();
+        o.player["position"] = json!([0.5, 2., 0.5]);
+        o.world["entities"][0]["position"] = json!([3.5, 2., 0.5]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][0].as_i64().unwrap() >= 0 && b["position"][1] == 1 {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let e = evade(&o).expect("observed lower ground must be available for retreat");
+        assert!(e.target.x < 0. && e.target.y == 1. && !e.jump);
+        let cells: Cells<'_> = o.world["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let p = point(&b["position"]).unwrap();
+                (p.map(|n| n as i32), b)
+            })
+            .collect();
+        assert!(descending_route(
+            &cells,
+            [0.5, 2., 0.5],
+            [-2.3, 1., 0.5],
+            &boxes(&o)
+        ));
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][0] == -1 && b["position"][1] == 0 {
+                b["block"] = json!("minecraft:air");
+                b["collision"] = json!([]);
+            }
+        }
+        let cells: Cells<'_> = o.world["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let p = point(&b["position"]).unwrap();
+                (p.map(|n| n as i32), b)
+            })
+            .collect();
+        assert!(
+            !descending_route(&cells, [0.5, 2., 0.5], [-2.3, 1., 0.5], &boxes(&o)),
+            "a gap must not become a safe descent"
+        );
     }
 }
