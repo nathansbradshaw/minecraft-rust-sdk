@@ -46,6 +46,10 @@ Search includes older journal events and action receipts, so a short context
 window does not prevent the agent retrieving its actual action IDs. Source
 editing uses separate path and UTF-8 content fields without nested JSON source
 encoding. Completed tool activity persists across reasoning turns.
+The latest tool result has a separate context budget so ordinary source output
+is not silently replaced by its abbreviated history. `minecraft-sdk-brain
+context STATE_DIRECTORY` prints the last exact model context for local debugging;
+keep that output private because it includes observations and player conversation.
 
 Finite terminal jobs clean up their process group, including background children.
 Normal completion, run-budget exit and handled termination disconnect the SDK
