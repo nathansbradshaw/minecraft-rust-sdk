@@ -60,7 +60,10 @@ impl Handle {
                         let mut context=json!({"messages":incoming,"goal":brain.get("goal")?.unwrap_or_else(||cfg.goal.clone()),"player":observed.player,"body":body.view()});
                         crate::bound_value(&mut context["messages"],12000);
                         crate::bound_value(&mut context["player"],6000);
-                        let request=model.converse(&context);
+                        let request=async {
+                            let _permit=body.model_lanes.acquire(false).await?;
+                            model.converse(&context).await
+                        };
                         tokio::pin!(request);
                         let reply=loop {
                             tokio::select! {

@@ -21,6 +21,7 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
     );
     let shared = Arc::new(Shared {
         mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
         emergency: AtomicBool::new(true),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),

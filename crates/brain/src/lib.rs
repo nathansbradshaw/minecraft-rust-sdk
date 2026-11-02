@@ -527,7 +527,14 @@ impl Brain {
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
             let develop = self.journal.get("develop_next")?.as_deref() == Some("true");
             let requested_goal = self.goal.clone();
-            let future = model.choose(&context, develop);
+            let lanes = self.body.as_ref().map(|h| h.shared.model_lanes.clone());
+            let future = async {
+                let _permit = match lanes {
+                    Some(lanes) => Some(lanes.acquire(develop).await?),
+                    None => None,
+                };
+                model.choose(&context, develop).await
+            };
             tokio::pin!(future);
             let answer = loop {
                 tokio::select! {reply=&mut future=>break reply,_=tokio::time::sleep(Duration::from_secs(1))=>{match self.refresh().await{Ok(())=>{},Err(e)=>{self.journal.event("observation_error",json!({"error":e.to_string()}))?;}}}}
@@ -570,11 +577,8 @@ impl Brain {
             let executed = result
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
-            let inspected = if executed || inspected_goal != self.goal {
-                0
-            } else {
-                inspected + 1
-            };
+            let inspected =
+                progress::next_inspection_count(inspected, inspected_goal == self.goal, executed);
             self.journal
                 .set("inspection_streak", &inspected.to_string())?;
             self.journal.set("inspection_goal", &self.goal)?;
