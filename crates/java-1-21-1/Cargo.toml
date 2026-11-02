@@ -1,6 +1,6 @@
 [package]
 name = "minecraft-sdk-java-1-21-1"
-version.workspace = true
+version = "0.1.0-alpha.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

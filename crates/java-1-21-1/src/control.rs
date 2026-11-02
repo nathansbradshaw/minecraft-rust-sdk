@@ -3,6 +3,12 @@ use super::*;
 use std::collections::VecDeque;
 
 type Frame = ([f64; 3], bool);
+pub(super) fn preview(before: &Observation, target: [f64; 3], jump: bool) -> AnyResult<Vec<Frame>> {
+    Ok(Plan::new(before, target, jump)?
+        .frames
+        .into_iter()
+        .collect())
+}
 struct FirstEffectContext {
     clock: Value,
     uuid: String,

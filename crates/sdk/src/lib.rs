@@ -1,4 +1,5 @@
 pub use minecraft_sdk_core::*;
+pub mod navigation;
 use reqwest::{Client as Http, Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
@@ -12,6 +13,7 @@ pub struct Profile {
     pub session: Option<Session>,
 }
 pub struct Client {
+    expected_instance: Option<String>,
     local_arbiter: Option<std::path::PathBuf>,
     endpoint: Url,
     http: Http,
@@ -48,6 +50,7 @@ impl Client {
             .build()
             .map_err(|_| ApiError::new(ErrorCode::Internal, "Cannot create HTTP client"))?;
         Ok(Self {
+            expected_instance: None,
             local_arbiter: std::env::var_os("MC_SDK_ARBITER").map(std::path::PathBuf::from),
             endpoint,
             http,
@@ -57,6 +60,7 @@ impl Client {
     }
     pub fn with_profile(profile: &Profile) -> Result<Self> {
         let mut client = Self::new(&profile.endpoint)?;
+        client.expected_instance = Some(profile.instance_id.clone());
         client.credential = Some(profile.credential.clone());
         client.session = profile.session.clone();
         Ok(client)

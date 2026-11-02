@@ -1,0 +1,1017 @@
+//! Optional bounded navigation. Goals/policies belong to callers; predictions
+//! never replace ordinary permissions or native action receipts.
+use crate::*;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const CAPABILITY: &str = "minecraft:movement_options";
+fn error(code: ErrorCode, message: impl Into<String>) -> ApiError {
+    ApiError::new(code, message)
+}
+fn local(e: impl std::fmt::Display) -> ApiError {
+    error(
+        ErrorCode::Internal,
+        format!("Local navigation journal: {e}"),
+    )
+}
+fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
+}
+fn key(p: [f64; 3]) -> String {
+    format!(
+        "{}:{}:{}",
+        (p[0] * 4.).round() as i64,
+        (p[1] * 16.).round() as i64,
+        (p[2] * 4.).round() as i64
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Goal {
+    Position {
+        dimension: String,
+        target: [f64; 3],
+        distance: f64,
+    },
+    /// Eye height/range are caller-supplied character parameters, not core policy.
+    BlockReach {
+        dimension: String,
+        block: [i32; 3],
+        distance: f64,
+        eye_height: f64,
+    },
+}
+impl Goal {
+    fn dimension(&self) -> &str {
+        match self {
+            Self::Position { dimension, .. } | Self::BlockReach { dimension, .. } => dimension,
+        }
+    }
+    fn gap(&self, mut p: [f64; 3]) -> f64 {
+        match self {
+            Self::Position {
+                target,
+                distance: r,
+                ..
+            } => (distance(p, *target) - r).max(0.),
+            Self::BlockReach {
+                block,
+                distance: r,
+                eye_height,
+                ..
+            } => {
+                p[1] += eye_height;
+                let nearest = std::array::from_fn(|i| {
+                    p[i].clamp(f64::from(block[i]), f64::from(block[i]) + 1.)
+                });
+                (distance(p, nearest) - r).max(0.)
+            }
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        let (r, valid) = match self {
+            Self::Position {
+                target, distance, ..
+            } => (*distance, target.iter().all(|v| v.is_finite())),
+            Self::BlockReach {
+                distance,
+                eye_height,
+                ..
+            } => (
+                *distance,
+                eye_height.is_finite() && *eye_height > 0. && *eye_height < 10.,
+            ),
+        };
+        if !registry_id(self.dimension()) || !r.is_finite() || r < 0. || !valid {
+            return Err(error(ErrorCode::InvalidRequest, "Invalid navigation goal"));
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Options {
+    pub max_steps: usize,
+    pub max_nodes: usize,
+    pub timeout_ms: u64,
+    pub blocked_blocks: Vec<String>,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            max_steps: 128,
+            max_nodes: 1024,
+            timeout_ms: 120000,
+            blocked_blocks: Vec::new(),
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Report {
+    pub elapsed_ms: u64,
+    pub status: String,
+    pub position: [f64; 3],
+    pub remaining_distance: f64,
+    pub actions: usize,
+    pub pending_action: Option<String>,
+    pub journal: PathBuf,
+    pub note: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Origin {
+    position: [f64; 3],
+    dimension: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Route {
+    target: [f64; 3],
+    jump: bool,
+    max_ticks: u16,
+    duration_ticks: u32,
+    touched_blocks: Vec<String>,
+}
+#[derive(Debug, Deserialize)]
+struct Page {
+    format: String,
+    origin: Option<Origin>,
+    scene: String,
+    options: Vec<Route>,
+    complete: bool,
+    next_offset: Option<usize>,
+    retry_after_ms: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Edge {
+    route: Route,
+    to: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Node {
+    position: [f64; 3],
+    expanded: bool,
+    edges: Vec<Edge>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Attempt {
+    request: ActionRequest,
+    origin: [f64; 3],
+    scene: String,
+    target: [f64; 3],
+    outcome: Option<Outcome>,
+}
+#[derive(Serialize, Deserialize)]
+struct State {
+    version: u32,
+    instance: String,
+    actor: String,
+    goal: Goal,
+    prefix: String,
+    sequence: u64,
+    nodes: BTreeMap<String, Node>,
+    blocked: BTreeSet<String>,
+    pending: Option<Attempt>,
+    history: Vec<Attempt>,
+    position: [f64; 3],
+}
+struct Journal {
+    path: PathBuf,
+    state: State,
+    _lock: File,
+}
+static NEXT: AtomicU64 = AtomicU64::new(0);
+fn private_options() -> OpenOptions {
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+impl Journal {
+    fn open(path: &Path, goal: Goal, instance: &str, actor: &str, p: [f64; 3]) -> Result<Self> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent).map_err(local)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let lock = opts
+            .open(path.with_extension("navigation-lock"))
+            .map_err(local)?;
+        lock.try_lock().map_err(|_| {
+            error(
+                ErrorCode::Conflict,
+                "Another navigation invocation owns this journal",
+            )
+        })?;
+        let state = if path.exists() {
+            let m = fs::symlink_metadata(path).map_err(local)?;
+            if !m.is_file() || m.file_type().is_symlink() || m.len() > 16 * 1024 * 1024 {
+                return Err(local("Expected a bounded regular navigation state file"));
+            }
+            let s: State =
+                serde_json::from_slice(&fs::read(path).map_err(local)?).map_err(local)?;
+            if s.version != 1
+                || s.instance != instance
+                || s.actor != actor
+                || s.goal != goal
+                || !valid_id(&s.prefix)
+            {
+                return Err(error(
+                    ErrorCode::Conflict,
+                    "Navigation journal belongs to another goal, character, instance or version; preserve it and use a new path",
+                ));
+            }
+            s
+        } else {
+            State {
+                version: 1,
+                instance: instance.into(),
+                actor: actor.into(),
+                goal,
+                prefix: format!(
+                    "nav-{:x}-{:x}-{:x}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(local)?
+                        .as_nanos(),
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ),
+                sequence: 0,
+                nodes: BTreeMap::new(),
+                blocked: BTreeSet::new(),
+                pending: None,
+                history: Vec::new(),
+                position: p,
+            }
+        };
+        let j = Self {
+            path: path.to_owned(),
+            state,
+            _lock: lock,
+        };
+        j.save()?;
+        Ok(j)
+    }
+    fn save(&self) -> Result<()> {
+        let bytes = serde_json::to_vec(&self.state).map_err(local)?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(local("Navigation state exceeds storage budget"));
+        }
+        let temp = self.path.with_extension(format!(
+            "navigation-next-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = private_options().open(&temp).map_err(local)?;
+        f.write_all(&bytes).map_err(local)?;
+        f.sync_all().map_err(local)?;
+        fs::rename(&temp, &self.path).map_err(local)?;
+        #[cfg(unix)]
+        File::open(
+            self.path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+        .and_then(|f| f.sync_all())
+        .map_err(local)?;
+        Ok(())
+    }
+    fn report(&self, status: &str, note: &str) -> Report {
+        Report {
+            elapsed_ms: 0,
+            status: status.into(),
+            position: self.state.position,
+            remaining_distance: self.state.goal.gap(self.state.position),
+            actions: self.state.history.len(),
+            pending_action: self
+                .state
+                .pending
+                .as_ref()
+                .map(|p| p.request.action_id.clone()),
+            journal: self.path.clone(),
+            note: note.into(),
+        }
+    }
+}
+fn observed_pose(o: &Observation) -> Result<Origin> {
+    let p = &o.player["position"];
+    let position = [p[0].as_f64(), p[1].as_f64(), p[2].as_f64()];
+    let [Some(x), Some(y), Some(z)] = position else {
+        return Err(error(ErrorCode::NotReady, "Player position unavailable"));
+    };
+    if ![x, y, z].iter().all(|v| v.is_finite()) {
+        return Err(error(ErrorCode::NotReady, "Player position invalid"));
+    }
+    Ok(Origin {
+        position: [x, y, z],
+        dimension: o.player["dimension"]
+            .as_str()
+            .ok_or_else(|| error(ErrorCode::NotReady, "Dimension unavailable"))?
+            .into(),
+    })
+}
+fn blocked_key(from: &str, to: &str, scene: &str) -> String {
+    format!("{from}>{to}@{scene}")
+}
+fn choose(state: &State, start: &str) -> Option<Route> {
+    let mut costs: BTreeMap<String, f64> = BTreeMap::from([(start.to_owned(), 0.)]);
+    let mut first = BTreeMap::<String, Route>::new();
+    let mut done = BTreeSet::new();
+    let mut best: Option<(f64, f64, Route)> = None;
+    loop {
+        let next = costs
+            .iter()
+            .filter(|(k, _)| !done.contains(*k))
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(k, c)| (k.clone(), *c));
+        let Some((id, cost)) = next else {
+            break;
+        };
+        done.insert(id.clone());
+        let node = state.nodes.get(&id)?;
+        if id != start && !node.expanded {
+            let h = state.goal.gap(node.position);
+            let score = cost + h;
+            if best.as_ref().is_none_or(|(s, old_h, _)| {
+                score < *s - 1e-6 || ((score - *s).abs() < 1e-6 && h < *old_h)
+            }) {
+                best = Some((score, h, first.get(&id)?.clone()));
+            }
+        }
+        for e in &node.edges {
+            let n = cost + distance(node.position, e.route.target);
+            if costs.get(&e.to).is_none_or(|old| n < *old) {
+                costs.insert(e.to.clone(), n);
+                first.insert(
+                    e.to.clone(),
+                    if id == start {
+                        e.route.clone()
+                    } else {
+                        first.get(&id)?.clone()
+                    },
+                );
+            }
+        }
+    }
+    best.map(|(_, _, r)| r)
+}
+
+/// Resume a persisted navigation intention without replay. A reached block
+/// distance is a candidate interaction pose, not proof of mining or collection.
+pub async fn navigate(
+    client: &Client,
+    goal: Goal,
+    path: &Path,
+    options: Options,
+) -> Result<Report> {
+    let started = std::time::Instant::now();
+    goal.validate()?;
+    if options.max_steps == 0
+        || options.max_nodes == 0
+        || options.timeout_ms == 0
+        || options.blocked_blocks.iter().any(|s| !registry_id(s))
+    {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "Invalid navigation budget or registry ID",
+        ));
+    }
+    let expected = client.expected_instance.as_deref().ok_or_else(|| {
+        error(
+            ErrorCode::Unauthorized,
+            "Navigation requires a scoped client profile",
+        )
+    })?;
+    let info = client.verify_instance(expected).await?;
+    if !info.capabilities.iter().any(|c| c == CAPABILITY) {
+        return Err(error(
+            ErrorCode::UnsupportedCapability,
+            "Server does not advertise movement options",
+        ));
+    }
+    let observation = client.observe().await?;
+    let pose = observed_pose(&observation)?;
+    let actor = observation.player["uuid"]
+        .as_str()
+        .ok_or_else(|| error(ErrorCode::NotReady, "Player identity unavailable"))?;
+    let mut journal = Journal::open(path, goal, expected, actor, pose.position)?;
+    let run = tokio::time::timeout(
+        Duration::from_millis(options.timeout_ms),
+        run(client, &mut journal, &options),
+    )
+    .await;
+    let mut report = match run {
+        Ok(result) => result,
+        Err(_) => {
+            journal.save()?;
+            Ok(journal.report("budget_exhausted","Operation deadline reached; inspect the preserved pending ID before any new intention. Finite controls retain their server expiry."))
+        }
+    }?;
+    report.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    Ok(report)
+}
+async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Report> {
+    loop {
+        if let Some(pending) = &j.state.pending {
+            let id = pending.request.action_id.clone();
+            let receipt = match client.action_status(&id).await {
+                Ok(r) => r,
+                Err(e) if e.code == ErrorCode::NotFound => {
+                    return Ok(j.report(
+                        "needs_reconciliation",
+                        "Pending ID is absent from the current journal; do not replay it",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            let receipt = if matches!(
+                receipt.outcome,
+                Outcome::Prepared | Outcome::Dispatched | Outcome::Uncertain
+            ) {
+                client.reconcile(&id).await?
+            } else {
+                receipt
+            };
+            if receipt.action_id != id {
+                return Err(error(ErrorCode::Conflict, "Navigation receipt ID mismatch"));
+            }
+            if !receipt.outcome.terminal() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            if receipt.outcome == Outcome::Observed {
+                let after = &receipt.evidence["after"]["player"]["position"];
+                let actual = [after[0].as_f64(), after[1].as_f64(), after[2].as_f64()];
+                if receipt.evidence["native_effect_verified"] != true
+                    || !matches!(actual,[Some(x),Some(y),Some(z)] if distance([x,y,z],pending.target)<0.15)
+                {
+                    return Ok(j.report("needs_reconciliation","Observed receipt does not bind to the saved movement target; preserve the intention and investigate"));
+                }
+            }
+            let mut attempt = j
+                .state
+                .pending
+                .take()
+                .ok_or_else(|| local("Pending intention vanished"))?;
+            attempt.outcome = Some(receipt.outcome.clone());
+            if receipt.outcome != Outcome::Observed {
+                j.state.blocked.insert(blocked_key(
+                    &key(attempt.origin),
+                    &key(attempt.target),
+                    &attempt.scene,
+                ));
+            }
+            j.state.history.push(attempt);
+            j.save()?;
+        }
+        let observation = client.observe().await?;
+        let pose = observed_pose(&observation)?;
+        j.state.position = pose.position;
+        if observation.player["uuid"].as_str() != Some(&j.state.actor) {
+            return Err(error(
+                ErrorCode::Conflict,
+                "Observed character differs from navigation journal",
+            ));
+        }
+        if pose.dimension != j.state.goal.dimension() {
+            j.save()?;
+            return Ok(j.report(
+                "dimension_changed",
+                "Replan the goal explicitly in the observed dimension",
+            ));
+        }
+        if j.state.goal.gap(pose.position) <= 0.001 {
+            j.save()?;
+            return Ok(j.report("reached","Observed player pose satisfies the requested distance; gameplay effects need their own verification"));
+        }
+        if j.state.history.len() >= options.max_steps || j.state.nodes.len() > options.max_nodes {
+            j.save()?;
+            return Ok(j.report("budget_exhausted","Navigation exploration budget reached; inspect saved routes and outcomes before extending it"));
+        }
+        let mut offset = 0;
+        let mut origin: Option<Origin> = None;
+        let mut scene = String::new();
+        let mut routes = Vec::new();
+        loop {
+            let mut input = serde_json::json!({"offset":offset});
+            if let Goal::Position { target, .. } = j.state.goal {
+                input["target"] = serde_json::json!(target);
+            }
+            let value = client
+                .read_observation(&ObservationQuery {
+                    capability: CAPABILITY.into(),
+                    input,
+                })
+                .await?;
+            let page: Page = serde_json::from_value(value).map_err(|_| {
+                error(
+                    ErrorCode::UnsupportedVersion,
+                    "Movement option schema is incompatible",
+                )
+            })?;
+            if page.format != "minecraft-movement-options-v1" {
+                return Err(error(
+                    ErrorCode::UnsupportedVersion,
+                    "Movement option version is incompatible",
+                ));
+            }
+            let Some(now) = page.origin else {
+                tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000)))
+                    .await;
+                continue;
+            };
+            if now.dimension != pose.dimension || distance(now.position, pose.position) > 0.15 {
+                origin = None;
+                break;
+            }
+            if let Some(old) = &origin {
+                if distance(old.position, now.position) > 0.01 || scene != page.scene {
+                    origin = None;
+                    break;
+                }
+            } else {
+                scene = page.scene.clone();
+                origin = Some(now);
+            }
+            for r in page.options {
+                if !r.target.iter().all(|v| v.is_finite())
+                    || r.max_ticks == 0
+                    || r.duration_ticks == 0
+                {
+                    return Err(error(
+                        ErrorCode::UnsupportedVersion,
+                        "Invalid route prediction",
+                    ));
+                }
+                if !r
+                    .touched_blocks
+                    .iter()
+                    .any(|id| options.blocked_blocks.contains(id))
+                {
+                    routes.push(r);
+                }
+            }
+            if page.complete {
+                break;
+            }
+            let Some(next) = page.next_offset.filter(|n| *n > offset && *n <= 1024) else {
+                return Err(error(
+                    ErrorCode::NotReady,
+                    "Movement option pagination did not advance",
+                ));
+            };
+            offset = next;
+            tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000))).await;
+        }
+        let Some(origin) = origin else {
+            continue;
+        };
+        let current = key(origin.position);
+        let mut edges = Vec::new();
+        if !j.state.nodes.contains_key(&current) && j.state.nodes.len() >= options.max_nodes {
+            return Ok(j.report("budget_exhausted", "Navigation node budget reached"));
+        }
+        j.state.nodes.entry(current.clone()).or_insert(Node {
+            position: origin.position,
+            expanded: false,
+            edges: Vec::new(),
+        });
+        for r in routes {
+            let to = key(r.target);
+            if to == current
+                || j.state
+                    .blocked
+                    .contains(&blocked_key(&current, &to, &scene))
+            {
+                continue;
+            }
+            if !j.state.nodes.contains_key(&to) && j.state.nodes.len() >= options.max_nodes {
+                j.save()?;
+                return Ok(j.report("budget_exhausted", "Navigation node budget reached"));
+            }
+            j.state.nodes.entry(to.clone()).or_insert(Node {
+                position: r.target,
+                expanded: false,
+                edges: Vec::new(),
+            });
+            edges.push(Edge { route: r, to });
+        }
+        j.state.nodes.insert(
+            current.clone(),
+            Node {
+                position: origin.position,
+                expanded: true,
+                edges,
+            },
+        );
+        let Some(route) = choose(&j.state, &current) else {
+            j.save()?;
+            return Ok(j.report("no_known_route","No reachable unexplored frontier remains. This is not proof that the world has no route; inspect interaction, terrain and goal constraints."));
+        };
+        j.state.sequence = j
+            .state
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| local("Action sequence exhausted"))?;
+        let request = ActionRequest {
+            action_id: format!("{}-{}", j.state.prefix, j.state.sequence),
+            action: Action::StartMove {
+                target: Position {
+                    x: route.target[0],
+                    y: route.target[1],
+                    z: route.target[2],
+                },
+                jump: route.jump,
+                max_ticks: route.max_ticks,
+            },
+        };
+        j.state.pending = Some(Attempt {
+            request: request.clone(),
+            origin: origin.position,
+            scene,
+            target: route.target,
+            outcome: None,
+        });
+        j.save()?;
+        // Persist before dispatch. Even an interrupted HTTP request is inspected
+        // on the next invocation; it is never automatically submitted again.
+        client.act(&request).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "mc-sdk-navigation-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn goal() -> Goal {
+        Goal::Position {
+            dimension: "fixture:world".into(),
+            target: [5.5, 1., 0.5],
+            distance: 0.1,
+        }
+    }
+    fn route(p: [f64; 3]) -> Route {
+        Route {
+            target: p,
+            jump: false,
+            max_ticks: 60,
+            duration_ticks: 10,
+            touched_blocks: Vec::new(),
+        }
+    }
+    async fn respond(
+        listener: &tokio::net::TcpListener,
+        expected: &str,
+        value: serde_json::Value,
+        status: u16,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with(expected), "Unexpected request: {line}");
+        let public = line.starts_with("GET /v1/server ");
+        loop {
+            line.clear();
+            stream.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if public {
+                assert!(!line.to_ascii_lowercase().starts_with("authorization:"));
+            }
+        }
+        let body = value.to_string();
+        let response = format!(
+            "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .get_mut()
+            .write_all(response.as_bytes())
+            .await
+            .unwrap();
+    }
+    fn info(instance: &str) -> serde_json::Value {
+        serde_json::json!({"api_version":API_VERSION,"instance_id":instance,"minecraft_version":"fixture","platform":"fixture","adapter_version":"fixture","ready":true,"capabilities":[CAPABILITY],"limits":{}})
+    }
+    fn observation(p: [f64; 3]) -> serde_json::Value {
+        serde_json::json!({"revision":"fixture","player":{"uuid":"actor","dimension":"fixture:world","position":p},"world":{},"menu":null})
+    }
+    fn client(endpoint: String) -> Client {
+        Client::with_profile(&Profile {
+            endpoint,
+            instance_id: "instance".into(),
+            credential: Credential {
+                bot_id: "fixture".into(),
+                player_uuid: "actor".into(),
+                key: "f".repeat(64),
+            },
+            session: Some(Session {
+                session_id: "fixture-session".into(),
+                adapter_version: "fixture".into(),
+            }),
+        })
+        .unwrap()
+        .without_local_arbiter()
+    }
+    #[tokio::test]
+    async fn missing_interrupted_intention_is_inspected_but_never_submitted_again() {
+        let temp = Temp::new();
+        let path = temp.0.join("nav.json");
+        {
+            let mut j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+            j.state.pending = Some(Attempt {
+                request: ActionRequest {
+                    action_id: "interrupted".into(),
+                    action: Action::StartMove {
+                        target: Position {
+                            x: 1.5,
+                            y: 1.,
+                            z: 0.5,
+                        },
+                        jump: false,
+                        max_ticks: 60,
+                    },
+                },
+                origin: [0.5, 1., 0.5],
+                scene: "scene".into(),
+                target: [1.5, 1., 0.5],
+                outcome: None,
+            });
+            j.save().unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+            respond(
+                &listener,
+                "GET /v1/bots/fixture/observations ",
+                observation([0.5, 1., 0.5]),
+                200,
+            )
+            .await;
+            respond(
+                &listener,
+                "GET /v1/bots/fixture/actions/interrupted ",
+                serde_json::to_value(ApiError::new(ErrorCode::NotFound, "Unknown action")).unwrap(),
+                404,
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "No replay or other gameplay mutation may follow a missing ID"
+            );
+        });
+        let report = navigate(&c, goal(), &path, Options::default())
+            .await
+            .unwrap();
+        assert_eq!(report.status, "needs_reconciliation");
+        assert_eq!(report.pending_action.as_deref(), Some("interrupted"));
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn a_replacement_instance_never_receives_the_existing_key() {
+        let temp = Temp::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            respond(&listener, "GET /v1/server ", info("replacement"), 200).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            navigate(&c, goal(), &temp.0.join("nav.json"), Options::default())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn a_defensively_cancelled_intention_is_resolved_before_reporting_the_fresh_pose() {
+        let temp = Temp::new();
+        let path = temp.0.join("nav.json");
+        {
+            let mut j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+            j.state.pending = Some(Attempt {
+                request: ActionRequest {
+                    action_id: "cancelled".into(),
+                    action: Action::StartMove {
+                        target: Position {
+                            x: 1.5,
+                            y: 1.,
+                            z: 0.5,
+                        },
+                        jump: false,
+                        max_ticks: 60,
+                    },
+                },
+                origin: [0.5, 1., 0.5],
+                scene: "scene".into(),
+                target: [1.5, 1., 0.5],
+                outcome: None,
+            });
+            j.save().unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+            respond(
+                &listener,
+                "GET /v1/bots/fixture/observations ",
+                observation([5.5, 1., 0.5]),
+                200,
+            )
+            .await;
+            respond(&listener,"GET /v1/bots/fixture/actions/cancelled ",serde_json::json!({"action_id":"cancelled","outcome":"cancelled","adapter_version":"fixture","evidence":{"input_released":true},"error":null}),200).await;
+            respond(
+                &listener,
+                "GET /v1/bots/fixture/observations ",
+                observation([5.5, 1., 0.5]),
+                200,
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let report = navigate(&c, goal(), &path, Options::default())
+            .await
+            .unwrap();
+        assert_eq!(report.status, "reached");
+        assert_eq!(report.actions, 1);
+        assert!(report.pending_action.is_none());
+        server.await.unwrap();
+        let j = Journal::open(&path, goal(), "instance", "actor", [5.5, 1., 0.5]).unwrap();
+        assert_eq!(j.state.history[0].outcome, Some(Outcome::Cancelled));
+    }
+    #[test]
+    fn block_reach_uses_caller_parameters_and_nearest_face() {
+        let g = Goal::BlockReach {
+            dimension: "fixture:world".into(),
+            block: [0, 6, 0],
+            distance: 4.4,
+            eye_height: 1.62,
+        };
+        assert_eq!(g.gap([0.5, 0., 0.5]), 0.);
+        assert!(g.gap([4., 0., 0.5]) > 0.);
+        assert!(
+            Goal::Position {
+                dimension: "fixture:world".into(),
+                target: [f64::NAN, 0., 0.],
+                distance: 1.
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    #[test]
+    fn interrupted_intention_survives_reopen_and_concurrent_owner_is_refused() {
+        let temp = Temp::new();
+        let path = temp.0.join("nav.json");
+        let saved;
+        {
+            let mut j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+            assert!(Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).is_err());
+            saved = ActionRequest {
+                action_id: format!("{}-1", j.state.prefix),
+                action: Action::StartMove {
+                    target: Position {
+                        x: 1.5,
+                        y: 1.,
+                        z: 0.5,
+                    },
+                    jump: false,
+                    max_ticks: 60,
+                },
+            };
+            j.state.pending = Some(Attempt {
+                request: saved.clone(),
+                origin: [0.5, 1., 0.5],
+                scene: "known".into(),
+                target: [1.5, 1., 0.5],
+                outcome: None,
+            });
+            j.save().unwrap();
+        }
+        let j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&j.state.pending.as_ref().unwrap().request).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
+        drop(j);
+        assert!(
+            Journal::open(&path, goal(), "different-instance", "actor", [0.5, 1., 0.5]).is_err()
+        );
+        assert!(
+            Journal::open(
+                &path,
+                goal(),
+                "instance",
+                "another-character",
+                [0.5, 1., 0.5]
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn graph_can_detour_but_never_invents_reverse_edges_after_a_drop() {
+        let temp = Temp::new();
+        let mut j = Journal::open(
+            &temp.0.join("nav.json"),
+            goal(),
+            "instance",
+            "actor",
+            [0.5, 1., 0.5],
+        )
+        .unwrap();
+        let a = [0.5, 1., 0.5];
+        let b = [0.5, 1., 1.5];
+        let c = [2.5, 1., 1.5];
+        j.state.nodes.insert(
+            key(a),
+            Node {
+                position: a,
+                expanded: true,
+                edges: vec![Edge {
+                    route: route(b),
+                    to: key(b),
+                }],
+            },
+        );
+        j.state.nodes.insert(
+            key(b),
+            Node {
+                position: b,
+                expanded: true,
+                edges: vec![Edge {
+                    route: route(c),
+                    to: key(c),
+                }],
+            },
+        );
+        j.state.nodes.insert(
+            key(c),
+            Node {
+                position: c,
+                expanded: false,
+                edges: Vec::new(),
+            },
+        );
+        assert_eq!(choose(&j.state, &key(a)).unwrap().target, b);
+        assert!(choose(&j.state, &key(c)).is_none());
+    }
+}

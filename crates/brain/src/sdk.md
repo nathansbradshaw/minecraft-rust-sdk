@@ -36,3 +36,18 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   It returns only loaded blocks hit by an unobstructed targeting ray. Follow
   next_offset until complete, respecting retry_after_ms. A partial page with no
   matches is not proof that the area contains no resources. It cannot load code.
+- If advertised, minecraft:movement_options returns paged, collision/gravity-
+  admitted local waypoints. These are predictions; only executed receipts prove
+  movement. Prefer the optional Rust navigation helper over guessing each step:
+  navigation::navigate(&client, goal, journal_path, options).await?. Goal::Position
+  takes dimension, target:[x,y,z], distance. Goal::BlockReach takes dimension,
+  block:[x,y,z], distance and eye_height supplied for the character (upright Java
+  player:1.62; use an appropriate interaction range). Choose the block from fresh
+  observations. The helper uses a persistent local graph and finite controls;
+  it never mines, teleports, breaks obstacles or chooses your task.
+- Put its journal under MC_SDK_STATE, using a distinct file per goal. Reuse that
+  journal to resume; pending IDs are inspected rather than replayed. Options
+  controls operation deadline, actions, nodes and caller-supplied forbidden block
+  IDs. Inspect status/remaining_distance/pending_action in the report. reached
+  for BlockReach means a candidate interaction distance, not an obtained item.
+  Keep the defensive arbiter enabled and verify the requested game effect.
