@@ -718,6 +718,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "minecraft-sdk-evidence"
+version = "0.1.0-alpha.3"
+dependencies = [
+ "libc",
+ "minecraft-sdk-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "minecraft-sdk-gateway"
 version = "0.1.0-alpha.3"
 dependencies = [

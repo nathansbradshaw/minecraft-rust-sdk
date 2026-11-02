@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/brain", "crates/core", "crates/sdk", "crates/gateway", "crates/cli", "crates/runner", "crates/wire", "crates/java-1-21-1", "crates/xtask"]
+members = ["crates/evidence", "crates/brain", "crates/core", "crates/sdk", "crates/gateway", "crates/cli", "crates/runner", "crates/wire", "crates/java-1-21-1", "crates/xtask"]
 resolver = "3"
 
 [workspace.package]
