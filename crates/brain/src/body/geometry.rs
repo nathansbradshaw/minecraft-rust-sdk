@@ -181,13 +181,17 @@ fn descending_route(
         if highest > previous + 0.001 {
             return false;
         }
-        let safe = (0..=4).all(|n| {
-            clear(
-                cells,
-                [x, previous + (highest - previous) * f64::from(n) / 4., z],
-                obstacles,
-            )
-        });
+        let safe = if (highest - previous).abs() < 0.001 {
+            clear(cells, [x, highest, z], obstacles)
+        } else {
+            (0..=4).all(|n| {
+                clear(
+                    cells,
+                    [x, previous + (highest - previous) * f64::from(n) / 4., z],
+                    obstacles,
+                )
+            })
+        };
         previous = highest;
         safe
     })

@@ -27,6 +27,10 @@ debug information, and development debug symbols are stripped. Keep the harness
 executable outside disposable Cargo output before cleaning that output. Use one
 compatible profile/cache in a storage-limited workspace; building release and
 development dependency trees simultaneously may exceed a deployment's budget.
+The shared development profile optimizes this brain package's reactive geometry;
+it leaves generated bot programs and dependency profiles unchanged. Body reaction
+records separate policy, dispatch and observation durations so a transport stall
+cannot be mistaken for a planning improvement.
 
 The workspace should contain an ordinary Rust Cargo project with the SDK and
 Tokio dependencies and an appropriate dependency cache/vendor configuration.
