@@ -121,6 +121,16 @@ pub enum DigStage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
+    /// A bounded waypoint control; inspect its durable action ID while running.
+    StartMove {
+        target: Position,
+        #[serde(default)]
+        jump: bool,
+        max_ticks: u16,
+    },
+    CancelControl {
+        action_id: String,
+    },
     MotionFrame {
         target: Position,
     },
@@ -206,6 +216,7 @@ pub enum Action {
 impl Action {
     pub fn capability(&self) -> &str {
         match self {
+            Self::StartMove { .. } | Self::CancelControl { .. } => "minecraft:finite_locomotion",
             Self::MotionFrame { .. } => "minecraft:movement_frames",
             Self::DropSelected { .. } => "minecraft:inventory",
             Self::Move { .. }
@@ -230,6 +241,15 @@ impl Action {
     }
     pub fn validate(&self) -> Result<()> {
         let valid = match self {
+            Self::StartMove {
+                target, max_ticks, ..
+            } => {
+                *max_ticks > 0
+                    && [target.x, target.y, target.z]
+                        .iter()
+                        .all(|x| x.is_finite() && x.abs() <= 30_000_000.)
+            }
+            Self::CancelControl { action_id } => valid_id(action_id),
             Self::Move { target, .. } | Self::MotionFrame { target } => {
                 [target.x, target.y, target.z]
                     .iter()
@@ -315,11 +335,29 @@ pub struct ActionRequest {
 pub enum Outcome {
     Prepared,
     Dispatched,
+    Running,
     Observed,
+    Cancelled,
+    Expired,
+    Failed,
     Rejected,
     Uncertain,
     Reconciled,
     Imported,
+}
+impl Outcome {
+    pub fn terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Observed
+                | Self::Cancelled
+                | Self::Expired
+                | Self::Failed
+                | Self::Rejected
+                | Self::Reconciled
+                | Self::Imported
+        )
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -382,6 +420,7 @@ pub enum AdapterOperation {
     Observe,
     ReadObservation { request: ObservationQuery },
     Action { request: ActionRequest },
+    ActionStatus { action_id: String },
     Reconcile { action_id: String },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

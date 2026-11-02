@@ -1,5 +1,6 @@
 use minecraft_sdk_core::*;
 mod chat;
+mod control;
 use minecraft_sdk_java_1_21_1::{Wire, encode_signed_varint as vi};
 use minecraft_sdk_wire::{decode_string_prefix, decode_varint_prefix, encode_string as text};
 use serde::Deserialize;
@@ -25,7 +26,13 @@ struct Config {
     backend: SocketAddr,
     native_endpoint: String,
     native_token: PathBuf,
+    #[serde(default = "default_control_ticks")]
+    control_max_ticks: u16,
 }
+fn default_control_ticks() -> u16 {
+    100
+}
+#[derive(Clone)]
 struct Native {
     endpoint: String,
     token: String,
@@ -137,6 +144,7 @@ impl Tables {
     }
 }
 struct Player {
+    control: Option<control::Job>,
     motion: Option<([f64; 3], f64)>,
     wire: Arc<Mutex<Wire<TcpStream>>>,
     alive: Arc<AtomicBool>,
@@ -146,6 +154,9 @@ struct Player {
 }
 impl Drop for Player {
     fn drop(&mut self) {
+        if let Some(job) = &self.control {
+            job.stop();
+        }
         self.alive.store(false, Ordering::Release);
         if let Ok(wire) = self.wire.lock() {
             let _ = wire.connection().shutdown(std::net::Shutdown::Both);
@@ -333,6 +344,7 @@ fn connect(
             thread::sleep(Duration::from_millis(100));
         }
         Ok(Player {
+            control: None,
             motion: None,
             wire,
             alive,
@@ -486,6 +498,9 @@ impl Player {
             .checked_add(1)
             .ok_or("Sequence exhausted; reconnect")?;
         let name = match action {
+            Action::StartMove { .. } | Action::CancelControl { .. } => {
+                return Err("Finite controls use their own scheduler".into());
+            }
             Action::MotionFrame { target } => {
                 let (next, ground, velocity) = motion_frame(before, target, self.motion)?;
                 for v in next {
@@ -840,6 +855,9 @@ fn main() -> AnyResult<()> {
         .nth(1)
         .ok_or("Usage: minecraft-sdk-java-1-21-1 CONFIG.json")?;
     let config: Config = serde_json::from_slice(&std::fs::read(path)?)?;
+    if !(1..=600).contains(&config.control_max_ticks) {
+        return Err("Control tick budget must be 1–600".into());
+    }
     if !config.backend.ip().is_loopback() {
         return Err("Backend must be local to the trusted integration".into());
     }
@@ -957,6 +975,7 @@ fn dispatch(
                 capabilities: [
                     "minecraft:movement",
                     "minecraft:movement_frames",
+                    "minecraft:finite_locomotion",
                     "minecraft:mining",
                     "minecraft:placement",
                     "minecraft:block_use",
@@ -980,7 +999,7 @@ fn dispatch(
                         .map(String::from),
                 )
                 .collect(),
-                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4}),
+                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4,"finite_control_max_ticks":config.control_max_ticks}),
             })),
             AdapterOperation::Connect => {
                 if players.contains_key(&request.bot_id) {
@@ -1054,6 +1073,31 @@ fn dispatch(
                 let player = players.get_mut(&request.bot_id).ok_or_else(|| {
                     ApiError::new(ErrorCode::SessionRequired, "Player disconnected")
                 })?;
+                if let Action::CancelControl { action_id } = &action.action {
+                    return player
+                        .control
+                        .as_mut()
+                        .ok_or_else(|| {
+                            ApiError::new(ErrorCode::NotFound, "No character control to cancel")
+                        })?
+                        .cancel(&action.action_id, action_id)
+                        .map(AdapterResponse::Receipt);
+                }
+                if player.control.as_ref().is_some_and(|c| c.running())
+                    && matches!(
+                        action.action,
+                        Action::StartMove { .. }
+                            | Action::Move { .. }
+                            | Action::MotionFrame { .. }
+                            | Action::Jump
+                            | Action::Respawn
+                    )
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::Conflict,
+                        "Inspect/cancel the active finite locomotion control first",
+                    ));
+                }
                 let before = native.observe(&request.player_uuid).map_err(|_| {
                     ApiError::new(
                         ErrorCode::NotReady,
@@ -1067,6 +1111,38 @@ fn dispatch(
                         ErrorCode::Conflict,
                         "Character is dead; explicitly respawn before acting",
                     ));
+                }
+                if let Action::StartMove {
+                    target,
+                    jump,
+                    max_ticks,
+                } = &action.action
+                {
+                    if *max_ticks > config.control_max_ticks {
+                        return Err(ApiError::new(
+                            ErrorCode::InvalidRequest,
+                            "Control duration exceeds this deployment's advertised limit",
+                        ));
+                    }
+                    if before.player["on_ground"] != true {
+                        return Err(ApiError::new(
+                            ErrorCode::UnsupportedCapability,
+                            "This finite waypoint adapter currently requires observed ground support",
+                        ));
+                    }
+                    let job = control::Job::start(
+                        player,
+                        native.clone(),
+                        before,
+                        action,
+                        [target.x, target.y, target.z],
+                        *jump,
+                        *max_ticks,
+                    )?;
+                    let receipt = job.status(&action.action_id)?;
+                    player.motion = None;
+                    player.control = Some(job);
+                    return Ok(AdapterResponse::Receipt(receipt));
                 }
                 match &action.action {
                     Action::MotionFrame { target } => {
@@ -1169,7 +1245,26 @@ fn dispatch(
                     },
                 }))
             }
+            AdapterOperation::ActionStatus { action_id } => players
+                .get(&request.bot_id)
+                .and_then(|p| p.control.as_ref())
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::UncertainOutcome,
+                        "Control process history unavailable; reconcile without replay",
+                    )
+                })?
+                .status(action_id)
+                .map(AdapterResponse::Receipt),
             AdapterOperation::Reconcile { action_id } => {
+                if let Some(job) = players
+                    .get(&request.bot_id)
+                    .and_then(|p| p.control.as_ref())
+                    && let Ok(receipt) = job.status(action_id)
+                    && (receipt.outcome.terminal() || receipt.outcome == Outcome::Running)
+                {
+                    return Ok(AdapterResponse::Receipt(receipt));
+                }
                 let first = native.observe(&request.player_uuid).map_err(|_| {
                     ApiError::new(ErrorCode::NotReady, "Native reconciliation unavailable")
                 })?;

@@ -123,7 +123,7 @@ impl Store {
         let pending: Vec<(String, String, String)> = {
             let mut q = store
                 .db
-                .prepare("SELECT bot,id,receipt FROM actions WHERE unresolved=1")
+                .prepare("SELECT bot,id,receipt FROM actions WHERE unresolved<>0")
                 .map_err(internal)?;
             q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .map_err(internal)?
@@ -483,9 +483,38 @@ impl Store {
         Ok(())
     }
     pub fn disconnect(&self, bot: &str) -> Result<()> {
+        self.interrupt_running(bot)?;
         self.db
             .execute("DELETE FROM sessions WHERE bot=?1", [bot])
             .map_err(internal)?;
+        Ok(())
+    }
+    pub fn running(&self, bot: &str) -> Result<Vec<String>> {
+        let mut q = self
+            .db
+            .prepare("SELECT id FROM actions WHERE bot=?1 AND unresolved=2")
+            .map_err(internal)?;
+        q.query_map([bot], |r| r.get(0))
+            .map_err(internal)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(internal)
+    }
+    fn interrupt_running(&self, bot: &str) -> Result<()> {
+        for id in self.running(bot)? {
+            if let Some(mut r) = self.receipt(bot, &id)? {
+                r.outcome = Outcome::Uncertain;
+                r.error = Some(ApiError::new(
+                    ErrorCode::UncertainOutcome,
+                    "Controller connection ended; inspect/reconcile without replay",
+                ));
+                self.db
+                    .execute(
+                        "UPDATE actions SET receipt=?3,unresolved=1 WHERE bot=?1 AND id=?2",
+                        params![bot, id, serde_json::to_string(&r).map_err(internal)?],
+                    )
+                    .map_err(internal)?;
+            }
+        }
         Ok(())
     }
     pub fn session(&self, bot: &str, session: &str) -> Result<String> {
@@ -665,10 +694,16 @@ impl Store {
             self.db.execute("INSERT INTO legacy_overrides VALUES(?1,?2,?3) ON CONFLICT(bot,id) DO UPDATE SET receipt=excluded.receipt",params![bot,id,serde_json::to_string(receipt).map_err(internal)?]).map_err(internal)?;
             return Ok(());
         }
-        let unresolved = matches!(
+        let unresolved = if receipt.outcome == Outcome::Running {
+            2
+        } else if matches!(
             receipt.outcome,
             Outcome::Prepared | Outcome::Dispatched | Outcome::Uncertain
-        );
+        ) {
+            1
+        } else {
+            0
+        };
         self.db
             .execute(
                 "UPDATE actions SET receipt=?3,unresolved=?4 WHERE bot=?1 AND id=?2",
@@ -687,6 +722,95 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn running_controls_allow_cancellation_without_replay_and_become_uncertain_after_disconnect() {
+        let (_dir, mut s, _key, actor) = setup();
+        let request = ActionRequest {
+            action_id: "motion-1".into(),
+            action: Action::StartMove {
+                target: Position {
+                    x: 1.,
+                    y: 1.,
+                    z: 1.,
+                },
+                jump: false,
+                max_ticks: 40,
+            },
+        };
+        let (mut receipt, new) = s.prepare(&actor.bot_id, &request, "fixture").unwrap();
+        assert!(new);
+        receipt.outcome = Outcome::Running;
+        s.save_receipt(&actor.bot_id, &request.action_id, &receipt)
+            .unwrap();
+        let (same, new) = s.prepare(&actor.bot_id, &request, "fixture").unwrap();
+        assert!(!new);
+        assert_eq!(same.outcome, Outcome::Running);
+        let mut changed = request.clone();
+        changed.action = Action::Jump;
+        assert_eq!(
+            s.prepare(&actor.bot_id, &changed, "fixture")
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let cancel = ActionRequest {
+            action_id: "cancel-1".into(),
+            action: Action::CancelControl {
+                action_id: request.action_id.clone(),
+            },
+        };
+        let (mut cancellation, new) = s.prepare(&actor.bot_id, &cancel, "fixture").unwrap();
+        assert!(new);
+        cancellation.outcome = Outcome::Running;
+        s.save_receipt(&actor.bot_id, &cancel.action_id, &cancellation)
+            .unwrap();
+        assert_eq!(s.running(&actor.bot_id).unwrap().len(), 2);
+        s.disconnect(&actor.bot_id).unwrap();
+        assert!(s.running(&actor.bot_id).unwrap().is_empty());
+        for id in [&request.action_id, &cancel.action_id] {
+            assert_eq!(
+                s.receipt(&actor.bot_id, id).unwrap().unwrap().outcome,
+                Outcome::Uncertain
+            );
+        }
+        let other = ActionRequest {
+            action_id: "later".into(),
+            action: Action::Jump,
+        };
+        assert_eq!(
+            s.prepare(&actor.bot_id, &other, "fixture")
+                .unwrap_err()
+                .code,
+            ErrorCode::UncertainOutcome
+        );
+    }
+    #[test]
+    fn restart_preserves_running_intents_as_uncertain_instead_of_replaying_them() {
+        let (dir, mut s, _key, actor) = setup();
+        let request = ActionRequest {
+            action_id: "running-at-crash".into(),
+            action: Action::StartMove {
+                target: Position {
+                    x: 1.,
+                    y: 1.,
+                    z: 1.,
+                },
+                jump: false,
+                max_ticks: 40,
+            },
+        };
+        let (mut receipt, _) = s.prepare(&actor.bot_id, &request, "fixture").unwrap();
+        receipt.outcome = Outcome::Running;
+        s.save_receipt(&actor.bot_id, &request.action_id, &receipt)
+            .unwrap();
+        drop(s);
+        let mut reopened = Store::open(&dir.path().join("journal.sqlite")).unwrap();
+        let (old, new) = reopened
+            .prepare(&actor.bot_id, &request, "fixture")
+            .unwrap();
+        assert!(!new);
+        assert_eq!(old.outcome, Outcome::Uncertain);
+    }
     fn setup() -> (tempfile::TempDir, Store, Credential, Actor) {
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;

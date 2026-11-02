@@ -341,10 +341,7 @@ impl Brain {
                 action,
             })
             .await?;
-        if matches!(
-            receipt.outcome,
-            Outcome::Observed | Outcome::Rejected | Outcome::Reconciled | Outcome::Imported
-        ) {
+        if receipt.outcome.terminal() {
             self.journal.set("pending_action", "")?;
         }
         self.journal
@@ -354,15 +351,13 @@ impl Brain {
     }
     pub async fn settle(&mut self, id: &str) -> Result<Value> {
         let receipt = self.client.action_status(id).await?;
-        let receipt = if matches!(
-            receipt.outcome,
-            Outcome::Observed | Outcome::Rejected | Outcome::Reconciled | Outcome::Imported
-        ) {
+        let receipt = if receipt.outcome.terminal() || receipt.outcome == Outcome::Running {
             receipt
         } else {
             self.client.reconcile(id).await?
         };
-        if self.journal.get("pending_action")?.as_deref() == Some(id) {
+        if receipt.outcome.terminal() && self.journal.get("pending_action")?.as_deref() == Some(id)
+        {
             self.journal.set("pending_action", "")?;
         }
         self.journal

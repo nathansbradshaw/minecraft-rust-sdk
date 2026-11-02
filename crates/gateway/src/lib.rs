@@ -239,6 +239,43 @@ impl Gateway {
         .await
         .map_err(|_| ApiError::new(ErrorCode::NotReady, "Observation exchange interrupted"))?
     }
+    // Caller owns the character lifecycle lane. Running controls permit reads,
+    // cancellation and other work; only genuine interruption creates uncertainty.
+    async fn refresh_running(self: &Arc<Self>, actor: &Actor) -> Result<()> {
+        let ids = self.db()?.running(&actor.bot_id)?;
+        for id in ids {
+            let adapter = self
+                .db()?
+                .receipt(&actor.bot_id, &id)?
+                .ok_or_else(|| ApiError::new(ErrorCode::Internal, "Missing running receipt"))?
+                .adapter_version;
+            match self
+                .call(
+                    actor,
+                    AdapterOperation::ActionStatus {
+                        action_id: id.clone(),
+                    },
+                )
+                .await?
+            {
+                AdapterResponse::Receipt(r)
+                    if r.action_id == id
+                        && r.adapter_version == adapter
+                        && r.outcome != Outcome::Prepared =>
+                {
+                    self.db()?.save_receipt(&actor.bot_id, &id, &r)?;
+                }
+                AdapterResponse::Error(e) => return Err(e),
+                _ => {
+                    return Err(ApiError::new(
+                        ErrorCode::UncertainOutcome,
+                        "Control status unavailable; never replay",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 pub fn router(gateway: Shared) -> Router {
     Router::new()
@@ -438,12 +475,13 @@ async fn action(
         )
         .into());
     }
-    let (receipt, new) = g.db()?.prepare(&bot, &request, &adapter)?;
-    if !new {
-        return Ok(Json(receipt));
-    }
     let task = tokio::spawn(async move {
         let _guard = guard;
+        g.refresh_running(&actor).await?;
+        let (receipt, new) = g.db()?.prepare(&bot, &request, &adapter)?;
+        if !new {
+            return Ok(receipt);
+        }
         let response = g
             .call(
                 &actor,
@@ -495,9 +533,26 @@ async fn status(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Receipt>, HttpError> {
     g.actor(&bot, &headers)?;
-    Ok(Json(g.db()?.receipt(&bot, &id)?.ok_or_else(|| {
-        ApiError::new(ErrorCode::NotFound, "Unknown action ID")
-    })?))
+    let guard = g.lane(&bot)?.lock_owned().await;
+    let actor = g.actor(&bot, &headers)?;
+    let old = g
+        .db()?
+        .receipt(&bot, &id)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "Unknown action ID"))?;
+    if old.outcome != Outcome::Running {
+        return Ok(Json(old));
+    }
+    g.controller(&actor, &headers)?;
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        g.refresh_running(&actor).await?;
+        g.db()?
+            .receipt(&bot, &id)?
+            .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "Unknown action ID"))
+    });
+    Ok(Json(task.await.map_err(|_| {
+        ApiError::new(ErrorCode::NotReady, "Control status interrupted")
+    })??))
 }
 async fn reconcile(
     State(g): State<Shared>,
@@ -512,11 +567,20 @@ async fn reconcile(
         .db()?
         .receipt(&bot, &id)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "Unknown action ID"))?;
-    if matches!(
-        old.outcome,
-        Outcome::Observed | Outcome::Rejected | Outcome::Reconciled | Outcome::Imported
-    ) {
+    if old.outcome.terminal() {
         return Ok(Json(old));
+    }
+    if old.outcome == Outcome::Running {
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            g.refresh_running(&actor).await?;
+            g.db()?
+                .receipt(&bot, &id)?
+                .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "Unknown action ID"))
+        });
+        return Ok(Json(task.await.map_err(|_| {
+            ApiError::new(ErrorCode::NotReady, "Control status interrupted")
+        })??));
     }
     let task = tokio::spawn(async move {
         let _guard = guard;
