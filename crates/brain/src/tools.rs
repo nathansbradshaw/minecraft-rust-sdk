@@ -238,8 +238,11 @@ mod tests {
     #[tokio::test]
     async fn terminal_preserves_the_images_explicit_toolchain_path() {
         let t = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink("/bin/echo", t.path().join("image-toolchain-probe")).unwrap();
-        let result = local_shell("image-toolchain-probe ready")
+        // Some coreutils installations reject execution under a different
+        // utility name. Use the platform shell rather than renaming echo;
+        // the unique name still detects a login shell overwriting PATH.
+        std::os::unix::fs::symlink("/bin/sh", t.path().join("image-toolchain-probe")).unwrap();
+        let result = local_shell("image-toolchain-probe -c 'printf \"ready\\n\"'")
             .env("PATH", t.path())
             .output()
             .await
