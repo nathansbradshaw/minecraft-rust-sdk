@@ -759,8 +759,14 @@ impl Player {
                 return Ok(());
             }
             Action::Command { command } => {
-                body.extend(text(command)?);
-                "chat_command"
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis() as i64;
+                let mut chat = self.chat.lock().map_err(|_| "Chat state unavailable")?;
+                let body = chat.command_payload(command, now)?;
+                self.send("chat_command_signed", &body)?;
+                chat.pending = 0;
+                return Ok(());
             }
             Action::Respawn => {
                 body.extend(vi(0));
@@ -1224,11 +1230,14 @@ fn dispatch(
                 })?;
                 let observation_ms = observation_started.elapsed().as_millis();
                 if before.player["health"].as_f64().is_some_and(|h| h <= 0.)
-                    && !matches!(action.action, Action::Respawn)
+                    && !matches!(
+                        action.action,
+                        Action::Respawn | Action::Chat { .. } | Action::Command { .. }
+                    )
                 {
                     return Err(ApiError::new(
                         ErrorCode::Conflict,
-                        "Character is dead; explicitly respawn before acting",
+                        "Character is dead; explicitly respawn before physical gameplay",
                     ));
                 }
                 if let Action::StartMove { max_ticks, .. } = &action.action {
