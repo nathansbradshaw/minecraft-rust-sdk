@@ -77,6 +77,7 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_BUILD_JOBS", "1")
         .env("CARGO_PROFILE_DEV_DEBUG", "0")
+        .env("CARGO_PROFILE_DEV_STRIP", "debuginfo")
         .env(
             "CARGO_TARGET_DIR",
             brain
