@@ -37,6 +37,11 @@ require investigation rather than unchanged automatic requests.
 allocated inference capability without connecting a character or executing a
 returned tool. Record its actual admission and outcome; it proves inference,
 not gameplay intelligence. The key stays in its private local file.
+The operator can run `model-probe watch http://LOOPBACK:PORT/health SAMPLES`
+outside the bot containers to sample the independent inference service's `busy`
+counter. It accepts1–240 samples, checks at250ms intervals and fails above two
+active jobs. Correlate it with actual completed requests; an idle sample alone
+does not verify concurrent operation or remote provider/GPU utilization.
 
 Terminal builds default to one job, no incremental compilation or development
 debug information, and development debug symbols are stripped. Keep the harness
