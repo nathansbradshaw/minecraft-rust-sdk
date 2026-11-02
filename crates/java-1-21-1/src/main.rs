@@ -28,6 +28,9 @@ struct Config {
     native_token: PathBuf,
     #[serde(default = "default_control_ticks")]
     control_max_ticks: u16,
+    /// Legacy conformance only. Public coding workspaces require finite controls.
+    #[serde(default)]
+    allow_blocking_locomotion: bool,
 }
 fn default_control_ticks() -> u16 {
     100
@@ -714,7 +717,20 @@ fn motion_plan(
     {
         return Err("Waypoint exceeds observed terrain".into());
     }
-    trajectory(start, target, jump, &boxes)
+    let speed = observation.player["movement_speed"]
+        .as_f64()
+        .filter(|v| v.is_finite() && *v > 0.)
+        .map(|v| {
+            (v * 2.1585
+                * if observation.player["sneaking"] == true {
+                    0.3
+                } else {
+                    1.
+                })
+            .min(0.36)
+        })
+        .unwrap_or(0.12);
+    trajectory(start, target, jump, &boxes, speed)
 }
 fn collision_boxes(observation: &Observation) -> AnyResult<Vec<[f64; 6]>> {
     let blocks = observation.world["blocks"]
@@ -807,6 +823,7 @@ fn trajectory(
     target: [f64; 3],
     jump: bool,
     boxes: &[[f64; 6]],
+    speed: f64,
 ) -> AnyResult<Vec<([f64; 3], bool)>> {
     let mut frames = Vec::new();
     let mut p = start;
@@ -820,7 +837,11 @@ fn trajectory(
         let dx = target[0] - p[0];
         let dz = target[2] - p[2];
         let distance = (dx * dx + dz * dz).sqrt();
-        let factor = if distance > 0.12 { 0.12 / distance } else { 1. };
+        let factor = if distance > speed {
+            speed / distance
+        } else {
+            1.
+        };
         let (next, ground) = minecraft_sdk_java_1_21_1::physics::step(
             p,
             [dx * factor, 0., dz * factor],
@@ -988,7 +1009,18 @@ fn dispatch(
                     "minecraft:respawn",
                 ]
                 .into_iter()
+                .filter(|c| {
+                    config.allow_blocking_locomotion || !matches!(*c, "minecraft:movement_frames")
+                })
                 .map(String::from)
+                .chain(
+                    discovery["native_observation_features"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(String::from),
+                )
                 .chain(
                     discovery["observation_capabilities"]
                         .as_array()
@@ -999,7 +1031,7 @@ fn dispatch(
                         .map(String::from),
                 )
                 .collect(),
-                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4,"finite_control_max_ticks":config.control_max_ticks}),
+                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4,"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion}),
             })),
             AdapterOperation::Connect => {
                 if players.contains_key(&request.bot_id) {
@@ -1031,16 +1063,21 @@ fn dispatch(
                     ApiError::new(ErrorCode::NotReady, "Native observation unavailable")
                 })?;
                 if let Some(player) = players.get(&request.bot_id) {
-                    observation.world["chat"] = json!(
-                        player
-                            .chat
-                            .lock()
-                            .map_err(|_| ApiError::new(
-                                ErrorCode::Internal,
-                                "Chat observation unavailable"
-                            ))?
-                            .messages
-                    );
+                    if let Some(job) = &player.control {
+                        observation.player["control"] = job.observation();
+                    }
+                    if observation.world.get("chat").is_none() {
+                        observation.world["chat"] = json!(
+                            player
+                                .chat
+                                .lock()
+                                .map_err(|_| ApiError::new(
+                                    ErrorCode::Internal,
+                                    "Chat observation unavailable"
+                                ))?
+                                .messages
+                        );
+                    }
                 }
                 Ok(AdapterResponse::Observation(observation))
             }
@@ -1070,6 +1107,17 @@ fn dispatch(
             }
             AdapterOperation::Action { request: action } => {
                 action.action.validate()?;
+                if !config.allow_blocking_locomotion
+                    && matches!(
+                        action.action,
+                        Action::Move { .. } | Action::MotionFrame { .. } | Action::Jump
+                    )
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::UnsupportedCapability,
+                        "This deployment requires cancellable start_move controls; blocking locomotion is disabled",
+                    ));
+                }
                 let player = players.get_mut(&request.bot_id).ok_or_else(|| {
                     ApiError::new(ErrorCode::SessionRequired, "Player disconnected")
                 })?;
@@ -1274,7 +1322,6 @@ fn dispatch(
                 })?;
                 if first.player["inventory"] != second.player["inventory"]
                     || first.menu != second.menu
-                    || first.player["position"] != second.player["position"]
                 {
                     return Err(ApiError::new(
                         ErrorCode::UncertainOutcome,
@@ -1461,6 +1508,60 @@ fn compact(action: &Action, o: &Observation) -> Value {
 #[cfg(test)]
 mod movement_tests {
     use super::*;
+    #[test]
+    fn finite_only_discovery_still_allows_sprint_and_sneak() {
+        let cfg = Config {
+            backend: "127.0.0.1:9".parse().unwrap(),
+            native_endpoint: "http://127.0.0.1:9".into(),
+            native_token: "fixture".into(),
+            control_max_ticks: 100,
+            allow_blocking_locomotion: false,
+        };
+        let native = Native {
+            endpoint: cfg.native_endpoint.clone(),
+            token: "fixture".into(),
+            http: reqwest::blocking::Client::new(),
+        };
+        let request = AdapterRequest {
+            protocol: ADAPTER_VERSION,
+            instance_id: "fixture".into(),
+            bot_id: String::new(),
+            player_uuid: String::new(),
+            player_name: String::new(),
+            operation: AdapterOperation::Discover,
+        };
+        let AdapterResponse::Info(info) = dispatch(
+            &cfg,
+            &native,
+            &json!({"max_players":10}),
+            &mut HashMap::new(),
+            &request,
+        ) else {
+            panic!("Discovery failed");
+        };
+        for action in [
+            Action::Sprint { enabled: true },
+            Action::Sneak { enabled: true },
+            Action::StartMove {
+                target: Position {
+                    x: 1.,
+                    y: 0.,
+                    z: 0.,
+                },
+                jump: false,
+                max_ticks: 10,
+            },
+        ] {
+            assert!(info.capabilities.iter().any(|c| c == action.capability()));
+        }
+        assert!(
+            !info
+                .capabilities
+                .iter()
+                .any(|c| c == "minecraft:movement_frames")
+        );
+        assert_eq!(info.limits["blocking_locomotion"], false);
+    }
     #[test]
     fn leaving_support_allows_one_level_frame_then_requires_gravity() {
         let mut o = Observation {

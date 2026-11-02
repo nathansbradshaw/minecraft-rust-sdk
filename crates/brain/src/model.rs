@@ -34,6 +34,13 @@ pub struct Model {
     http: reqwest::Client,
     endpoint: String,
 }
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Conversation {
+    pub message: String,
+    pub goal: String,
+    pub reason: String,
+}
 impl Model {
     pub fn new(endpoint: &str, key_file: &Path) -> Result<Self> {
         let url = reqwest::Url::parse(endpoint)?;
@@ -70,12 +77,66 @@ impl Model {
     }
     pub async fn choose(&self, context: &Value, develop: bool) -> Result<(Choice, Value)> {
         let model = if develop { "gpt-6.1-sol" } else { "gpt-6-luna" };
+        let (content, usage) = self
+            .request(
+                context,
+                model,
+                if develop { "develop" } else { "plan" },
+                schema(),
+                include_str!("system.md"),
+                4096,
+            )
+            .await?;
+        let choice: Choice = serde_json::from_str(&content)?;
+        ensure(
+            TOOLS.contains(&choice.tool.as_str())
+                && choice.input.len() <= 10000
+                && choice.path.len() <= 256
+                && choice.summary.len() <= 1024,
+            "Invalid tool choice",
+        )?;
+        Ok((choice, usage))
+    }
+    pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {
+        let format = json!({"type":"object","properties":{"message":{"type":"string","maxLength":256},"goal":{"type":"string","maxLength":2048},"reason":{"type":"string","maxLength":512}},"required":["message","goal","reason"],"additionalProperties":false});
+        let (content, usage) = self
+            .request(
+                context,
+                "gpt-6-luna",
+                "plan",
+                format,
+                include_str!("conversation.md"),
+                1024,
+            )
+            .await?;
+        let reply: Conversation = serde_json::from_str(&content)?;
+        ensure(
+            reply.message.len() <= 256 && reply.goal.len() <= 2048 && reply.reason.len() <= 1024,
+            "Conversation exceeds its output budget",
+        )?;
+        if !reply.message.is_empty() {
+            minecraft_sdk::Action::Chat {
+                message: reply.message.clone(),
+            }
+            .validate()?;
+        }
+        Ok((reply, usage))
+    }
+    async fn request(
+        &self,
+        context: &Value,
+        model: &str,
+        purpose: &str,
+        format: Value,
+        prompt: &str,
+        tokens: u32,
+    ) -> Result<(String, Value)> {
         let context = serde_json::to_string(context)?;
         ensure(
             context.len() <= 32768,
             "Model context exceeds its declared budget",
         )?;
-        let body = json!({"model":model,"stream":false,"purpose":if develop{"develop"}else{"plan"},"options":{"num_predict":4096},"format":schema(),"messages":[{"role":"system","content":include_str!("system.md")},{"role":"user","content":context}]});
+        let body = json!({"model":model,"stream":false,"purpose":purpose,"options":{"num_predict":tokens},"format":format,"messages":[{"role":"system","content":prompt},{"role":"user","content":context}]});
         let started = std::time::Instant::now();
         let mut response = self.http.post(&self.endpoint).json(&body).send().await?;
         let status = response.status().as_u16();
@@ -99,16 +160,8 @@ impl Model {
         let content = envelope["message"]["content"]
             .as_str()
             .ok_or("Model content missing")?;
-        let choice: Choice = serde_json::from_str(content)?;
-        ensure(
-            TOOLS.contains(&choice.tool.as_str())
-                && choice.input.len() <= 10000
-                && choice.path.len() <= 256
-                && choice.summary.len() <= 1024,
-            "Invalid tool choice",
-        )?;
         Ok((
-            choice,
+            content.to_owned(),
             json!({"model":model,"elapsed_ms":started.elapsed().as_millis(),"response_bytes":bytes.len(),"host_tools_executed":false}),
         ))
     }

@@ -49,9 +49,9 @@ new sessions reject a changed binary until the gateway is deliberately restarted
 HTTP API 1 and the private NeoForge native API 1 are unchanged. This Rust transport
 change does not require replacing the alpha.3 NeoForge module. Deploy the matching
 Rust gateway and adapter together; restarting the gateway disconnects SDK players
-but does not restart the Minecraft server. Legacy `move` still blocks its own
-character's observations while executing. Independent lanes do not yet provide
-finite cancellable locomotion, a tactical Survival controller or survival proof.
+but does not restart the Minecraft server. Independent process lanes alone do
+not establish Survival competence; finite controls and client behavior are
+separate layers described below.
 
 The journal commits intent before dispatch, keeps action IDs permanently and
 fences multiple gateway processes with a file lock.
@@ -84,7 +84,11 @@ retain their 1 MiB client bound. Missing providers return `unsupported_capabilit
 walking frames. The Java adapter checks swept collision, ordinary per-frame
 distance, gravity and continuous airborne velocity, and derives ground contact.
 A caller cannot supply its own ground flag. Unsupported airborne states fail
-closed. `move` remains the higher-level supported-waypoint operation.
+closed. `move` is the older blocking waypoint operation. Since alpha.6 the Java
+adapter disables blocking `move`, `motion_frame` and `jump` by default. An operator
+can enable `allow_blocking_locomotion` for legacy conformance work. Public coding
+deployments should leave it disabled and use `start_move`, including its jump
+option. A caller cannot hold the observation lane using a legacy walk.
 
 Rust alpha.5 additionally advertises `minecraft:finite_locomotion`. `start_move`
 accepts a waypoint, `jump` and positive `max_ticks` (fifty milliseconds per tick).
@@ -115,3 +119,48 @@ capabilities and native tests. No NeoForge module change is needed for this
 optional Rust capability. Older clients cannot decode the new outcome variants
 for actions created by newer clients. Keep a matching gateway/adapter pair and
 preserve the journal through upgrades; never restore an old journal to replay work.
+
+Alpha.6 adds authenticated own-character `GET /v1/bots/{bot}/actions/pending`.
+It returns typed pending intentions and receipts, including interrupted imports
+without exposing their private journal paths. Independent conversation, looking,
+movement, combat and respawn can continue while an unrelated inventory/world
+mutation remains uncertain. Its durable ID remains fenced until reconciliation;
+this permission never retries the interrupted mutation.
+
+The NeoForge alpha.4 module advertises `minecraft:survival_facts` and
+`minecraft:delivered_chat`. Public observations include visible hostile entities,
+moving projectiles, collision geometry, food/use state and ordinary player
+attributes. Chat is collected per recipient after the server queues that
+connection's player, disguised/private, system or action-bar packet. Filtering
+is retained; signatures are not claimed verified. Buffers have connection epochs,
+sequence numbers, dropped counts and bounded marked text. No other recipient's
+private chat is queried. The Rust player socket still handles signed-chat
+acknowledgements. Installing these Java hooks requires a saved server restart.
+
+The optional reference brain runs its responsive body in a separate Rust thread
+and runtime, with a separate journal. It evades observed threats, can preempt a
+finite program control, resumes queued work when safe, and performs ordinary
+respawn. This initial policy is experimental: eating, combat effectiveness,
+fluids, complex navigation and general Survival strength require further native
+evidence. Health, shelter and threats do not gate model reasoning or conversation.
+
+Generated SDK programs inherit `MC_SDK_ARBITER`, a private same-UID Unix socket.
+It accepts bounded typed actions and no credentials/actor override. Urgent body
+control defers ordinary program actions; conversation remains available. Stalled,
+disappearing and partial callers cannot own a persistent action lease. This is
+cooperative client scheduling, not a security boundary against code holding its
+own bot key: the trusted gateway and ordinary server permissions remain that
+boundary. The engine fails closed on stale body observations and disconnects on
+controlled exit. A whole-container crash still needs deployment supervision.
+
+An independent event-driven Luna conversation loop records normally delivered
+chat and may send a reply or supply a parameterized gameplay goal while Sol
+develops code. Provider credentials and provider-side tools remain absent from
+the workspace. Deployments must allocate independent bounded model lanes while
+retaining their global inference and daily budgets. `await_chat_goal` supports a
+player-driven pilot without idle inference polling. Model errors are retained;
+unchanged rejected requests are not automatically resubmitted.
+
+Gate completion requires independently recorded gameplay and merged-source
+bindings. These interfaces, diagnostics and a successful compiler build alone do
+not establish intelligent gameplay, endurance or competitive performance.

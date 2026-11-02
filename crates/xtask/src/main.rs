@@ -40,6 +40,7 @@ fn allowed(path: &str) -> bool {
                 "crates/brain/README.md"
                     | "crates/brain/Cargo.container.toml"
                     | "crates/brain/src/system.md"
+                    | "crates/brain/src/conversation.md"
             )
             || path == "crates/java-1-21-1/packet-ids.json";
     }

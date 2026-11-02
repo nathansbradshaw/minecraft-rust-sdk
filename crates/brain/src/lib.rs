@@ -1,5 +1,7 @@
 //! Container-local coding-agent harness. Trusted gameplay authority stays in SDK
 //! gateway/server components. Model completion claims never certify game effects.
+pub mod body;
+pub mod conversation;
 pub mod model;
 pub mod tools;
 use minecraft_sdk::{ActionRequest, Client, ErrorCode, Observation, Outcome, Profile};
@@ -63,6 +65,12 @@ fn default_interval() -> u64 {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "conversation_default")]
+    pub conversation: bool,
+    #[serde(default)]
+    pub await_chat_goal: bool,
+    #[serde(default)]
+    pub body: body::Config,
     pub profile: PathBuf,
     pub model_key: PathBuf,
     pub model_endpoint: String,
@@ -79,6 +87,9 @@ pub struct Config {
     pub model_interval_secs: u64,
     #[serde(default)]
     pub exit_on_complete: bool,
+}
+fn conversation_default() -> bool {
+    true
 }
 pub struct Journal {
     db: Connection,
@@ -235,6 +246,7 @@ fn compact_history(value: &mut Value) {
     }
 }
 pub struct Brain {
+    pub body: Option<body::Handle>,
     pub cfg: Config,
     pub client: Client,
     pub journal: Journal,
@@ -261,6 +273,10 @@ impl Brain {
                 && cfg.goal.len() <= 2048,
             "Invalid run budget/goal",
         )?;
+        ensure(
+            !cfg.await_chat_goal || (cfg.conversation && cfg.body.enabled),
+            "Waiting for chat requires conversation and the responsive body",
+        )?;
         fs::create_dir_all(&cfg.workspace)?;
         fs::create_dir_all(&cfg.state)?;
         fs::set_permissions(&cfg.state, fs::Permissions::from_mode(0o700))?;
@@ -276,9 +292,15 @@ impl Brain {
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "Another brain owns this state directory",
         )?;
+        let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
+        let mut random = [0; 16];
+        use std::io::Read;
+        fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let run_id = digest(&random)[..24].to_owned();
+        let goal = journal.get("goal")?.unwrap_or_else(|| cfg.goal.clone());
         let mut profile: Profile = serde_json::from_slice(&private_read(&cfg.profile, 16384)?)?;
-        let mut client = Client::with_profile(&profile)?;
-        client.verify_instance(&profile.instance_id).await?;
+        let mut client = Client::with_profile(&profile)?.without_local_arbiter();
+        let info = client.verify_instance(&profile.instance_id).await?;
         if let Err(e) = client.observe().await {
             if e.code == ErrorCode::SessionRequired {
                 profile.session = None;
@@ -296,18 +318,52 @@ impl Brain {
                 .as_bytes(),
             );
             profile.session = Some(client.connect(&request).await?);
-            private_write(&cfg.profile, &serde_json::to_vec(&profile)?)?;
-            client = Client::with_profile(&profile)?;
+            client = Client::with_profile(&profile)?.without_local_arbiter();
+            if let Err(e) = private_write(&cfg.profile, &serde_json::to_vec(&profile)?) {
+                let _ = client.disconnect().await;
+                return Err(e);
+            }
         }
-        let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
-        let mut random = [0; 16];
-        use std::io::Read;
-        fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-        let run_id = digest(&random)[..24].to_owned();
-        let goal = journal.get("goal")?.unwrap_or_else(|| cfg.goal.clone());
-        let observed = client.observe().await?;
-        journal.event("brain_started",json!({"run":run_id,"uuid":profile.credential.player_uuid,"instance":profile.instance_id,"goal":goal,"execution":"container-local","initial":projection(&observed)}))?;
+        let observed = match client.observe().await {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = client.disconnect().await;
+                return Err(e.into());
+            }
+        };
+        let body = if cfg.body.enabled {
+            if ![
+                "minecraft:finite_locomotion",
+                "minecraft:survival_facts",
+                "minecraft:pending_actions",
+            ]
+            .iter()
+            .all(|c| info.capabilities.iter().any(|v| v == c))
+            {
+                let _ = client.disconnect().await;
+                return Err("Default Survival brain requires finite controls, survival facts and pending-action inspection".into());
+            }
+            match body::Handle::start(
+                profile.clone(),
+                cfg.body.clone(),
+                &cfg.state,
+                observed.clone(),
+            ) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    let _ = client.disconnect().await;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(e)=journal.event("brain_started",json!({"run":run_id,"uuid":profile.credential.player_uuid,"instance":profile.instance_id,"goal":goal,"execution":"container-local","initial":projection(&observed)})) {
+            if let Some(body)=body {let _=body.stop().await;}
+            let _=client.disconnect().await;return Err(e);
+        }
         Ok(Self {
+            body,
             cfg,
             client,
             journal,
@@ -318,14 +374,44 @@ impl Brain {
         })
     }
     pub async fn refresh(&mut self) -> Result<()> {
-        self.observed = self.client.observe().await?;
+        self.observed = if let Some(h) = &self.body {
+            h.shared.observe()?
+        } else {
+            self.client.observe().await?
+        };
+        if let Some(goal) = self.journal.get("goal")? {
+            self.goal = goal;
+        }
         Ok(())
     }
     pub async fn act(&mut self, action: minecraft_sdk::Action) -> Result<Value> {
+        let safety = self.body.as_ref().map(|h| h.shared.clone());
+        let _guard = if let Some(s) = &safety {
+            ensure(
+                body::supported(&action),
+                "Use finite start_move controls so defensive movement remains preemptible",
+            )?;
+            let guard = s.mutation.clone().lock_owned().await;
+            ensure(
+                !s.urgent()
+                    || matches!(
+                        action,
+                        minecraft_sdk::Action::Chat { .. } | minecraft_sdk::Action::Look { .. }
+                    ),
+                "Defensive control is active; observation, conversation and coding remain available",
+            )?;
+            Some(guard)
+        } else {
+            None
+        };
+        let previous = self.journal.get("pending_action")?.unwrap_or_default();
+        let independent = matches!(
+            action,
+            minecraft_sdk::Action::Chat { .. } | minecraft_sdk::Action::Look { .. }
+        );
+        let cancelling = matches!(&action,minecraft_sdk::Action::CancelControl{action_id} if action_id==&previous);
         ensure(
-            self.journal
-                .get("pending_action")?
-                .is_none_or(|s| s.is_empty()),
+            previous.is_empty() || independent || cancelling,
             "Inspect/reconcile the recorded pending action before submitting another mutation",
         )?;
         let sequence = self.journal.event(
@@ -341,12 +427,15 @@ impl Brain {
                 action,
             })
             .await?;
-        if receipt.outcome.terminal() {
+        drop(_guard);
+        if independent && !previous.is_empty() {
+            self.journal.set("pending_action", &previous)?;
+        } else if receipt.outcome.terminal() {
             self.journal.set("pending_action", "")?;
         }
         self.journal
             .event("action_receipt", serde_json::to_value(&receipt)?)?;
-        self.refresh().await?;
+        self.observed = self.client.observe().await?;
         Ok(json!({"receipt":receipt,"after":projection(&self.observed)}))
     }
     pub async fn settle(&mut self, id: &str) -> Result<Value> {
@@ -373,13 +462,20 @@ impl Brain {
                 self.refresh().await?;
             }
             self.refresh().await?;
+            while self.cfg.await_chat_goal
+                && (self.goal == self.cfg.goal
+                    || self.journal.get("completed_goal")?.as_deref() == Some(&self.goal))
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                self.refresh().await?;
+            }
             let pending = self.journal.get("pending_action")?.unwrap_or_default();
             let activity: Value = self
                 .journal
                 .get("activity")?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
-            let mut context = json!({"goal":self.goal,"turn":turn,"workspace":self.cfg.workspace,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
+            let mut context = json!({"goal":self.goal,"turn":turn,"workspace":self.cfg.workspace,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             // Preserve the latest error and player state under pressure; never
             // silently delete all feedback to make a world snapshot fit.
             bound_value(&mut context["memory"], 1000);
@@ -395,17 +491,30 @@ impl Brain {
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
             let develop = self.journal.get("develop_next")?.as_deref() == Some("true");
+            let requested_goal = self.goal.clone();
             let future = model.choose(&context, develop);
             tokio::pin!(future);
             let answer = loop {
                 tokio::select! {reply=&mut future=>break reply,_=tokio::time::sleep(Duration::from_secs(1))=>{match self.refresh().await{Ok(())=>{},Err(e)=>{self.journal.event("observation_error",json!({"error":e.to_string()}))?;}}}}
             };
             next = tokio::time::Instant::now() + Duration::from_secs(self.cfg.model_interval_secs);
+            self.refresh().await?;
+            if self.goal != requested_goal {
+                self.journal.event("superseded_reasoning",json!({"requested_goal":requested_goal,"current_goal":self.goal,"discarded_result":true}))?;
+                continue;
+            }
             let (choice, usage) = match answer {
                 Ok(v) => v,
                 Err(e) => {
                     self.journal
                         .event("model_error", json!({"error":e.to_string(),"turn":turn}))?;
+                    // Preserve responsive gameplay/chat while the operator or a
+                    // new player goal supplies a changed condition. Repeating a
+                    // rejected inference request is not investigation.
+                    while self.goal == requested_goal {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        self.refresh().await?;
+                    }
                     continue;
                 }
             };
@@ -438,6 +547,9 @@ impl Brain {
             }
             if completed && self.cfg.exit_on_complete {
                 break;
+            }
+            if completed {
+                self.journal.set("completed_goal", &self.goal)?;
             }
         }
         self.journal.event("brain_run_budget_finished",json!({"run":self.run_id,"goal":self.goal,"completion_authority":"external_native_evidence"}))?;
@@ -513,7 +625,7 @@ fn tool_failed(v: &Value) -> bool {
         || v.get("error").is_some_and(|e| !e.is_null())
         || matches!(
             v["receipt"]["outcome"].as_str(),
-            Some("rejected" | "uncertain")
+            Some("rejected" | "uncertain" | "failed" | "expired")
         )
 }
 #[cfg(test)]

@@ -571,6 +571,7 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let store = crate::store::Store::open(&dir.path().join("gateway.sqlite")).unwrap();
         let gateway = Arc::new(crate::Gateway {
+            base_path: String::new(),
             store: Mutex::new(store),
             adapter: pool,
             info: info(&"f".repeat(64)),

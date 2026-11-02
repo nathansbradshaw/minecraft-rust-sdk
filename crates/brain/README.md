@@ -100,3 +100,27 @@ host build can acquire newer glibc symbol requirements even when source checks
 pass. `Cargo.container.toml` defines a minimal three-crate workspace for compiling
 inside the existing coding image. Reuse its per-bot Cargo target and reviewed
 vendor configuration; do not download another toolchain or dependency bundle.
+
+The default `body` configuration is `{ "enabled": true, "period_ms": 150 }`.
+It requires finite locomotion, public survival facts and pending-action inspection.
+Terminal children inherit `MC_SDK_ARBITER` and run at reduced CPU priority so the
+independent body can preempt gameplay while compilation continues. Use finite
+`start_move` and inspect its eventual receipt. Blocked code requests can resume
+after danger clears; they do not retain a character-wide action lease.
+
+The `conversation` option defaults to true and requires the responsive body.
+It uses Luna only when new chat arrives and runs independently of Sol and terminal
+work. `await_chat_goal: true` waits for a player-supplied goal and waits again after
+completion, instead of spending inference on an unchanged idle condition. Its
+separate conversation journal preserves reports, replies, cursor and model errors.
+The trusted model service must allow one pending job per bot/model while retaining
+its global jobs and per-bot daily ceilings. No additional allowance is created.
+
+`body-probe PRIVATE_CONFIG.json blocked|compile SECONDS` is a declared native
+execution diagnostic. Blocked mode injects a stalled reasoning future and calls
+no provider; compile mode runs the real offline release compiler and records its
+actual duration and failures. Both keep the body active and disconnect on exit.
+`peer-probe PRIVATE_CONFIG.json chat|command MESSAGE SECONDS` provides an ordinary
+non-operator SDK peer for native recipient/chat tests. Neither certifies competence.
+Use separate private state directories and record initial conditions, real threat
+fixtures, health/deaths, latency, interventions, source and binary hashes.

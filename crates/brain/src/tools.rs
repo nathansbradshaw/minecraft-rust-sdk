@@ -89,6 +89,18 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(body) = &brain.body {
+        c.env("MC_SDK_ARBITER", &body.socket);
+    }
+    // Leave scheduling room for the independent reactive controller.
+    unsafe {
+        c.pre_exec(|| {
+            if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     c.process_group(0);
     let mut child = c.spawn()?;
     let pid = child.id().ok_or("Process ID unavailable")?;

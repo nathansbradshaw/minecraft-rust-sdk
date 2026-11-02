@@ -42,14 +42,20 @@ Tools and input:
 - complete: your completion report. This is recorded as a model claim and checked
   against observations separately; a model claim cannot certify a benchmark pass.
 
-SDK controls available through sdk: look {yaw,pitch}; move {target:{x,y,z},
-on_ground:true,jump:false}; motion_frame {target:{x,y,z}}; dig {block:{x,y,z},
+SDK controls available through sdk: look {yaw,pitch}; start_move {target:{x,y,z},
+jump:false,max_ticks:60}; cancel_control {action_id}; dig {block:{x,y,z},
 face:0..5,stage:"start"|"finish"|"cancel"}; place/use_block {block,face,
 hand:"main"|"off",hit:[x,y,z]}; use_item {hand}; select_slot {slot:0..8};
-attack {entity}; interact {entity,hand}; sprint/sneak {enabled}; jump; respawn;
+attack {entity}; interact {entity,hand}; sprint/sneak {enabled}; respawn;
 click_slot {menu_id,state_id,slot,button,mode}; craft {recipe,menu_id,make_all};
 close_menu {menu_id}; drop_selected {entire_stack}; chat {message}.
 Include "kind" for every action. Inspect the SDK source/docs for exact versions.
+Movement returns running, then observed/cancelled/expired/failed; poll status or
+observe its progress. The background Survival controller may cancel movement
+and defer new program actions while evading. Continue coding/chatting; inspect
+fresh state and resume afterwards. Legacy blocking move/jump/motion_frame are
+rejected in protected coding workspaces. Pending-action inspection and explicit
+reconciliation remain available; interrupted mutations are never auto-replayed.
 
 For Rust programs, SDK exports Client, Profile, Action, ActionRequest and Outcome.
 Load Profile from the MC_SDK_PROFILE environment path, create Client::with_profile,

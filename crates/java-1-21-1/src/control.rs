@@ -103,6 +103,16 @@ pub struct Job {
     state: Arc<Mutex<Receipt>>,
 }
 impl Job {
+    pub fn observation(&self) -> Value {
+        match self.state.lock() {
+            Ok(r) => {
+                json!({"action_id":self.id,"outcome":r.outcome,"target":r.evidence["target"],"progress":r.evidence["progress"],"cancel_requested":self.cancel.load(Ordering::Acquire),"input_released":r.evidence["input_released"]})
+            }
+            Err(_) => {
+                json!({"action_id":self.id,"outcome":"uncertain","error":"Control state unavailable"})
+            }
+        }
+    }
     pub fn running(&self) -> bool {
         self.state
             .lock()
@@ -176,7 +186,7 @@ impl Job {
             action_id: request.action_id.clone(),
             outcome: Outcome::Running,
             adapter_version: VERSION.into(),
-            evidence: json!({"before":compact(&request.action,&before),"native_effect_verified":false,"progress":{"frames_sent":0},"max_ticks":max_ticks}),
+            evidence: json!({"before":compact(&request.action,&before),"native_effect_verified":false,"target":target,"progress":{"frames_sent":0},"max_ticks":max_ticks}),
             error: None,
         };
         let state = Arc::new(Mutex::new(initial));
