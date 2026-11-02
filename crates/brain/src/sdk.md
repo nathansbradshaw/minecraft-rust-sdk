@@ -28,6 +28,19 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   under a new ID. Reconciliation does not prove a historical effect.
 - Print compact action ID/outcome/error and relevant before/after facts, not full
   world receipts every frame. Authoritative evidence stays in the gateway journal.
+- Generic menu builders: menu::prepare_recipe(&observation, recipe_id, make_all)
+  builds Action::Craft for the observed menu. This prepares a recipe; it does not
+  take its output or establish inventory gain. Inspect observation.menu.slots and
+  use menu::click_slot(&observation, slot, button, click_mode::QUICK_MOVE) with a
+  fresh observation when appropriate. The caller chooses slots and verifies effects.
+  menu::item_count(&observation, item_id) counts retained player inventory only,
+  excluding a prepared output or carried cursor stack. Do not print every air slot.
+- Rust ClickSlot.mode remains u8; click_mode constants cover PICKUP=0,
+  QUICK_MOVE=1, SWAP=2, CLONE=3, THROW=4, QUICK_CRAFT=5, PICKUP_ALL=6.
+  SDK JSON also accepts the corresponding snake_case names; serialization sends
+  the same canonical numeric intent. Unknown modes fail explicitly. Normal player
+  authority and stale-menu rejection still apply. A creative-only mode grants
+  no creative permissions. Programs retain IDs and inspect uncertainty as usual.
 - Use tokio::time for bounded waits; it is enabled in the coding project. Paths,
   model access and SDK endpoints come from deployment, never invented credentials.
 - Optional read-only query schemas are advertised in server.limits.observation_queries.

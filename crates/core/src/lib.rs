@@ -5,6 +5,43 @@ use serde_json::Value;
 pub const API_VERSION: u32 = 1;
 pub const ADAPTER_VERSION: u32 = 2;
 
+/// Stable click-intent codes. The version adapter owns protocol encoding.
+pub mod click_mode {
+    pub const PICKUP: u8 = 0;
+    pub const QUICK_MOVE: u8 = 1;
+    pub const SWAP: u8 = 2;
+    pub const CLONE: u8 = 3;
+    pub const THROW: u8 = 4;
+    pub const QUICK_CRAFT: u8 = 5;
+    pub const PICKUP_ALL: u8 = 6;
+}
+fn deserialize_click_mode<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u8, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Code(u8),
+        Name(String),
+    }
+    let code = match Input::deserialize(deserializer)? {
+        Input::Code(code) => Some(code),
+        Input::Name(name) => match name.as_str() {
+            "pickup" => Some(click_mode::PICKUP),
+            "quick_move" => Some(click_mode::QUICK_MOVE),
+            "swap" => Some(click_mode::SWAP),
+            "clone" => Some(click_mode::CLONE),
+            "throw" => Some(click_mode::THROW),
+            "quick_craft" => Some(click_mode::QUICK_CRAFT),
+            "pickup_all" => Some(click_mode::PICKUP_ALL),
+            _ => None,
+        },
+    };
+    code.filter(|code| *code <= 6).ok_or_else(|| {
+        serde::de::Error::custom("Expected a click code0..6 or a supported snake_case mode name")
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -190,6 +227,7 @@ pub enum Action {
         state_id: i32,
         slot: i16,
         button: u8,
+        #[serde(deserialize_with = "deserialize_click_mode")]
         mode: u8,
     },
     CloseMenu {
@@ -479,6 +517,34 @@ pub struct AdapterFrameResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_click_modes_have_one_numeric_intent_and_reject_unknown_inputs() {
+        let names = [
+            "pickup",
+            "quick_move",
+            "swap",
+            "clone",
+            "throw",
+            "quick_craft",
+            "pickup_all",
+        ];
+        for (code, name) in names.iter().enumerate() {
+            let named = serde_json::json!({"kind":"click_slot","menu_id":1,"state_id":7,"slot":3,"button":0,"mode":name});
+            let action: super::Action = serde_json::from_value(named.clone()).unwrap();
+            let mut numeric = named.clone();
+            numeric["mode"] = serde_json::json!(code);
+            assert_eq!(serde_json::to_value(action).unwrap(), numeric);
+        }
+        for mode in [
+            serde_json::json!("operator"),
+            serde_json::json!(7),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!({"code":1}),
+        ] {
+            assert!(serde_json::from_value::<super::Action>(serde_json::json!({"kind":"click_slot","menu_id":1,"state_id":7,"slot":3,"button":0,"mode":mode})).is_err());
+        }
+    }
     use super::*;
     #[test]
     fn observation_query_cannot_select_actor_or_plugin_code() {

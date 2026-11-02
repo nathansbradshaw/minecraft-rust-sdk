@@ -1,4 +1,5 @@
 pub use minecraft_sdk_core::*;
+pub mod menu;
 pub mod navigation;
 use reqwest::{Client as Http, Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
