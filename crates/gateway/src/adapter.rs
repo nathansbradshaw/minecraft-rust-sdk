@@ -162,6 +162,9 @@ impl Adapter {
             (AdapterOperation::Reconcile { action_id }, AdapterResponse::Receipt(receipt)) => {
                 &receipt.action_id == action_id
             }
+            (AdapterOperation::ActionStatus { action_id }, AdapterResponse::Receipt(receipt)) => {
+                &receipt.action_id == action_id
+            }
             _ => false,
         };
         if !valid {

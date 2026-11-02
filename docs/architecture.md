@@ -85,3 +85,33 @@ walking frames. The Java adapter checks swept collision, ordinary per-frame
 distance, gravity and continuous airborne velocity, and derives ground contact.
 A caller cannot supply its own ground flag. Unsupported airborne states fail
 closed. `move` remains the higher-level supported-waypoint operation.
+
+Rust alpha.5 additionally advertises `minecraft:finite_locomotion`. `start_move`
+accepts a waypoint, `jump` and positive `max_ticks` (fifty milliseconds per tick).
+Discovery advertises the deployment's `finite_control_max_ticks`; the Rust
+adapter configuration defaults to 100 and permits an operator budget of 1–600.
+It returns `running` immediately, then drives ordinary player position packets
+in a separate bounded control thread. Own observations and non-conflicting
+actions remain available. `cancel_control` references that same character's
+durable action ID and has its own durable request ID. Inspect both IDs through
+normal action status; cancellation can remain running while gravity settles.
+
+`observed` means the requested target was observed, `cancelled`/`expired` mean
+the corresponding finite control ended, and `failed` means execution ended
+without the goal effect. Evidence separately states whether its native effect
+was verified. Missing an immediate effect is not interruption. Genuine transport
+or verification loss remains uncertain and requires explicit reconciliation,
+which never replays or retrospectively certifies a historical effect. A running
+control is separate from that uncertainty fence. Gateway restart or controller
+disconnection converts uncaptured running results to uncertain records.
+
+The initial finite adapter requires grounded starts, observed collision geometry
+and a gravity-only release path for every planned frame. It refuses unsupported
+terrain rather than freezing a character in the air. A second locomotion control
+must wait for cancellation/completion; look and other ordinary actions can
+continue. These conservative client trajectories are not full water, fluid,
+vehicle, knockback or modded movement physics conformance. Those need independent
+capabilities and native tests. No NeoForge module change is needed for this
+optional Rust capability. Older clients cannot decode the new outcome variants
+for actions created by newer clients. Keep a matching gateway/adapter pair and
+preserve the journal through upgrades; never restore an old journal to replay work.

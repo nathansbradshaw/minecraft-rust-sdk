@@ -85,6 +85,16 @@ replays work. Operators can use that behavior in a declared socket-failure test,
 then start a separate diagnostic to prove reconnection. These are native
 transport measurements, not evidence of tactical behavior or survival.
 
+`control-latency-probe PRIVATE_CONFIG.json finite` checks the optional finite
+locomotion capability: five walks with concurrent observations, a concurrent
+look, duplicate IDs, ground/jump cancellation, expiry, a completed jump and an
+interrupted control followed by same-identity reconnect and explicit
+reconciliation. It uses no models and refuses missing observed flat routes.
+Its initial observation boundary is measured p95 <=500 ms and maximum <=1 s.
+All receipts and failures stay in the private brain journal. The character must
+otherwise be inactive. It does not prove defensive decisions, eating/combat,
+claim denials or full Survival physics.
+
 Build with a toolchain and libc compatible with the runtime container. A Linux
 host build can acquire newer glibc symbol requirements even when source checks
 pass. `Cargo.container.toml` defines a minimal three-crate workspace for compiling

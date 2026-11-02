@@ -6,6 +6,8 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+#[path = "control-latency-probe/finite.rs"]
+mod finite;
 
 fn position(o: &Observation) -> Result<[f64; 3]> {
     Ok([
@@ -176,8 +178,10 @@ async fn main() -> Result<()> {
     let path = args.first().ok_or(
         "Usage: control-latency-probe PRIVATE_CONFIG.json [watch SAMPLE_COUNT] (inside container)",
     )?;
+    let finite = matches!(args.as_slice(),[_,command] if command=="finite");
     let samples = match args.as_slice() {
         [_] => None,
+        [_, command] if command == "finite" => None,
         [_, command, count] if command == "watch" => {
             let count: u32 = count.parse()?;
             if !(1..=120).contains(&count) {
@@ -189,7 +193,9 @@ async fn main() -> Result<()> {
     };
     let cfg: Config = serde_json::from_slice(&private_read(Path::new(&path), 16384)?)?;
     let mut brain = Brain::open(cfg).await?;
-    let result = if let Some(count) = samples {
+    let result = if finite {
+        finite::run(&mut brain).await
+    } else if let Some(count) = samples {
         watch(&mut brain, count).await
     } else {
         probe(&mut brain).await
