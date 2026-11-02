@@ -12,9 +12,8 @@ import java.util.*;
 public final class NativeChat {
     private static final Map<Connection,ArrayDeque<Map<String,Object>>> own=Collections.synchronizedMap(new WeakHashMap<>());
     private static final Map<Connection,Inbox> delivered=new WeakHashMap<>();
-    private static final String epoch=UUID.randomUUID().toString();
     private static long sequence;
-    private static final class Inbox {long sequence;int bytes;long dropped;final ArrayDeque<Map<String,Object>> rows=new ArrayDeque<>();}
+    private static final class Inbox {final String epoch=UUID.randomUUID().toString();long sequence;int bytes;long dropped;final ArrayDeque<Map<String,Object>> rows=new ArrayDeque<>();}
     static void install(){NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST,false,(ServerChatEvent event)->{
         if(SdkService.active==null||!SdkService.active.owns(event.getPlayer()))return;
         synchronized(own){var queue=own.computeIfAbsent(event.getPlayer().connection.getConnection(),id->new ArrayDeque<>());
@@ -23,7 +22,7 @@ public final class NativeChat {
     static List<Map<String,Object>> snapshot(ServerPlayer player){synchronized(own){return List.copyOf(own.getOrDefault(player.connection.getConnection(),new ArrayDeque<>()));}}
     /** Observe only packets actually queued to this admitted character's connection. */
     public static void receive(ServerPlayer player,Packet<?> packet){
-        SdkService service=SdkService.active;if(service==null||!service.owns(player))return;
+        SdkService service=SdkService.active;if(player==null||service==null||!service.owns(player))return;
         var row=new LinkedHashMap<String,Object>();String message;
         if(packet instanceof ClientboundPlayerChatPacket chat){
             String filtered=chat.filterMask().apply(chat.body().content());if(filtered==null)return;
@@ -43,6 +42,6 @@ public final class NativeChat {
         }
     }
     private static String bounded(String text){return text.length()<=4096?text:text.substring(0,text.offsetByCodePoints(0,Math.min(2048,text.codePointCount(0,text.length()))))+" [truncated]";}
-    static Map<String,Object> inbox(ServerPlayer player){synchronized(delivered){var inbox=delivered.computeIfAbsent(player.connection.getConnection(),key->new Inbox());return Map.of("epoch",epoch+":"+player.getId(),"messages",List.copyOf(inbox.rows),"dropped",inbox.dropped);}}
+    static Map<String,Object> inbox(ServerPlayer player){synchronized(delivered){var inbox=delivered.computeIfAbsent(player.connection.getConnection(),key->new Inbox());return Map.of("epoch",inbox.epoch,"messages",List.copyOf(inbox.rows),"dropped",inbox.dropped);}}
     private NativeChat(){}
 }

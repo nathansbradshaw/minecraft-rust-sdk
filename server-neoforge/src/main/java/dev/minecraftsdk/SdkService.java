@@ -27,6 +27,8 @@ public final class SdkService implements AutoCloseable {
     private final Path registryPath;
     private final Map<UUID,String> identities=new HashMap<>();
     private final Map<String,java.util.function.BiFunction<ServerPlayer,JsonObject,Object>> observationProviders=new TreeMap<>();
+    private final Map<String,Object> observationSchemas=new TreeMap<>();
+    public synchronized void registerObservationProvider(String capability,Object descriptor,java.util.function.BiFunction<ServerPlayer,JsonObject,Object> provider){registerObservationProvider(capability,provider);observationSchemas.put(capability,descriptor);}
     /** Installed server code only. Requests cannot install providers or select classes. */
     public synchronized void registerObservationProvider(String capability,java.util.function.BiFunction<ServerPlayer,JsonObject,Object> provider){
         if(!capability.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")||capability.length()>128||provider==null||observationProviders.putIfAbsent(capability,provider)!=null)
@@ -94,7 +96,7 @@ public final class SdkService implements AutoCloseable {
         var channels=new ArrayList<Map<String,Object>>();
         NetworkRegistryAccessor.sdk$registrations().forEach((protocol,values)->values.forEach((id,registration)->channels.add(Map.of("protocol",protocol.id(),"id",id.toString(),"version",registration.version(),"flow",registration.flow().map(Enum::name).orElse("BIDIRECTIONAL"),"optional",registration.optional()))));
         channels.sort(Comparator.comparing(row->row.get("protocol")+":"+row.get("id")));
-        return Map.of("minecraft_version","1.21.1","platform","neoforge","channels",channels,"max_players",server.getMaxPlayers(),"online_mode",server.usesAuthentication(),"observation_capabilities",List.copyOf(observationProviders.keySet()),"native_observation_features",List.of("minecraft:survival_facts","minecraft:delivered_chat"));
+        return Map.of("minecraft_version","1.21.1","platform","neoforge","channels",channels,"max_players",server.getMaxPlayers(),"online_mode",server.usesAuthentication(),"observation_capabilities",List.copyOf(observationProviders.keySet()),"native_observation_features",List.of("minecraft:survival_facts","minecraft:delivered_chat"),"observation_query_schemas",Map.copyOf(observationSchemas));
     }
     private static void validateIdentity(UUID uuid,String name){if(uuid==null||name.length()>16||!name.matches("(\\.S_[0-9a-f]{12}|\\.AI_[A-Za-z0-9_]{1,12})"))throw new IllegalArgumentException("SDK identity required");}
     private synchronized Object register(JsonObject request){
