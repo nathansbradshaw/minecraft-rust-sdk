@@ -392,7 +392,7 @@ async fn controller(
             previous_health = observed.player["health"].clone();
         }
         let danger = dead
-            || nearby.is_some_and(|(_, d)| d < 10.)
+            || geometry::threatened(&observed)
             || escape.is_some()
             || incoming
             || burning
@@ -491,7 +491,7 @@ async fn controller(
                     }
                 }
             }
-        } else if shared.urgent() && safe_since.elapsed() > Duration::from_secs(1) {
+        } else if shared.urgent() && safe_since.elapsed() > Duration::from_secs(3) {
             if body_sprint {
                 let _guard = shared.mutation.lock().await;
                 send(&client, j, Action::Sprint { enabled: false }).await?;

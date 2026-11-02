@@ -9,6 +9,7 @@ import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.RangedAttackMob;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
@@ -16,6 +17,9 @@ import java.util.*;
 
 /** Bounded observations, always collected together on the authoritative server thread. */
 final class NativeObservation {
+    static final int ENTITY_RADIUS=32;
+    private static final Set<String> RANGED_ANIMATIONS=Set.of("BOW","CROSSBOW","SPEAR");
+    private static Map<String,Object> equipment(ItemStack item){return Map.of("item",BuiltInRegistries.ITEM.getKey(item.getItem()).toString(),"use_animation",item.getUseAnimation().name());}
     private static Map<String,Object> stack(ItemStack stack,ServerPlayer player){
         var result=new LinkedHashMap<String,Object>();result.put("item",BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());result.put("count",stack.getCount());
         result.put("components",stack.isEmpty()?"":stack.save(player.registryAccess()).toString());
@@ -46,13 +50,13 @@ final class NativeObservation {
             }
         }
         var entities=new ArrayList<Map<String,Object>>();
-        var visible=world.getEntities(player,player.getBoundingBox().inflate(12)).stream().filter(e->e.isAlive()&&player.hasLineOfSight(e))
+        var visible=world.getEntities(player,player.getBoundingBox().inflate(ENTITY_RADIUS)).stream().filter(e->e.isAlive()&&player.hasLineOfSight(e))
             .sorted(Comparator.<net.minecraft.world.entity.Entity>comparingInt(e->e instanceof Enemy||e.getType().getCategory()==MobCategory.MONSTER||e instanceof Projectile&&e.getDeltaMovement().lengthSqr()>0.0001?0:1)
             .thenComparingDouble(e->e.distanceToSqr(player))).limit(128).toList();
         for(var entity:visible){var row=new LinkedHashMap<String,Object>();row.put("entity_id",entity.getId());row.put("uuid",entity.getUUID().toString());row.put("type",BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());row.put("position",List.of(entity.getX(),entity.getY(),entity.getZ()));row.put("visible",true);
             var velocity=entity.getDeltaMovement();row.put("velocity",List.of(velocity.x,velocity.y,velocity.z));
             row.put("hostile",entity instanceof Enemy||entity.getType().getCategory()==MobCategory.MONSTER);row.put("player",entity instanceof net.minecraft.world.entity.player.Player);
-            if(entity instanceof LivingEntity living){row.put("health",living.getHealth());row.put("hurt_time",living.hurtTime);}
+            if(entity instanceof LivingEntity living){row.put("health",living.getHealth());row.put("hurt_time",living.hurtTime);row.put("main_hand",equipment(living.getMainHandItem()));row.put("off_hand",equipment(living.getOffhandItem()));row.put("ranged_attack",entity instanceof RangedAttackMob||RANGED_ANIMATIONS.contains(living.getMainHandItem().getUseAnimation().name())||RANGED_ANIMATIONS.contains(living.getOffhandItem().getUseAnimation().name()));}
             if(entity instanceof Mob mob)row.put("aggressive",mob.isAggressive());
             if(entity instanceof Projectile projectile){var owner=projectile.getOwner();row.put("projectile",true);row.put("owner_uuid",owner==null?"":owner.getUUID().toString());}
             if(entity instanceof Creeper creeper)row.put("creeper",Map.of("swell_direction",creeper.getSwellDir(),"powered",creeper.isPowered(),"ignited",creeper.isIgnited()));

@@ -346,13 +346,14 @@ impl Brain {
             if ![
                 "minecraft:finite_locomotion",
                 "minecraft:survival_facts",
+                "minecraft:ranged_observation",
                 "minecraft:pending_actions",
             ]
             .iter()
             .all(|c| info.capabilities.iter().any(|v| v == c))
             {
                 let _ = client.disconnect().await;
-                return Err("Default Survival brain requires finite controls, survival facts and pending-action inspection".into());
+                return Err("Default Survival brain requires finite controls, survival/ranged facts and pending-action inspection".into());
             }
             match body::Handle::start(
                 profile.clone(),
@@ -631,7 +632,7 @@ pub fn projection(o: &Observation) -> Value {
         .filter(|r| r["count"].as_u64().is_some_and(|c| c > 0))
         .map(|r| json!({"slot":r["slot"],"item":r["item"],"count":r["count"],"food":r["food"]}))
         .collect();
-    let entities: Vec<_> = o.world["entities"].as_array().into_iter().flatten().take(24).map(|e| json!({"uuid":e["uuid"],"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"velocity":e["velocity"],"visible":e["visible"],"hostile":e["hostile"],"projectile":e["projectile"],"creeper":e["creeper"],"health":e["health"],"item":e["item"],"name":e["name"]})).collect();
+    let entities: Vec<_> = o.world["entities"].as_array().into_iter().flatten().take(24).map(|e| json!({"uuid":e["uuid"],"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"velocity":e["velocity"],"visible":e["visible"],"hostile":e["hostile"],"ranged_attack":e["ranged_attack"],"main_hand":e["main_hand"],"off_hand":e["off_hand"],"projectile":e["projectile"],"creeper":e["creeper"],"health":e["health"],"item":e["item"],"name":e["name"]})).collect();
     json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"blocks":blocks,"entities":entities,"chat":o.world["chat"].as_array().map(|c|c.iter().rev().take(24).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"],"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"]}})
 }
 /// Compact large strings/arrays without losing the structure of errors or player
