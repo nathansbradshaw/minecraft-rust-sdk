@@ -853,6 +853,7 @@ fn main() -> AnyResult<()> {
     }
     let mut players: HashMap<String, Player> = HashMap::new();
     let mut identities: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut channel: Option<(String, u64)> = None;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut output = std::io::stdout().lock();
@@ -867,8 +868,32 @@ fn main() -> AnyResult<()> {
         if line.len() > 16384 {
             return Err("Adapter request too large".into());
         }
-        let request: AdapterRequest = serde_json::from_slice(&line)?;
-        let response = if request.protocol != ADAPTER_VERSION {
+        let raw: Value = serde_json::from_slice(&line)?;
+        let frame: Option<AdapterFrameRequest> = if raw.get("request").is_some() {
+            Some(serde_json::from_value(raw.clone())?)
+        } else {
+            None
+        };
+        let request: AdapterRequest = if let Some(frame) = &frame {
+            frame.request.clone()
+        } else {
+            serde_json::from_value(raw)?
+        };
+        let framing_ok = if let Some(frame) = &frame {
+            frame.protocol == ADAPTER_VERSION
+                && frame.channel_id.len() == 64
+                && frame.channel_id.bytes().all(|b| b.is_ascii_hexdigit())
+                && frame.request_id > 0
+                && channel
+                    .as_ref()
+                    .is_none_or(|(id, last)| id == &frame.channel_id && frame.request_id > *last)
+        } else {
+            channel.is_none() && matches!(request.operation, AdapterOperation::Discover)
+        };
+        if framing_ok && let Some(frame) = &frame {
+            channel = Some((frame.channel_id.clone(), frame.request_id));
+        }
+        let response = if request.protocol != ADAPTER_VERSION || !framing_ok {
             AdapterResponse::Error(ApiError::new(
                 ErrorCode::UnsupportedVersion,
                 "Unsupported adapter process protocol",
@@ -892,7 +917,22 @@ fn main() -> AnyResult<()> {
                 dispatch(&config, &native, &discovery, &mut players, &request)
             }
         };
-        serde_json::to_writer(&mut output, &response)?;
+        if let Some(frame) = frame {
+            serde_json::to_writer(
+                &mut output,
+                &AdapterFrameResponse {
+                    protocol: ADAPTER_VERSION,
+                    channel_id: frame.channel_id,
+                    request_id: frame.request_id,
+                    instance_id: request.instance_id,
+                    bot_id: request.bot_id,
+                    player_uuid: request.player_uuid,
+                    response,
+                },
+            )?;
+        } else {
+            serde_json::to_writer(&mut output, &response)?;
+        }
         output.write_all(b"\n")?;
         output.flush()?;
     }
@@ -940,7 +980,7 @@ fn dispatch(
                         .map(String::from),
                 )
                 .collect(),
-                limits: json!({"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4}),
+                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4}),
             })),
             AdapterOperation::Connect => {
                 if players.contains_key(&request.bot_id) {
@@ -958,6 +998,16 @@ fn dispatch(
                 Ok(AdapterResponse::Disconnected)
             }
             AdapterOperation::Observe => {
+                if players
+                    .get(&request.bot_id)
+                    .is_none_or(|p| !p.alive.load(Ordering::Acquire))
+                {
+                    players.remove(&request.bot_id);
+                    return Err(ApiError::new(
+                        ErrorCode::SessionRequired,
+                        "Character connection ended; reconnect without replay",
+                    ));
+                }
                 let mut observation = native.observe(&request.player_uuid).map_err(|_| {
                     ApiError::new(ErrorCode::NotReady, "Native observation unavailable")
                 })?;
