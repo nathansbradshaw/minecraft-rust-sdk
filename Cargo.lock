@@ -684,6 +684,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "minecraft-sdk-brain"
+version = "0.1.0-alpha.3"
+dependencies = [
+ "libc",
+ "minecraft-sdk",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "minecraft-sdk-cli"
 version = "0.1.0-alpha.3"
 dependencies = [
