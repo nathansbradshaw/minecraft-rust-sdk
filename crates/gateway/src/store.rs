@@ -1042,6 +1042,16 @@ mod tests {
         assert_eq!(receipt.adapter_version, "adapter-a");
     }
     #[test]
+    fn named_and_numeric_click_inputs_cannot_duplicate_an_intention() {
+        let (_dir, mut store, _key, actor) = setup();
+        let mut input = serde_json::json!({"action_id":"one-menu-intention","action":{"kind":"click_slot","menu_id":0,"state_id":3,"slot":0,"button":0,"mode":"quick_move"}});
+        let named: ActionRequest = serde_json::from_value(input.clone()).unwrap();
+        assert!(store.prepare(&actor.bot_id, &named, "fixture").unwrap().1);
+        input["action"]["mode"] = serde_json::json!(1);
+        let numeric: ActionRequest = serde_json::from_value(input).unwrap();
+        assert!(!store.prepare(&actor.bot_id, &numeric, "fixture").unwrap().1);
+    }
+    #[test]
     fn single_controller_and_state_survive_reconnect() {
         let (_d, mut s, _key, actor) = setup();
         let r = SessionRequest {
