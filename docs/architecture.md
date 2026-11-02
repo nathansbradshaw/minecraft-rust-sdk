@@ -29,11 +29,32 @@ A native ticket expires after ten seconds, binds the exact registered UUID,
 name and local TCP source port, and is consumed once. It never changes global
 Java authentication. Operators must keep the native directory/token private.
 
-The gateway serializes each character's lifecycle/mutations. Its adapter transport
-drains replies even when an HTTP caller disappears, preventing replies crossing
-character boundaries. The journal commits intent before dispatch, keeps action
-IDs permanently, fences multiple gateway processes with a file lock, and
-quarantines failed adapter communication. Active sessions pin adapter versions.
+The gateway orders each character's reads, lifecycle and mutations in its own
+lane. Each connected character has a separate operator-configured adapter process
+and player socket. A long action or failed transport for one character does not
+hold another character's transport lock. A bounded deployment queue limits
+in-flight work; normal server admission determines connected player capacity.
+An empty adapter process serves initial discovery without owning a character.
+
+Since Rust alpha.4, the gateway and Rust adapter must both support process protocol
+2. The initial bare `Discover` advertises `limits.process_protocol`; subsequent
+JSON-line frames carry an OS-random channel ID, increasing request ID and actor
+binding. Replies must match the channel, request, instance, bot, UUID, operation
+and applicable action ID. Transport errors or mismatches close only that lane
+and invalidate its controller. Reconnection does not replay an interrupted action.
+Replies drain even when an HTTP caller disappears, retaining their queue permit
+and lifecycle ordering until completion. Active sessions pin the adapter version;
+new sessions reject a changed binary until the gateway is deliberately restarted.
+
+HTTP API 1 and the private NeoForge native API 1 are unchanged. This Rust transport
+change does not require replacing the alpha.3 NeoForge module. Deploy the matching
+Rust gateway and adapter together; restarting the gateway disconnects SDK players
+but does not restart the Minecraft server. Legacy `move` still blocks its own
+character's observations while executing. Independent lanes do not yet provide
+finite cancellable locomotion, a tactical Survival controller or survival proof.
+
+The journal commits intent before dispatch, keeps action IDs permanently and
+fences multiple gateway processes with a file lock.
 
 No HTTP or MCP operator endpoint exists. Operator recovery/revocation uses a
 mode-600 Unix socket beside the gateway journal, with same-UID peer checks.

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const API_VERSION: u32 = 1;
-pub const ADAPTER_VERSION: u32 = 1;
+pub const ADAPTER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -394,6 +394,28 @@ pub enum AdapterResponse {
     ObservationData(Value),
     Receipt(Receipt),
     Error(ApiError),
+}
+
+/// Correlated process messages after the initial bare Discover handshake. This
+/// is trusted operator-selected IPC, never a public gameplay request format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterFrameRequest {
+    pub protocol: u32,
+    pub channel_id: String,
+    pub request_id: u64,
+    pub request: AdapterRequest,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterFrameResponse {
+    pub protocol: u32,
+    pub channel_id: String,
+    pub request_id: u64,
+    pub instance_id: String,
+    pub bot_id: String,
+    pub player_uuid: String,
+    pub response: AdapterResponse,
 }
 
 #[cfg(test)]

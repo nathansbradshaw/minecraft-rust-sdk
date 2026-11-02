@@ -1,7 +1,7 @@
 pub mod adapter;
 pub mod operator;
 pub mod store;
-use adapter::{Adapter, AdapterConfig};
+use adapter::{Adapter, AdapterConfig, AdapterPool};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
@@ -42,7 +42,7 @@ fn default_journal_budget() -> u32 {
 }
 pub struct Gateway {
     store: Mutex<Store>,
-    adapter: tokio::sync::Mutex<Adapter>,
+    adapter: AdapterPool,
     info: ServerInfo,
     registration_times: Mutex<VecDeque<Instant>>,
     registration_limit: u32,
@@ -129,7 +129,7 @@ impl Gateway {
         let health = adapter.health.clone();
         Ok(Arc::new(Self {
             store: Mutex::new(store),
-            adapter: tokio::sync::Mutex::new(adapter),
+            adapter: AdapterPool::new(config.adapter, adapter, &info),
             info,
             registration_times: Mutex::new(VecDeque::new()),
             registration_limit: config.registrations_per_minute,
@@ -187,11 +187,24 @@ impl Gateway {
             operation,
         };
         let gateway = self.clone();
+        let bot_id = actor.bot_id.clone();
         // Drain exactly one reply even if its HTTP client disconnects. Otherwise an
         // orphaned observation could be consumed by another character's request.
         tokio::spawn(async move {
             let _permit = permit;
-            gateway.adapter.lock().await.request(&request).await
+            let response = gateway.adapter.request(&request).await;
+            if response.is_err()
+                || matches!(
+                    &response,
+                    Ok(AdapterResponse::Error(ApiError {
+                        code: ErrorCode::SessionRequired,
+                        ..
+                    }))
+                )
+            {
+                gateway.db()?.disconnect(&bot_id)?;
+            }
+            response
         })
         .await
         .map_err(|_| ApiError::new(ErrorCode::UncertainOutcome, "Adapter exchange interrupted"))?
@@ -205,6 +218,26 @@ impl Gateway {
                 "Server integration is not ready",
             ))
         }
+    }
+    async fn controller_read(
+        self: &Arc<Self>,
+        bot: &str,
+        headers: &HeaderMap,
+        operation: AdapterOperation,
+    ) -> Result<AdapterResponse> {
+        self.actor(bot, headers)?;
+        let guard = self.lane(bot)?.lock_owned().await;
+        let actor = self.actor(bot, headers)?;
+        self.controller(&actor, headers)?;
+        let gateway = self.clone();
+        // Retain lifecycle ordering even when an HTTP reader disconnects. A late
+        // failed read must never invalidate a subsequent controller session.
+        tokio::spawn(async move {
+            let _guard = guard;
+            gateway.call(&actor, operation).await
+        })
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::NotReady, "Observation exchange interrupted"))?
     }
 }
 pub fn router(gateway: Shared) -> Router {
@@ -345,8 +378,10 @@ async fn observe(
     headers: HeaderMap,
 ) -> std::result::Result<Json<Observation>, HttpError> {
     let actor = g.actor(&bot, &headers)?;
-    g.controller(&actor, &headers)?;
-    match g.call(&actor, AdapterOperation::Observe).await? {
+    match g
+        .controller_read(&bot, &headers, AdapterOperation::Observe)
+        .await?
+    {
         AdapterResponse::Observation(o) if o.player["uuid"] == actor.uuid => Ok(Json(o)),
         AdapterResponse::Error(e) => Err(e.into()),
         _ => Err(ApiError::new(ErrorCode::Internal, "Unexpected adapter reply").into()),
@@ -358,8 +393,7 @@ async fn read_observation(
     headers: HeaderMap,
     Json(request): Json<ObservationQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, HttpError> {
-    let actor = g.actor(&bot, &headers)?;
-    g.controller(&actor, &headers)?;
+    g.actor(&bot, &headers)?;
     request.validate()?;
     if !g.info.capabilities.contains(&request.capability) {
         return Err(ApiError::new(
@@ -369,7 +403,11 @@ async fn read_observation(
         .into());
     }
     match g
-        .call(&actor, AdapterOperation::ReadObservation { request })
+        .controller_read(
+            &bot,
+            &headers,
+            AdapterOperation::ReadObservation { request },
+        )
         .await?
     {
         AdapterResponse::ObservationData(value) => Ok(Json(value)),
