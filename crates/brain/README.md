@@ -148,6 +148,7 @@ and factual `notes` persist API knowledge between calls; the original player
 request accompanies the shorter goal so task constraints are retained.
 
 `max_inspections_without_execution` defaults to eight (deployment range 1–64).
+The first unchanged inspection of a new goal counts toward that ceiling.
 Unchanged read/list/terminal inspections cannot spend the entire model allowance:
 source edits, SDK execution, inventory changes or completion reset this hint.
 At the ceiling, only execution inference waits for changed source or goal; body
