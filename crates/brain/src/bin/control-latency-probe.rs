@@ -191,7 +191,9 @@ async fn main() -> Result<()> {
         }
         _ => return Err("Unexpected diagnostic arguments".into()),
     };
-    let cfg: Config = serde_json::from_slice(&private_read(Path::new(&path), 16384)?)?;
+    let mut cfg: Config = serde_json::from_slice(&private_read(Path::new(&path), 16384)?)?;
+    // Transport/physics conformance is deliberately separate from tactics.
+    cfg.body.enabled = false;
     let mut brain = Brain::open(cfg).await?;
     let result = if finite {
         finite::run(&mut brain).await

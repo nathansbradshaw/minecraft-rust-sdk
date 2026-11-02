@@ -1,0 +1,31 @@
+Rust SDK quick reference (documentation, not a gameplay strategy):
+
+- SDK types are re-exported from minecraft_sdk. Their source is crates/core/src/lib.rs
+  beside crates/sdk/src/lib.rs under the SDK source root. The crate directory is
+  core, not sdk-core. Rust tools in the workspace include Cargo; if rg is absent,
+  use grep/find or the harness read/list tools. Read bounded line ranges when
+  terminal output says output_truncated; repeating a large dump loses its end.
+- Import Client, Profile, Action, ActionRequest, Position, Outcome. Load Profile
+  from MC_SDK_PROFILE; Client::with_profile(&profile) uses its existing session.
+  Generated programs must not connect/disconnect the harness's character.
+- Observation.player and .world are serde_json::Value; .revision is String.
+  player.position is exactly [x,y,z]. A compact context is a sample; a program can
+  inspect client.observe().await? for full local facts and collision geometry.
+- Action::StartMove { target: Position{x,y,z}, jump: bool, max_ticks: u16 } is
+  finite, ordinary movement. Action::CancelControl { action_id:String } cancels
+  that control. Legacy Move, Jump and MotionFrame are disabled in protected
+  coding deployments; old examples using them require adaptation.
+- client.act(&ActionRequest{action_id:String,action}).await? returns Receipt.
+  Outcome::Running means poll client.action_status(&id).await? until terminal.
+  Observed verifies the requested effect. Cancelled, Expired, Failed and Rejected
+  are feedback, not success. Reobserve/replan after defensive cancellation.
+- The inherited MC_SDK_ARBITER defers ordinary gameplay during danger while code
+  and chat remain available. A deferred action's old target may be stale; inspect
+  its receipt and fresh observation. Do not bypass the local body scheduler.
+- Keep unique durable IDs per intention. An interrupted/Uncertain mutation is
+  inspected with action_status, pending_actions and reconcile; never replay it
+  under a new ID. Reconciliation does not prove a historical effect.
+- Print compact action ID/outcome/error and relevant before/after facts, not full
+  world receipts every frame. Authoritative evidence stays in the gateway journal.
+- Use tokio::time for bounded waits; it is enabled in the coding project. Paths,
+  model access and SDK endpoints come from deployment, never invented credentials.

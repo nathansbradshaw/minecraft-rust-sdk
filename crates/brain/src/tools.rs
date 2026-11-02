@@ -89,6 +89,18 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(body) = &brain.body {
+        c.env("MC_SDK_ARBITER", &body.socket);
+    }
+    // Leave scheduling room for the independent reactive controller.
+    unsafe {
+        c.pre_exec(|| {
+            if libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     c.process_group(0);
     let mut child = c.spawn()?;
     let pid = child.id().ok_or("Process ID unavailable")?;
@@ -98,6 +110,7 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     let out = tokio::spawn(bounded_output(stdout));
     let err = tokio::spawn(bounded_output(stderr));
     let started = std::time::Instant::now();
+    let initial_inventory = brain.observed.player["inventory"].clone();
     let deadline = tokio::time::sleep(Duration::from_secs(brain.cfg.tool_timeout_secs));
     tokio::pin!(deadline);
     let mut timed_out = false;
@@ -108,8 +121,9 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     // Bound inherited open pipes even if a subprocess detached from its parent.
     let stdout = tokio::time::timeout(Duration::from_secs(2), out).await???;
     let stderr = tokio::time::timeout(Duration::from_secs(2), err).await???;
+    brain.refresh().await?;
     Ok(
-        json!({"exit_code":status.code(),"success":status.success()&&!timed_out,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"output_truncated":stdout.len()>8000||stderr.len()>8000,"stdout":String::from_utf8_lossy(&stdout[..stdout.len().min(8000)]),"stderr":String::from_utf8_lossy(&stderr[..stderr.len().min(8000)])}),
+        json!({"exit_code":status.code(),"success":status.success()&&!timed_out,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"output_truncated":stdout.len()>8000||stderr.len()>8000,"stdout":String::from_utf8_lossy(&stdout[..stdout.len().min(8000)]),"stderr":String::from_utf8_lossy(&stderr[..stderr.len().min(8000)])}),
     )
 }
 pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {

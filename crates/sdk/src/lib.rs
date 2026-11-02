@@ -12,6 +12,7 @@ pub struct Profile {
     pub session: Option<Session>,
 }
 pub struct Client {
+    local_arbiter: Option<std::path::PathBuf>,
     endpoint: Url,
     http: Http,
     credential: Option<Credential>,
@@ -31,11 +32,11 @@ impl Client {
             || endpoint.password().is_some()
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
-            || endpoint.path() != "/"
+            || !endpoint.path().ends_with('/')
         {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
-                "Use an HTTPS gateway origin (HTTP allowed only on loopback)",
+                "Use an HTTPS gateway base URL ending in / (HTTP allowed only on loopback)",
             ));
         }
         let builder = Http::builder()
@@ -47,6 +48,7 @@ impl Client {
             .build()
             .map_err(|_| ApiError::new(ErrorCode::Internal, "Cannot create HTTP client"))?;
         Ok(Self {
+            local_arbiter: std::env::var_os("MC_SDK_ARBITER").map(std::path::PathBuf::from),
             endpoint,
             http,
             credential: None,
@@ -61,6 +63,12 @@ impl Client {
     }
     pub fn set_session(&mut self, session: Option<Session>) {
         self.session = session;
+    }
+    /// For the container's own arbiter/body. This changes local scheduling only,
+    /// never remote authentication or ordinary server permissions.
+    pub fn without_local_arbiter(mut self) -> Self {
+        self.local_arbiter = None;
+        self
     }
     fn bot_path(&self, suffix: &str) -> Result<String> {
         let bot = &self
@@ -201,6 +209,9 @@ impl Client {
     }
     pub async fn act(&self, request: &ActionRequest) -> Result<Receipt> {
         request.action.validate()?;
+        if let Some(path) = &self.local_arbiter {
+            return local_action(path, request).await;
+        }
         self.request(
             Method::POST,
             &self.bot_path("actions")?,
@@ -221,6 +232,10 @@ impl Client {
         self.request(Method::GET, &self.bot_path(&format!("actions/{id}"))?, None)
             .await
     }
+    pub async fn pending_actions(&self) -> Result<Vec<PendingAction>> {
+        self.request(Method::GET, &self.bot_path("actions/pending")?, None)
+            .await
+    }
     pub async fn reconcile(&self, id: &str) -> Result<Receipt> {
         if !valid_id(id) {
             return Err(ApiError::new(
@@ -236,9 +251,150 @@ impl Client {
         .await
     }
 }
+#[cfg(unix)]
+async fn local_action(path: &std::path::Path, request: &ActionRequest) -> Result<Receipt> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let unavailable = || {
+        ApiError::new(
+            ErrorCode::NotReady,
+            "Container action arbiter unavailable; do not bypass it",
+        )
+    };
+    let m = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
+    if !path.is_absolute() || !m.file_type().is_socket() || m.permissions().mode() & 0o077 != 0 {
+        return Err(unavailable());
+    }
+    let exchange = async {
+        let mut socket = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|_| unavailable())?;
+        if socket.peer_cred().map_err(|_| unavailable())?.uid() != m.uid() {
+            return Err(unavailable());
+        }
+        let mut payload = serde_json::to_vec(&LocalActionRequest {
+            version: LOCAL_CONTROL_VERSION,
+            request: request.clone(),
+        })
+        .map_err(|_| unavailable())?;
+        if payload.len() > 16384 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Local action exceeds budget",
+            ));
+        }
+        payload.push(b'\n');
+        socket
+            .write_all(&payload)
+            .await
+            .map_err(|_| unavailable())?;
+        let mut input = tokio::io::BufReader::new(socket);
+        let mut bytes = Vec::new();
+        loop {
+            let buf = input.fill_buf().await.map_err(|_| unavailable())?;
+            if buf.is_empty() {
+                return Err(ApiError::new(
+                    ErrorCode::UncertainOutcome,
+                    "Local action reply lost; inspect the original ID without replay",
+                ));
+            }
+            let count = buf
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(buf.len(), |n| n + 1);
+            if bytes.len() + count > 1_048_576 {
+                return Err(unavailable());
+            }
+            let done = buf[count - 1] == b'\n';
+            bytes.extend_from_slice(&buf[..count]);
+            input.consume(count);
+            if done {
+                break;
+            }
+        }
+        match serde_json::from_slice(&bytes).map_err(|_| unavailable())? {
+            LocalActionResponse::Receipt(r) if r.action_id == request.action_id => Ok(r),
+            LocalActionResponse::Error(e) => Err(e),
+            _ => Err(ApiError::new(
+                ErrorCode::UncertainOutcome,
+                "Local action correlation mismatch",
+            )),
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(300), exchange)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::UncertainOutcome,
+                "Local action timed out; inspect its original ID",
+            )
+        })?
+}
+#[cfg(not(unix))]
+async fn local_action(_: &std::path::Path, _: &ActionRequest) -> Result<Receipt> {
+    Err(ApiError::new(
+        ErrorCode::UnsupportedCapability,
+        "Local Unix action arbitration is unavailable on this platform",
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn local_actions_send_only_typed_intent_and_reject_crossed_receipts() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!(
+            "sdk-arbiter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let path = dir.join("a.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio::io::BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            let req: LocalActionRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.version, LOCAL_CONTROL_VERSION);
+            assert_eq!(req.request.action_id, "own-action");
+            assert!(!line.contains("credential"));
+            let response = LocalActionResponse::Receipt(Receipt {
+                action_id: "foreign-action".into(),
+                outcome: Outcome::Observed,
+                adapter_version: "fixture".into(),
+                evidence: serde_json::Value::Null,
+                error: None,
+            });
+            socket
+                .get_mut()
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .await
+                .unwrap();
+        });
+        let error = local_action(
+            &path,
+            &ActionRequest {
+                action_id: "own-action".into(),
+                action: Action::Chat {
+                    message: "hello".into(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UncertainOutcome);
+        peer.await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(serde_json::from_str::<LocalActionRequest>(r#"{"version":1,"actor":"other","request":{"action_id":"x","action":{"kind":"respawn"}}}"#).is_err());
+    }
     #[tokio::test]
     async fn instance_verification_never_discloses_credentials() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

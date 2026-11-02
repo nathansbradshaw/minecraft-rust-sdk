@@ -9,6 +9,22 @@ fn internal(_: impl std::fmt::Display) -> ApiError {
 fn conflict(message: &str) -> ApiError {
     ApiError::new(ErrorCode::Conflict, message)
 }
+fn independent_control(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Chat { .. }
+            | Action::Look { .. }
+            | Action::StartMove { .. }
+            | Action::CancelControl { .. }
+            | Action::Move { .. }
+            | Action::MotionFrame { .. }
+            | Action::Jump
+            | Action::Sprint { .. }
+            | Action::Sneak { .. }
+            | Action::Attack { .. }
+            | Action::Respawn
+    )
+}
 pub fn random_id() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(internal)?;
@@ -499,6 +515,50 @@ impl Store {
             .collect::<std::result::Result<_, _>>()
             .map_err(internal)
     }
+    pub fn pending_actions(&self, bot: &str) -> Result<Vec<PendingAction>> {
+        let mut q=self.db.prepare("SELECT intent,receipt FROM actions WHERE bot=?1 AND unresolved<>0 ORDER BY id LIMIT 65").map_err(internal)?;
+        let rows = q
+            .query_map([bot], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(internal)?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (intent, receipt) = row.map_err(internal)?;
+            result.push(PendingAction {
+                action: Some(serde_json::from_str(&intent).map_err(internal)?),
+                receipt: serde_json::from_str(&receipt).map_err(internal)?,
+            });
+        }
+        if result.len() > 64 {
+            return Err(ApiError::new(
+                ErrorCode::NotReady,
+                "Pending journal requires operator inspection; response bound exceeded",
+            ));
+        }
+        // Match the legacy fence enforced by prepare, without disclosing its path.
+        if let Some(legacy) = self.legacy(bot)? {
+            let id: Option<String> = legacy
+                .query_row(
+                    "SELECT id FROM actions WHERE result IS NULL LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            if let Some(id) = id
+                && !result.iter().any(|r| r.receipt.action_id == id)
+                && let Some(receipt) = self.receipt(bot, &id)?
+                && !receipt.outcome.terminal()
+            {
+                result.push(PendingAction {
+                    action: None,
+                    receipt,
+                });
+            }
+        }
+        Ok(result)
+    }
     fn interrupt_running(&self, bot: &str) -> Result<()> {
         for id in self.running(bot)? {
             if let Some(mut r) = self.receipt(bot, &id)? {
@@ -625,6 +685,7 @@ impl Store {
                 .optional()
                 .map_err(internal)?;
             if let Some(id) = pending
+                && !independent_control(&request.action)
                 && self
                     .receipt(bot, &id)?
                     .is_none_or(|r| r.outcome != Outcome::Reconciled)
@@ -660,7 +721,7 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(internal)?;
-        if unresolved {
+        if unresolved && !independent_control(&request.action) {
             return Err(ApiError::new(
                 ErrorCode::UncertainOutcome,
                 "Reconcile the previous action before submitting another mutation",
@@ -723,6 +784,67 @@ impl Store {
 mod tests {
     use super::*;
     #[test]
+    fn uncertainty_does_not_suppress_conversation_and_pending_inspection_is_actor_scoped() {
+        let (_dir, mut s, _key, actor) = setup();
+        let request = ActionRequest {
+            action_id: "uncertain".into(),
+            action: Action::Jump,
+        };
+        let (mut r, _) = s.prepare(&actor.bot_id, &request, "fixture").unwrap();
+        r.outcome = Outcome::Uncertain;
+        s.save_receipt(&actor.bot_id, &request.action_id, &r)
+            .unwrap();
+        for (id, action) in [
+            (
+                "chat",
+                Action::Chat {
+                    message: "I can still talk while investigating".into(),
+                },
+            ),
+            (
+                "look",
+                Action::Look {
+                    yaw: 30.,
+                    pitch: 0.,
+                },
+            ),
+        ] {
+            let req = ActionRequest {
+                action_id: id.into(),
+                action,
+            };
+            let (mut r, new) = s.prepare(&actor.bot_id, &req, "fixture").unwrap();
+            assert!(new);
+            r.outcome = Outcome::Observed;
+            s.save_receipt(&actor.bot_id, id, &r).unwrap();
+        }
+        let pending = s.pending_actions(&actor.bot_id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt.action_id, "uncertain");
+        let other = s
+            .register(&Registration {
+                name: "another".into(),
+            })
+            .unwrap();
+        assert!(s.pending_actions(&other.bot_id).unwrap().is_empty());
+        assert!(
+            !serde_json::to_string(&pending)
+                .unwrap()
+                .contains("journal.sqlite")
+        );
+        assert!(
+            s.prepare(
+                &actor.bot_id,
+                &ActionRequest {
+                    action_id: "no-replay".into(),
+                    action: Action::SelectSlot { slot: 0 }
+                },
+                "fixture"
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn running_controls_allow_cancellation_without_replay_and_become_uncertain_after_disconnect() {
         let (_dir, mut s, _key, actor) = setup();
         let request = ActionRequest {
@@ -775,7 +897,7 @@ mod tests {
         }
         let other = ActionRequest {
             action_id: "later".into(),
-            action: Action::Jump,
+            action: Action::SelectSlot { slot: 0 },
         };
         assert_eq!(
             s.prepare(&actor.bot_id, &other, "fixture")
@@ -905,7 +1027,7 @@ mod tests {
                 &actor.bot_id,
                 &ActionRequest {
                     action_id: "next".into(),
-                    action: Action::Jump
+                    action: Action::SelectSlot { slot: 0 }
                 },
                 "a"
             )
@@ -1004,7 +1126,7 @@ mod tests {
                     &credential.bot_id,
                     &ActionRequest {
                         action_id: "new".into(),
-                        action: Action::Respawn
+                        action: Action::SelectSlot { slot: 0 }
                     },
                     "new-adapter"
                 )

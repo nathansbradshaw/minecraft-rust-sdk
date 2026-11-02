@@ -23,6 +23,8 @@ use store::{Actor, Store};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub base_path: String,
     pub listen: SocketAddr,
     pub journal: PathBuf,
     pub adapter: AdapterConfig,
@@ -41,6 +43,7 @@ fn default_journal_budget() -> u32 {
     1024
 }
 pub struct Gateway {
+    base_path: String,
     store: Mutex<Store>,
     adapter: AdapterPool,
     info: ServerInfo,
@@ -79,6 +82,21 @@ impl IntoResponse for HttpError {
 }
 impl Gateway {
     pub async fn start(config: Config) -> Result<Shared> {
+        if !config.base_path.is_empty()
+            && (!config.base_path.starts_with('/')
+                || config.base_path.ends_with('/')
+                || config.base_path.len() > 128
+                || config.base_path.contains("//")
+                || !config
+                    .base_path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/_-".contains(&b)))
+        {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Invalid gateway base path",
+            ));
+        }
         if !(1..=1024).contains(&config.adapter_queue_capacity) {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
@@ -124,10 +142,12 @@ impl Gateway {
             ));
         }
         info.instance_id = store.instance_id.clone();
+        info.capabilities.push("minecraft:pending_actions".into());
         info.limits["journal_max_mib"] = serde_json::json!(config.journal_max_mib);
         info.limits["adapter_queue_capacity"] = serde_json::json!(config.adapter_queue_capacity);
         let health = adapter.health.clone();
         Ok(Arc::new(Self {
+            base_path: config.base_path,
             store: Mutex::new(store),
             adapter: AdapterPool::new(config.adapter, adapter, &info),
             info,
@@ -278,7 +298,8 @@ impl Gateway {
     }
 }
 pub fn router(gateway: Shared) -> Router {
-    Router::new()
+    let base_path = gateway.base_path.clone();
+    let routes = Router::new()
         .route("/v1/server", get(discover))
         .route("/v1/bots", post(register))
         .route("/v1/bots/{bot}/key/rotate", post(rotate))
@@ -286,11 +307,17 @@ pub fn router(gateway: Shared) -> Router {
         .route("/v1/bots/{bot}/observations", get(observe))
         .route("/v1/bots/{bot}/observations/query", post(read_observation))
         .route("/v1/bots/{bot}/actions", post(action))
+        .route("/v1/bots/{bot}/actions/pending", get(pending_actions))
         .route("/v1/bots/{bot}/actions/{id}", get(status))
         .route("/v1/bots/{bot}/actions/{id}/reconcile", post(reconcile))
         .layer(DefaultBodyLimit::max(16384))
         .layer(axum::middleware::from_fn(no_store))
-        .with_state(gateway)
+        .with_state(gateway);
+    if base_path.is_empty() {
+        routes
+    } else {
+        Router::new().nest(&base_path, routes)
+    }
 }
 async fn no_store(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let mut response = next.run(request).await;
@@ -553,6 +580,14 @@ async fn status(
     Ok(Json(task.await.map_err(|_| {
         ApiError::new(ErrorCode::NotReady, "Control status interrupted")
     })??))
+}
+async fn pending_actions(
+    State(g): State<Shared>,
+    Path(bot): Path<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<PendingAction>>, HttpError> {
+    g.actor(&bot, &headers)?;
+    Ok(Json(g.db()?.pending_actions(&bot)?))
 }
 async fn reconcile(
     State(g): State<Shared>,

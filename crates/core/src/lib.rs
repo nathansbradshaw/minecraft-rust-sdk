@@ -368,6 +368,13 @@ pub struct Receipt {
     pub evidence: Value,
     pub error: Option<ApiError>,
 }
+/// Own pending journal entries. Imported legacy intents may only have a digest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingAction {
+    pub action: Option<Action>,
+    pub receipt: Receipt,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
@@ -375,6 +382,19 @@ pub struct Observation {
     pub player: Value,
     pub world: Value,
     pub menu: Value,
+}
+pub const LOCAL_CONTROL_VERSION: u32 = 1;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalActionRequest {
+    pub version: u32,
+    pub request: ActionRequest,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum LocalActionResponse {
+    Receipt(Receipt),
+    Error(ApiError),
 }
 
 /// A read-only query to an operator-installed, namespaced observation provider.

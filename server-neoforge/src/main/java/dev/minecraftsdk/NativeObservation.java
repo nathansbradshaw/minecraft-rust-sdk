@@ -4,13 +4,28 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import java.util.*;
 
 /** Bounded observations, always collected together on the authoritative server thread. */
 final class NativeObservation {
     private static Map<String,Object> stack(ItemStack stack,ServerPlayer player){
         var result=new LinkedHashMap<String,Object>();result.put("item",BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());result.put("count",stack.getCount());
-        result.put("components",stack.isEmpty()?"":stack.save(player.registryAccess()).toString());return result;
+        result.put("components",stack.isEmpty()?"":stack.save(player.registryAccess()).toString());
+        if(!stack.isEmpty()){
+            var food=stack.getFoodProperties(player);
+            if(food!=null)result.put("food",Map.of("nutrition",food.nutrition(),"saturation",food.saturation(),"can_always_eat",food.canAlwaysEat(),"can_eat",player.canEat(food.canAlwaysEat())));
+            result.put("use_duration_ticks",stack.getUseDuration(player));result.put("use_animation",stack.getUseAnimation().name());
+            result.put("on_cooldown",player.getCooldowns().isOnCooldown(stack.getItem()));
+        }
+        return result;
     }
     static Object snapshot(MinecraftServer server,ServerPlayer player){
         if(!server.isSameThread())throw new IllegalStateException("Main server thread required");
@@ -31,10 +46,29 @@ final class NativeObservation {
             }
         }
         var entities=new ArrayList<Map<String,Object>>();
-        for(var entity:world.getEntities(player,player.getBoundingBox().inflate(12))){if(entities.size()>=128)break;var row=new LinkedHashMap<String,Object>();row.put("entity_id",entity.getId());row.put("uuid",entity.getUUID().toString());row.put("type",BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());row.put("position",List.of(entity.getX(),entity.getY(),entity.getZ()));row.put("visible",player.hasLineOfSight(entity));entities.add(row);}
+        var visible=world.getEntities(player,player.getBoundingBox().inflate(12)).stream().filter(e->e.isAlive()&&player.hasLineOfSight(e))
+            .sorted(Comparator.<net.minecraft.world.entity.Entity>comparingInt(e->e instanceof Enemy||e.getType().getCategory()==MobCategory.MONSTER||e instanceof Projectile&&e.getDeltaMovement().lengthSqr()>0.0001?0:1)
+            .thenComparingDouble(e->e.distanceToSqr(player))).limit(128).toList();
+        for(var entity:visible){var row=new LinkedHashMap<String,Object>();row.put("entity_id",entity.getId());row.put("uuid",entity.getUUID().toString());row.put("type",BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());row.put("position",List.of(entity.getX(),entity.getY(),entity.getZ()));row.put("visible",true);
+            var velocity=entity.getDeltaMovement();row.put("velocity",List.of(velocity.x,velocity.y,velocity.z));
+            row.put("hostile",entity instanceof Enemy||entity.getType().getCategory()==MobCategory.MONSTER);row.put("player",entity instanceof net.minecraft.world.entity.player.Player);
+            if(entity instanceof LivingEntity living){row.put("health",living.getHealth());row.put("hurt_time",living.hurtTime);}
+            if(entity instanceof Mob mob)row.put("aggressive",mob.isAggressive());
+            if(entity instanceof Projectile projectile){var owner=projectile.getOwner();row.put("projectile",true);row.put("owner_uuid",owner==null?"":owner.getUUID().toString());}
+            if(entity instanceof Creeper creeper)row.put("creeper",Map.of("swell_direction",creeper.getSwellDir(),"powered",creeper.isPowered(),"ignited",creeper.isIgnited()));
+            if(entity instanceof ItemEntity item)row.put("item",stack(item.getItem(),player));
+            entities.add(row);
+        }
         var own=new LinkedHashMap<String,Object>();own.put("uuid",player.getUUID().toString());own.put("name",player.getGameProfile().getName());own.put("entity_id",player.getId());own.put("dimension",world.dimension().location().toString());own.put("position",List.of(player.getX(),player.getY(),player.getZ()));own.put("yaw",player.getYRot());own.put("pitch",player.getXRot());own.put("on_ground",player.onGround());own.put("sprinting",player.isSprinting());own.put("sneaking",player.isShiftKeyDown());own.put("health",player.getHealth());own.put("food",player.getFoodData().getFoodLevel());own.put("inventory",inventory);own.put("selected",player.getInventory().selected);
+        own.put("saturation",player.getFoodData().getSaturationLevel());own.put("air",player.getAirSupply());own.put("max_air",player.getMaxAirSupply());own.put("fire_ticks",player.getRemainingFireTicks());
+        own.put("in_water",player.isInWater());own.put("in_lava",player.isInLava());own.put("fall_distance",player.fallDistance);own.put("using_item",player.isUsingItem());
+        own.put("use_item",stack(player.getUseItem(),player));own.put("remaining_use_ticks",player.getUseItemRemainingTicks());own.put("attack_strength",player.getAttackStrengthScale(0.5f));
+        own.put("velocity",List.of(player.getDeltaMovement().x,player.getDeltaMovement().y,player.getDeltaMovement().z));
+        own.put("movement_speed",player.getAttributeValue(Attributes.MOVEMENT_SPEED));own.put("attack_damage",player.getAttributeValue(Attributes.ATTACK_DAMAGE));
+        own.put("attack_speed",player.getAttributeValue(Attributes.ATTACK_SPEED));own.put("max_health",player.getMaxHealth());own.put("armor",player.getArmorValue());
         var mining=(dev.minecraftsdk.mixin.GameModeAccessor)player.gameMode;var target=mining.sdk$miningPosition();own.put("mining",Map.of("active",mining.sdk$mining(),"block",List.of(target.getX(),target.getY(),target.getZ())));own.put("accepted_chat",NativeChat.snapshot(player));
-        return Map.of("revision",Integer.toString(server.getTickCount()),"player",own,"world",Map.of("game_time",world.getGameTime(),"day_time",world.getDayTime(),"blocks",blocks,"entities",entities,"unknown_columns",unknown),"menu",Map.of("menu_id",menu.containerId,"state_id",menu.getStateId(),"type",menu==player.inventoryMenu?"minecraft:inventory":BuiltInRegistries.MENU.getKey(menu.getType()).toString(),"slots",slots,"carried",stack(menu.getCarried(),player)));
+        var chat=NativeChat.inbox(player);
+        return Map.of("revision",Integer.toString(server.getTickCount()),"player",own,"world",Map.of("game_time",world.getGameTime(),"day_time",world.getDayTime(),"blocks",blocks,"entities",entities,"unknown_columns",unknown,"chat",chat.get("messages"),"chat_epoch",chat.get("epoch"),"chat_dropped",chat.get("dropped")),"menu",Map.of("menu_id",menu.containerId,"state_id",menu.getStateId(),"type",menu==player.inventoryMenu?"minecraft:inventory":BuiltInRegistries.MENU.getKey(menu.getType()).toString(),"slots",slots,"carried",stack(menu.getCarried(),player)));
     }
     private NativeObservation(){}
 }
