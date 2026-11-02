@@ -22,6 +22,12 @@ create duplicate caches for each command. Model credentials must be a separately
 allocated per-bot key accepted by a compatible HTTPS inference proxy. SDK public
 registration does not grant model access.
 
+Terminal builds default to one job, no incremental compilation or development
+debug information, and development debug symbols are stripped. Keep the harness
+executable outside disposable Cargo output before cleaning that output. Use one
+compatible profile/cache in a storage-limited workspace; building release and
+development dependency trees simultaneously may exceed a deployment's budget.
+
 The workspace should contain an ordinary Rust Cargo project with the SDK and
 Tokio dependencies and an appropriate dependency cache/vendor configuration.
 The harness sets `MC_SDK_PROFILE` for programs, with the already-connected private
