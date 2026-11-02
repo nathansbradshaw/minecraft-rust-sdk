@@ -22,6 +22,22 @@ create duplicate caches for each command. Model credentials must be a separately
 allocated per-bot key accepted by a compatible HTTPS inference proxy. SDK public
 registration does not grant model access.
 
+New player tasks start with Luna; it can escalate to Sol through `develop`.
+The proxy remains authoritative for daily allowances. Its operator usage report
+must include legacy admissions whose model identity is unknown; these are charged
+conservatively against each model ceiling. Do not infer remaining allowance from
+identified Sol/Luna rows alone or reset a ledger to continue an evaluation.
+Explicit `allocation_daily_limit` and `allocation_pacing` responses may supply a
+bounded `retry_at_utc`. The brain waits for that clock event while its body and
+other model lane remain available. Conversation retains unacknowledged input for
+that retry. Authentication, schema, queue, provider and clock-rollback failures
+require investigation rather than unchanged automatic requests.
+
+`model-probe HTTPS_ENDPOINT ALLOCATED_KEY routine|develop LABEL` checks an
+allocated inference capability without connecting a character or executing a
+returned tool. Record its actual admission and outcome; it proves inference,
+not gameplay intelligence. The key stays in its private local file.
+
 Terminal builds default to one job, no incremental compilation or development
 debug information, and development debug symbols are stripped. Keep the harness
 executable outside disposable Cargo output before cleaning that output. Use one

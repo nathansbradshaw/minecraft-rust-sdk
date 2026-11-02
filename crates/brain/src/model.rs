@@ -3,6 +3,51 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 
+#[derive(Debug)]
+struct HttpFailure {
+    status: u16,
+    class: String,
+    retry_at: Option<i64>,
+}
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model_http_{}: {}", self.status, self.class)
+    }
+}
+impl std::error::Error for HttpFailure {}
+fn http_failure(status: u16, envelope: &Value, now: i64) -> HttpFailure {
+    let class = envelope["error"]
+        .as_str()
+        .filter(|s| {
+            s.len() <= 96
+                && s.bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        })
+        .unwrap_or("response_unavailable")
+        .to_owned();
+    let retry_at = if status == 429
+        && matches!(
+            class.as_str(),
+            "allocation_daily_limit" | "allocation_pacing"
+        ) {
+        envelope["retry_at_utc"]
+            .as_i64()
+            .filter(|at| *at > now && *at <= now.saturating_add(86400))
+    } else {
+        None
+    };
+    HttpFailure {
+        status,
+        class,
+        retry_at,
+    }
+}
+/// Only an explicit, bounded daily-reset or pacing timestamp permits a retry.
+/// Authentication/schema/queue/provider failures still require investigation.
+pub fn retry_at(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<i64> {
+    error.downcast_ref::<HttpFailure>().and_then(|e| e.retry_at)
+}
+
 /// Container-local coordination for the shared allocated model credentials.
 /// The broker remains authoritative for global jobs and daily budgets.
 #[derive(Clone)]
@@ -169,13 +214,9 @@ impl Model {
             bytes.extend(chunk);
         }
         let envelope: Value = serde_json::from_slice(&bytes)?;
-        ensure(
-            status == 200,
-            &format!(
-                "model_http_{status}: {}",
-                envelope["error"].as_str().unwrap_or("response unavailable")
-            ),
-        )?;
+        if status != 200 {
+            return Err(Box::new(http_failure(status, &envelope, crate::now())));
+        }
         ensure(envelope["done"] == true, "Incomplete model response")?;
         let content = envelope["message"]["content"]
             .as_str()
@@ -189,6 +230,40 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_bounded_explicit_allocation_clock_events_allow_retry() {
+        let daily = http_failure(
+            429,
+            &json!({"error":"allocation_daily_limit","retry_at_utc":200}),
+            100,
+        );
+        assert_eq!(retry_at(&daily), Some(200));
+        for (status, class, at) in [
+            (429, "allocation_daily_limit", 100),
+            (429, "allocation_daily_limit", 86501),
+            (429, "allocation_clock_rollback", 200),
+            (503, "model_queue_timeout", 200),
+            (401, "unauthorized", 200),
+            (429, "allocation_limit", 200),
+        ] {
+            assert_eq!(
+                retry_at(&http_failure(
+                    status,
+                    &json!({"error":class,"retry_at_utc":at}),
+                    100
+                )),
+                None
+            );
+        }
+        assert_eq!(
+            retry_at(&http_failure(
+                429,
+                &json!({"error":"allocation_pacing","retry_at_utc":101}),
+                100
+            )),
+            Some(101)
+        );
+    }
     #[tokio::test]
     async fn same_model_callers_wait_while_the_other_model_remains_independent() {
         let lanes = Lanes::default();
