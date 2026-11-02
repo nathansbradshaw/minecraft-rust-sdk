@@ -115,6 +115,7 @@ impl Default for Options {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    pub elapsed_ms: u64,
     pub status: String,
     pub position: [f64; 3],
     pub remaining_distance: f64,
@@ -295,6 +296,7 @@ impl Journal {
     }
     fn report(&self, status: &str, note: &str) -> Report {
         Report {
+            elapsed_ms: 0,
             status: status.into(),
             position: self.state.position,
             remaining_distance: self.state.goal.gap(self.state.position),
@@ -380,6 +382,7 @@ pub async fn navigate(
     path: &Path,
     options: Options,
 ) -> Result<Report> {
+    let started = std::time::Instant::now();
     goal.validate()?;
     if options.max_steps == 0
         || options.max_nodes == 0
@@ -415,13 +418,15 @@ pub async fn navigate(
         run(client, &mut journal, &options),
     )
     .await;
-    match run {
+    let mut report = match run {
         Ok(result) => result,
         Err(_) => {
             journal.save()?;
             Ok(journal.report("budget_exhausted","Operation deadline reached; inspect the preserved pending ID before any new intention. Finite controls retain their server expiry."))
         }
-    }
+    }?;
+    report.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    Ok(report)
 }
 async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Report> {
     loop {
