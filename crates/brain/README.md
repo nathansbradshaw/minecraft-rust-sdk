@@ -132,6 +132,10 @@ completion, instead of spending inference on an unchanged idle condition. Its
 separate conversation journal preserves reports, replies, cursor and model errors.
 The trusted model service must allow one pending job per bot/model while retaining
 its global jobs and per-bot daily ceilings. No additional allowance is created.
+Routine Luna planning and Luna conversation share a local permit, so concurrent
+callers wait inside the container rather than colliding at that broker limit.
+Sol uses a separate permit. Waiting for either model leaves body observations
+and gameplay active; a returned error releases the permit before investigation.
 
 `body-probe PRIVATE_CONFIG.json blocked|compile SECONDS` is a declared native
 execution diagnostic. Blocked mode injects a stalled reasoning future and calls

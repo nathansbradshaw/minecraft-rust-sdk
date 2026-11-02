@@ -40,6 +40,7 @@ impl Default for Config {
 }
 pub struct Shared {
     pub mutation: Arc<tokio::sync::Mutex<()>>,
+    pub model_lanes: crate::model::Lanes,
     emergency: AtomicBool,
     running: AtomicBool,
     latest: Mutex<Option<(Instant, Arc<Observation>)>>,
@@ -111,6 +112,7 @@ impl Handle {
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let shared = Arc::new(Shared {
             mutation: Arc::new(tokio::sync::Mutex::new(())),
+            model_lanes: crate::model::Lanes::default(),
             emergency: AtomicBool::new(false),
             running: AtomicBool::new(true),
             latest: Mutex::new(Some((Instant::now(), Arc::new(initial)))),

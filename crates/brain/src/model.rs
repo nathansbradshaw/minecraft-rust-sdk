@@ -3,6 +3,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 
+/// Container-local coordination for the shared allocated model credentials.
+/// The broker remains authoritative for global jobs and daily budgets.
+#[derive(Clone)]
+pub struct Lanes([std::sync::Arc<tokio::sync::Semaphore>; 2]);
+impl Default for Lanes {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+        }))
+    }
+}
+impl Lanes {
+    pub async fn acquire(&self, develop: bool) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Ok(self.0[usize::from(develop)].clone().acquire_owned().await?)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Choice {
@@ -172,6 +189,36 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn same_model_callers_wait_while_the_other_model_remains_independent() {
+        let lanes = Lanes::default();
+        let routine = lanes.acquire(false).await.unwrap();
+        let development = tokio::time::timeout(Duration::from_millis(100), lanes.acquire(true))
+            .await
+            .expect("Luna must not reserve Sol")
+            .unwrap();
+        let conversation = {
+            let lanes = lanes.clone();
+            tokio::spawn(async move { lanes.acquire(false).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !conversation.is_finished(),
+            "same-model work must wait locally"
+        );
+        drop(routine);
+        let conversation = tokio::time::timeout(Duration::from_millis(100), conversation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(conversation);
+        let reused = tokio::time::timeout(Duration::from_millis(100), lanes.acquire(false))
+            .await
+            .expect("completed or failed caller must release its slot")
+            .unwrap();
+        drop((development, reused));
+    }
     #[test]
     fn tool_contract_allows_real_coding_and_gameplay() {
         let s = schema();
