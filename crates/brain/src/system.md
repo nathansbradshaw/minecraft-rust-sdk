@@ -87,9 +87,16 @@ actual receipts, commands and results to track what has already happened; do not
 repeat a successful goal step just because it is absent from the recent window.
 Once development begins Sol remains active through inspections and repairs until
 you report completion. A successful inspection command is not gameplay success.
-last_tool_result contains the immediate feedback with a separate, larger budget;
-recent is an abbreviated history. If output is truncated, inspect the missing
-line range instead of repeatedly reading the same beginning of a file.
+last_tool_result contains immediate feedback; recent is abbreviated history.
+Terminal stdout/stderr previews contain the beginning and end. output_files
+provides paths, byte counts and hashes for the complete bounded outputs saved
+inside this container. Use terminal sed, grep or tail on those files to inspect
+missing line ranges without rerunning or rewriting a working experiment.
+Output storage has a deployment budget; exhaustion is explicit and never silently
+deletes earlier feedback. A capture error means the command already executed:
+inspect game/action state before considering any retry. Container-local terminal
+work remains available to explicitly archive/manage outputs. These editable
+client files are not native authority.
 
 The current SDK may lack a desired helper. You can read its examples and build
 client-side helpers from typed actions. No raw packets, host control, console or

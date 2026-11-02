@@ -97,3 +97,13 @@ bot credential/proxy and allow its exact endpoint. No model account, personal
 coding-agent authentication or automatic strategy is bundled. Checkpoint idle
 workspaces before stopping containers. Container claims never grant an external
 client additional gateway authority.
+
+The reference brain stores complete terminal stdout/stderr under its private
+state directory and returns compact head/tail previews plus file paths and
+hashes. Each stream remains limited to 4 MiB. Configure
+`terminal_output_budget_mib` (default 32, range 8–256) per deployment; capture
+failure is explicit and never silently removes old feedback. A capture failure
+does not undo the command: inspect action state before any retry. Terminal work
+remains available for explicit archival and storage management. State files are
+excluded from source-progress hints even when state is nested in the workspace.
+These editable client artifacts do not replace the operator-owned action journal.

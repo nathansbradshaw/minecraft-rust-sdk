@@ -4,9 +4,18 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
 pub fn workspace_fingerprint(root: &Path) -> Result<String> {
+    fingerprint(root, None)
+}
+
+pub fn workspace_fingerprint_excluding_state(root: &Path, state: &Path) -> Result<String> {
+    fingerprint(&fs::canonicalize(root)?, Some(&fs::canonicalize(state)?))
+}
+
+fn fingerprint(root: &Path, state: Option<&Path>) -> Result<String> {
     fn visit(
         root: &Path,
         path: &Path,
+        state: Option<&Path>,
         depth: u8,
         remaining: &mut usize,
         hash: &mut Sha256,
@@ -22,10 +31,13 @@ pub fn workspace_fingerprint(root: &Path) -> Result<String> {
                 continue;
             }
             let path = row.path();
+            if state == Some(path.as_path()) {
+                continue;
+            }
             let meta = fs::symlink_metadata(&path)?;
             hash.update(path.strip_prefix(root)?.to_string_lossy().as_bytes());
             if meta.is_dir() {
-                visit(root, &path, depth + 1, remaining, hash)?;
+                visit(root, &path, state, depth + 1, remaining, hash)?;
             } else if meta.is_file() {
                 let size = usize::try_from(meta.len())?;
                 ensure(
@@ -41,7 +53,7 @@ pub fn workspace_fingerprint(root: &Path) -> Result<String> {
         Ok(())
     }
     let mut hash = Sha256::new();
-    visit(root, root, 0, &mut (16 * 1024 * 1024), &mut hash)?;
+    visit(root, root, state, 0, &mut (16 * 1024 * 1024), &mut hash)?;
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -67,6 +79,28 @@ pub fn next_inspection_count(previous: u32, same_goal: bool, executed: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_feedback_in_nested_state_is_not_a_source_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let before = workspace_fingerprint_excluding_state(dir.path(), &state).unwrap();
+        fs::write(
+            state.join("terminal-result.txt"),
+            "new output, unchanged source",
+        )
+        .unwrap();
+        assert_eq!(
+            before,
+            workspace_fingerprint_excluding_state(dir.path(), &state).unwrap()
+        );
+        fs::write(dir.path().join("main.rs"), "fn main() { todo!() }").unwrap();
+        assert_ne!(
+            before,
+            workspace_fingerprint_excluding_state(dir.path(), &state).unwrap()
+        );
+    }
     #[test]
     fn the_eighth_unchanged_inspection_reaches_the_configured_limit() {
         let mut count = next_inspection_count(63, false, false);
