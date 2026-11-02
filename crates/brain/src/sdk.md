@@ -29,3 +29,9 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   world receipts every frame. Authoritative evidence stays in the gateway journal.
 - Use tokio::time for bounded waits; it is enabled in the coding project. Paths,
   model access and SDK endpoints come from deployment, never invented credentials.
+- Optional read-only query schemas are advertised in server.limits.observation_queries.
+  Call client.read_observation(&ObservationQuery{capability, input}).await?. A
+  block_search query accepts a runtime block ID or tag, radius, limit and offset.
+  It returns only loaded blocks hit by an unobstructed targeting ray. Follow
+  next_offset until complete, respecting retry_after_ms. A partial page with no
+  matches is not proof that the area contains no resources. It cannot load code.

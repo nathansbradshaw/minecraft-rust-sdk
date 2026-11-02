@@ -39,6 +39,23 @@ Players are non-operator Survival characters; normal server handlers enforce
 claim rules. Unsupported specialized mod operations require an operator-installed
 adapter, not a client-supplied plugin or raw packet.
 
+The built-in `minecraft:block_search` observation query accepts exactly one
+runtime `block` ID or `tag`, plus optional `radius`, `limit` and `offset` integers.
+Its schema is advertised in `ServerInfo.limits.observation_queries`. For example,
+`{"capability":"minecraft:block_search","input":{"tag":"minecraft:logs","radius":32,"limit":8}}`
+finds loaded blocks whose targeting ray from this character reaches that block.
+Occluded blocks are excluded. It never loads chunks or supplies hidden container
+contents. Results are observations, not permission to mine; normal gameplay
+handlers still enforce permissions.
+
+The deployment radius defaults to 32 blocks (`-Dminecraftsdk.searchRadius=N`,
+1–64). Each connection may start one page per second; each page checks a bounded
+part of the distance-sorted sphere with a 20 ms cooperative time budget. Follow
+`next_offset` until `complete`, and respect `retry_after_ms`. An empty partial page
+does not establish absence. Match positions and the returned `origin` use world
+coordinates; restart pagination after moving. Search and rate limits are deployment choices,
+not hardcoded resource or behavior policy in the client.
+
 # Operator recovery and migration
 
 `minecraft-sdk-admin SOCKET REQUEST.json NEW_PRIVATE_OUTPUT.json` contacts the

@@ -7,7 +7,7 @@ public final class SdkMod {
     public SdkMod(){
         NativeChat.install();
         NeoForge.EVENT_BUS.addListener((ServerStartedEvent event)->{
-            try{SdkService.active=new SdkService(event.getServer());}
+            try{var service=new SdkService(event.getServer());NativeBlockSearch.install(service);SdkService.active=service;}
             catch(Exception failure){throw new IllegalStateException("SDK integration failed closed",failure);}
         });
         NeoForge.EVENT_BUS.addListener((ServerStoppingEvent event)->{var service=SdkService.active;SdkService.active=null;if(service!=null)service.close();});
