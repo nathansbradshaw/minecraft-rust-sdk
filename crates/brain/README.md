@@ -66,6 +66,14 @@ SDK provider's perception; it must not be presented as a player-visibility proof
 All model/tool source is MIT. Do not include generated worlds, keys, personal bot
 memory or deployment journals in a release or source publication.
 
+`control-latency-probe PRIVATE_CONFIG.json` is a model-free native diagnostic for
+an otherwise inactive test character. It selects one observed flat, clear walking
+route, compares idle observation latency with a concurrent observation during the
+walk, records the native receipt and disconnects. It does not establish Survival
+competence or a latency percentile. It fails rather than inventing missing terrain
+or treating unverified movement/disconnection as successful. Run it only after
+stopping any other controller for that character.
+
 Build with a toolchain and libc compatible with the runtime container. A Linux
 host build can acquire newer glibc symbol requirements even when source checks
 pass. `Cargo.container.toml` defines a minimal three-crate workspace for compiling
