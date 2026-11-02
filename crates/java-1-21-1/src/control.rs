@@ -175,10 +175,28 @@ impl Job {
         native: Native,
         before: Observation,
         request: &ActionRequest,
-        target: [f64; 3],
-        jump: bool,
-        max_ticks: u16,
+        correction_epoch: u64,
     ) -> Result<Self> {
+        let Action::StartMove {
+            target,
+            jump,
+            max_ticks,
+        } = &request.action
+        else {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Finite movement required",
+            ));
+        };
+        let (target, jump, max_ticks) = ([target.x, target.y, target.z], *jump, *max_ticks);
+        if player.correcting.load(Ordering::Acquire)
+            || player.corrections.load(Ordering::Acquire) != correction_epoch
+        {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "Server corrected this character; observe fresh state before moving",
+            ));
+        }
         let mut plan = Plan::new(&before, target, jump)
             .map_err(|e| ApiError::new(ErrorCode::UnsupportedCapability, e.to_string()))?;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -198,6 +216,8 @@ impl Job {
         };
         let writer = player.wire.clone();
         let alive = player.alive.clone();
+        let corrections = player.corrections.clone();
+        let correcting = player.correcting.clone();
         let tables = player.tables.clone();
         let uuid = before.player["uuid"]
             .as_str()
@@ -223,12 +243,20 @@ impl Job {
                         bytes.extend(v.to_be_bytes());
                     }
                     bytes.push(u8::from(ground));
-                    tables.send(
-                        &mut *writer.lock().map_err(|_| "Player writer unavailable")?,
-                        "play",
-                        "position",
-                        &bytes,
-                    )?;
+                    {
+                        let mut writer = writer.lock().map_err(|_| "Player writer unavailable")?;
+                        // The correction handler changes this epoch under the
+                        // same wire lock before acknowledging a relocation.
+                        // Never send a stale trajectory into the new location.
+                        if correcting.load(Ordering::Acquire)
+                            || corrections.load(Ordering::Acquire) != correction_epoch
+                        {
+                            return Err(
+                                "Server position correction interrupted this control".into()
+                            );
+                        }
+                        tables.send(&mut writer, "play", "position", &bytes)?;
+                    }
                     sent += 1;
                     if let Ok(mut r) = state.lock() {
                         r.evidence["progress"] = json!({"frames_sent":sent,"commanded_position":p,"elapsed_ms":started.elapsed().as_millis(),"releasing":plan.outcome.is_some()});
