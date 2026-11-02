@@ -43,9 +43,11 @@ async fn bounded_output(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result
             break;
         }
         total += n;
-        ensure(total <= 4 * 1024 * 1024, "Terminal output flood stopped")?;
-        let keep = n.min(8001usize.saturating_sub(bytes.len()));
-        bytes.extend_from_slice(&chunk[..keep]);
+        ensure(
+            total <= crate::output::STREAM_LIMIT,
+            "Terminal output flood stopped",
+        )?;
+        bytes.extend_from_slice(&chunk[..n]);
     }
     Ok(bytes)
 }
@@ -71,6 +73,13 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
         !command.is_empty() && command.len() <= 8192,
         "Bounded terminal command required",
     )?;
+    let output_root = brain.cfg.state.join("terminal-output");
+    let output_budget = u64::from(brain.cfg.terminal_output_budget_mib) * 1024 * 1024;
+    crate::output::prepare(&output_root)?;
+    let sequence = brain
+        .journal
+        .event("terminal_started", json!({"command":command}))?;
+    let output_id = format!("{}-{sequence}", brain.run_id);
     let mut c = local_shell(command);
     c.current_dir(&brain.cfg.workspace)
         .env("MC_SDK_PROFILE", &brain.cfg.profile)
@@ -122,9 +131,22 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     // Bound inherited open pipes even if a subprocess detached from its parent.
     let stdout = tokio::time::timeout(Duration::from_secs(2), out).await???;
     let stderr = tokio::time::timeout(Duration::from_secs(2), err).await???;
+    let output_files = match crate::output::save(
+        &output_root,
+        &output_id,
+        &stdout,
+        &stderr,
+        output_budget,
+    ) {
+        Ok(files) => files,
+        Err(error) => {
+            json!({"error":error.to_string(),"complete_capture_available":false,"command_executed":true})
+        }
+    };
+    let captured = output_files.get("error").is_none();
     brain.refresh().await?;
     Ok(
-        json!({"exit_code":status.code(),"success":status.success()&&!timed_out,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"output_truncated":stdout.len()>8000||stderr.len()>8000,"stdout":String::from_utf8_lossy(&stdout[..stdout.len().min(8000)]),"stderr":String::from_utf8_lossy(&stderr[..stderr.len().min(8000)])}),
+        json!({"exit_code":status.code(),"success":status.success()&&!timed_out&&captured,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"output_truncated":stdout.len()>2000||stderr.len()>2000,"output_files":output_files,"stdout":crate::output::preview(&stdout),"stderr":crate::output::preview(&stderr)}),
     )
 }
 pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
@@ -232,7 +254,7 @@ mod tests {
     async fn tool_output_is_bounded() {
         let input = std::io::Cursor::new(vec![b'x'; 20000]);
         let bytes = bounded_output(input).await.unwrap();
-        assert_eq!(bytes.len(), 8001);
+        assert_eq!(bytes.len(), 20000);
         assert!(bounded_output(tokio::io::repeat(b'x')).await.is_err());
     }
     #[tokio::test]

@@ -3,6 +3,7 @@
 pub mod body;
 pub mod conversation;
 pub mod model;
+pub mod output;
 pub mod progress;
 pub mod tools;
 use minecraft_sdk::{ActionRequest, Client, ErrorCode, Observation, Outcome, Profile};
@@ -66,9 +67,14 @@ fn default_interval() -> u64 {
 fn default_inspections() -> u32 {
     8
 }
+fn default_terminal_output_budget() -> u32 {
+    32
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "default_terminal_output_budget")]
+    pub terminal_output_budget_mib: u32,
     #[serde(default = "default_inspections")]
     pub max_inspections_without_execution: u32,
     #[serde(default = "conversation_default")]
@@ -283,6 +289,10 @@ impl Brain {
         ensure(
             (1..=64).contains(&cfg.max_inspections_without_execution),
             "Invalid inspection budget",
+        )?;
+        ensure(
+            (8..=256).contains(&cfg.terminal_output_budget_mib),
+            "Invalid terminal output storage budget",
         )?;
         ensure(
             !cfg.await_chat_goal || (cfg.conversation && cfg.body.enabled),
@@ -571,9 +581,15 @@ impl Brain {
                 self.journal.set("develop_next", "false")?;
             }
             let completed = choice.tool == "complete";
-            let source_before = progress::workspace_fingerprint(&self.cfg.workspace)?;
+            let source_before = progress::workspace_fingerprint_excluding_state(
+                &self.cfg.workspace,
+                &self.cfg.state,
+            )?;
             let result = tools::execute(self, &choice).await;
-            let source_after = progress::workspace_fingerprint(&self.cfg.workspace)?;
+            let source_after = progress::workspace_fingerprint_excluding_state(
+                &self.cfg.workspace,
+                &self.cfg.state,
+            )?;
             let executed = result
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));

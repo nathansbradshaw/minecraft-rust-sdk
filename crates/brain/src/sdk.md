@@ -3,8 +3,9 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
 - SDK types are re-exported from minecraft_sdk. Their source is crates/core/src/lib.rs
   beside crates/sdk/src/lib.rs under the SDK source root. The crate directory is
   core, not sdk-core. Rust tools in the workspace include Cargo; if rg is absent,
-  use grep/find or the harness read/list tools. Read bounded line ranges when
-  terminal output says output_truncated; repeating a large dump loses its end.
+  use grep/find or the harness read/list tools. Terminal output_files retain
+  complete bounded stdout/stderr; inspect their missing ranges using sed/tail
+  instead of rerunning an experiment just because its preview is abbreviated.
 - Import Client, Profile, Action, ActionRequest, Position, Outcome. Load Profile
   from MC_SDK_PROFILE; Client::with_profile(&profile) uses its existing session.
   Generated programs must not connect/disconnect the harness's character.
