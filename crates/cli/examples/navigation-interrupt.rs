@@ -44,18 +44,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     ));
     let watch = async {
         loop {
-            if let Ok(bytes) = fs::read(path) {
-                if let Ok(state) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(id) = state["pending"]["request"]["action_id"].as_str() {
-                        if let Ok(r) = client.action_status(id).await {
-                            if r.outcome == Outcome::Running
-                                && r.evidence["progress"]["frames_sent"].as_u64().unwrap_or(0) > 0
-                            {
-                                return Ok::<_, Box<dyn std::error::Error>>(id.to_owned());
-                            }
-                        }
-                    }
-                }
+            if let Ok(bytes) = fs::read(path)
+                && let Ok(state) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(id) = state["pending"]["request"]["action_id"].as_str()
+                && let Ok(r) = client.action_status(id).await
+                && r.outcome == Outcome::Running
+                && r.evidence["progress"]["frames_sent"].as_u64().unwrap_or(0) > 0
+            {
+                return Ok::<_, Box<dyn std::error::Error>>(id.to_owned());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
