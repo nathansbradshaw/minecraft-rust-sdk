@@ -11,6 +11,8 @@ pub struct Choice {
     #[serde(default)]
     pub path: String,
     pub summary: String,
+    #[serde(default)]
+    pub notes: String,
 }
 pub const TOOLS: [&str; 13] = [
     "develop",
@@ -28,7 +30,7 @@ pub const TOOLS: [&str; 13] = [
     "complete",
 ];
 pub fn schema() -> Value {
-    json!({"type":"object","properties":{"tool":{"type":"string","enum":TOOLS},"input":{"type":"string","maxLength":10000},"path":{"type":"string","maxLength":256},"summary":{"type":"string","maxLength":512}},"required":["tool","input","path","summary"],"additionalProperties":false})
+    json!({"type":"object","properties":{"tool":{"type":"string","enum":TOOLS},"input":{"type":"string","maxLength":10000},"path":{"type":"string","maxLength":256},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048}},"required":["tool","input","path","summary","notes"],"additionalProperties":false})
 }
 pub struct Model {
     http: reqwest::Client,
@@ -95,6 +97,7 @@ impl Model {
                 && choice.summary.len() <= 1024,
             "Invalid tool choice",
         )?;
+        ensure(choice.notes.len() <= 4096, "Working notes exceed budget")?;
         Ok((choice, usage))
     }
     pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {

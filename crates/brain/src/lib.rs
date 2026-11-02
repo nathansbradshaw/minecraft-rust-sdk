@@ -3,6 +3,7 @@
 pub mod body;
 pub mod conversation;
 pub mod model;
+pub mod progress;
 pub mod tools;
 use minecraft_sdk::{ActionRequest, Client, ErrorCode, Observation, Outcome, Profile};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -62,9 +63,14 @@ fn default_timeout() -> u64 {
 fn default_interval() -> u64 {
     31
 }
+fn default_inspections() -> u32 {
+    8
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "default_inspections")]
+    pub max_inspections_without_execution: u32,
     #[serde(default = "conversation_default")]
     pub conversation: bool,
     #[serde(default)]
@@ -274,6 +280,10 @@ impl Brain {
             "Invalid run budget/goal",
         )?;
         ensure(
+            (1..=64).contains(&cfg.max_inspections_without_execution),
+            "Invalid inspection budget",
+        )?;
+        ensure(
             !cfg.await_chat_goal || (cfg.conversation && cfg.body.enabled),
             "Waiting for chat requires conversation and the responsive body",
         )?;
@@ -462,6 +472,26 @@ impl Brain {
                 self.refresh().await?;
             }
             self.refresh().await?;
+            let mut inspected = self
+                .journal
+                .get("inspection_streak")?
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or_default();
+            let inspected_goal = self.journal.get("inspection_goal")?.unwrap_or_default();
+            if inspected_goal == self.goal
+                && inspected >= self.cfg.max_inspections_without_execution
+            {
+                let source = progress::workspace_fingerprint(&self.cfg.workspace)?;
+                self.journal.event("execution_stalled",json!({"inspection_calls":inspected,"goal":self.goal,"source_sha256":source,"thinking_lane":"paused pending changed source or goal","body_and_chat":"remain active","next_action":"Investigate the recorded context/tool boundary; no unchanged model polling"}))?;
+                while self.goal == inspected_goal
+                    && progress::workspace_fingerprint(&self.cfg.workspace)? == source
+                {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    self.refresh().await?;
+                }
+                self.journal.set("inspection_streak", "0")?;
+                inspected = 0;
+            }
             while self.cfg.await_chat_goal
                 && (self.goal == self.cfg.goal
                     || self.journal.get("completed_goal")?.as_deref() == Some(&self.goal))
@@ -475,15 +505,17 @@ impl Brain {
                 .get("activity")?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
-            let mut context = json!({"goal":self.goal,"turn":turn,"workspace":self.cfg.workspace,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
+            let mut context = json!({"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             // Preserve the latest error and player state under pressure; never
             // silently delete all feedback to make a world snapshot fit.
             bound_value(&mut context["memory"], 1000);
-            bound_value(&mut context["recent"], 4000);
+            bound_value(&mut context["recent"], 3000);
             bound_value(&mut context["observation"], 6000);
             bound_value(&mut context["development_request"], 1000);
-            bound_value(&mut context["completed_tool_activity"], 2000);
-            bound_value(&mut context["last_tool_result"], 12000);
+            bound_value(&mut context["completed_tool_activity"], 1500);
+            bound_value(&mut context["last_tool_result"], 9000);
+            bound_value(&mut context["working_notes"], 2000);
+            bound_value(&mut context["player_request"], 2000);
             ensure(
                 serde_json::to_vec(&context)?.len() <= 32768,
                 "Context budget exceeded",
@@ -520,13 +552,29 @@ impl Brain {
             };
             self.journal
                 .event("choice", json!({"choice":choice,"usage":usage,"turn":turn}))?;
+            if !choice.notes.is_empty() {
+                self.journal.set("working_notes", &choice.notes)?;
+            }
             if ["develop", "write", "terminal"].contains(&choice.tool.as_str()) {
                 self.journal.set("develop_next", "true")?;
             } else if choice.tool == "complete" {
                 self.journal.set("develop_next", "false")?;
             }
             let completed = choice.tool == "complete";
+            let source_before = progress::workspace_fingerprint(&self.cfg.workspace)?;
             let result = tools::execute(self, &choice).await;
+            let source_after = progress::workspace_fingerprint(&self.cfg.workspace)?;
+            let executed = result
+                .as_ref()
+                .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
+            let inspected = if executed || inspected_goal != self.goal {
+                0
+            } else {
+                inspected + 1
+            };
+            self.journal
+                .set("inspection_streak", &inspected.to_string())?;
+            self.journal.set("inspection_goal", &self.goal)?;
             match result {
                 Ok(value) => {
                     self.journal.activity(&choice, &value)?;
@@ -579,9 +627,9 @@ pub fn projection(o: &Observation) -> Value {
         .into_iter()
         .flatten()
         .filter(|r| r["count"].as_u64().is_some_and(|c| c > 0))
-        .map(|r| json!({"slot":r["slot"],"item":r["item"],"count":r["count"]}))
+        .map(|r| json!({"slot":r["slot"],"item":r["item"],"count":r["count"],"food":r["food"]}))
         .collect();
-    let entities: Vec<_> = o.world["entities"].as_array().into_iter().flatten().take(24).map(|e| json!({"id":e["id"],"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"health":e["health"],"item":e["item"],"name":e["name"]})).collect();
+    let entities: Vec<_> = o.world["entities"].as_array().into_iter().flatten().take(24).map(|e| json!({"uuid":e["uuid"],"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"velocity":e["velocity"],"visible":e["visible"],"hostile":e["hostile"],"projectile":e["projectile"],"creeper":e["creeper"],"health":e["health"],"item":e["item"],"name":e["name"]})).collect();
     json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"blocks":blocks,"entities":entities,"chat":o.world["chat"].as_array().map(|c|c.iter().rev().take(24).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"],"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"]}})
 }
 /// Compact large strings/arrays without losing the structure of errors or player
@@ -604,6 +652,7 @@ fn shrink_value(value: &mut Value) {
             s.truncate(end);
             s.push_str(" [truncated]");
         }
+        Value::Array(a) if a.len() <= 6 && a.iter().all(Value::is_number) => {}
         Value::Array(a) => {
             if a.len() > 2 {
                 a.drain(..a.len() / 2);
@@ -613,8 +662,21 @@ fn shrink_value(value: &mut Value) {
             }
         }
         Value::Object(o) => {
-            for v in o.values_mut() {
-                shrink_value(v);
+            for (key, v) in o.iter_mut() {
+                if matches!(key.as_str(), "blocks" | "entities")
+                    && let Some(a) = v.as_array_mut()
+                {
+                    // These snapshots prioritize nearest blocks and visible
+                    // threats first, unlike chronological journal lists.
+                    if a.len() > 2 {
+                        a.truncate(a.len().div_ceil(2));
+                    }
+                    for row in a {
+                        shrink_value(row);
+                    }
+                } else {
+                    shrink_value(v);
+                }
             }
         }
         _ => {}
@@ -648,6 +710,24 @@ mod tests {
         );
         assert_eq!(j.recall("wood").unwrap()[0]["kind"], "report");
         assert!(j.remember("verified_success_from_model", "fake").is_err());
+    }
+    #[test]
+    fn compact_context_keeps_complete_coordinates_and_nearby_threats() {
+        let blocks: Vec<_> = (0..128)
+            .map(|n| json!({"p":[n,64,0],"block":"fixture:block","description":"x".repeat(100)}))
+            .collect();
+        let entities: Vec<_> = (0..64)
+            .map(|n| json!({"entity_id":n,"position":[n,64,1],"hostile":n==0}))
+            .collect();
+        let mut context = json!({"player":{"position":[12.25,64.0,-9.5],"velocity":[0.1,0.0,0.2],"health":17.0},"blocks":blocks,"entities":entities,"collision":[0.,0.,0.,1.,1.,1.]});
+        bound_value(&mut context, 2000);
+        assert!(context.to_string().len() <= 2000);
+        assert_eq!(context["player"]["position"], json!([12.25, 64.0, -9.5]));
+        assert_eq!(context["player"]["velocity"], json!([0.1, 0.0, 0.2]));
+        assert_eq!(context["collision"], json!([0., 0., 0., 1., 1., 1.]));
+        assert_eq!(context["blocks"][0]["p"], json!([0, 64, 0]));
+        assert_eq!(context["entities"][0]["entity_id"], 0);
+        assert_eq!(context["entities"][0]["hostile"], true);
     }
     #[test]
     fn large_observations_cannot_erase_rejection_feedback() {

@@ -124,3 +124,15 @@ actual duration and failures. Both keep the body active and disconnect on exit.
 non-operator SDK peer for native recipient/chat tests. Neither certifies competence.
 Use separate private state directories and record initial conditions, real threat
 fixtures, health/deaths, latency, interventions, source and binary hashes.
+
+Model context preserves numeric position/velocity/collision vectors and the
+nearest geometry/threats when compacting large observations. A short SDK reference
+and factual `notes` persist API knowledge between calls; the original player
+request accompanies the shorter goal so task constraints are retained.
+
+`max_inspections_without_execution` defaults to eight (deployment range 1–64).
+Unchanged read/list/terminal inspections cannot spend the entire model allowance:
+source edits, SDK execution, inventory changes or completion reset this hint.
+At the ceiling, only execution inference waits for changed source or goal; body
+and conversation continue. Source fingerprints exclude compiler caches. This
+cost guard is not proof of useful gameplay; native evidence still decides gates.
