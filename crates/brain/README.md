@@ -74,6 +74,17 @@ competence or a latency percentile. It fails rather than inventing missing terra
 or treating unverified movement/disconnection as successful. Run it only after
 stopping any other controller for that character.
 
+`control-latency-probe PRIVATE_CONFIG.json watch SAMPLE_COUNT` instead collects
+1–120 own-character observations without movement or model calls. Each sample
+records its Unix send time, duration, UUID and revision; the summary reports the
+measured latency distribution. Run separate instances in separate bot containers
+to inspect cross-character progress during another character's long action.
+Each process has only its own profile, and disconnects on exit. An observation
+failure is retained and fails the diagnostic; it never silently reconnects or
+replays work. Operators can use that behavior in a declared socket-failure test,
+then start a separate diagnostic to prove reconnection. These are native
+transport measurements, not evidence of tactical behavior or survival.
+
 Build with a toolchain and libc compatible with the runtime container. A Linux
 host build can acquire newer glibc symbol requirements even when source checks
 pass. `Cargo.container.toml` defines a minimal three-crate workspace for compiling
