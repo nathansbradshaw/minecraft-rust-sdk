@@ -1,5 +1,6 @@
 [package]
 name = "minecraft-sdk-brain"
+default-run = "minecraft-sdk-brain"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
