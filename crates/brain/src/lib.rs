@@ -131,6 +131,20 @@ impl Journal {
         }
         Ok(json!(values))
     }
+    pub fn history(&self, query: &str) -> Result<Value> {
+        // Include the receipt immediately following a matching action intent,
+        // so a lookup for "look" can recover its real durable action ID.
+        let mut q = self.db.prepare("SELECT id,at,kind,data FROM events WHERE instr(lower(data),lower(?1))>0 OR id IN (SELECT id+1 FROM events WHERE kind='action_intent' AND instr(lower(data),lower(?1))>0) ORDER BY id DESC LIMIT 12")?;
+        let mut rows = q.query([query])?;
+        let mut records = Vec::new();
+        while let Some(r) = rows.next()? {
+            let mut data: Value = serde_json::from_str(&r.get::<_, String>(3)?)?;
+            compact_history(&mut data);
+            bound_value(&mut data, 1500);
+            records.push(json!({"sequence":r.get::<_,i64>(0)?,"at":r.get::<_,i64>(1)?,"event":r.get::<_,String>(2)?,"data":data}));
+        }
+        Ok(json!(records))
+    }
     fn recent(&self) -> Result<Value> {
         let mut q=self.db.prepare("SELECT kind,data FROM events WHERE kind IN ('choice','tool_result','model_error','model_completion_claim') ORDER BY id DESC LIMIT 6")?;
         let mut rows = q.query([])?;
@@ -177,6 +191,31 @@ impl Journal {
             records.drain(..records.len() - 12);
         }
         self.set("activity", &serde_json::to_string(&records)?)
+    }
+}
+fn compact_history(value: &mut Value) {
+    match value {
+        Value::Object(o) => {
+            for key in [
+                "before",
+                "after",
+                "world",
+                "blocks",
+                "entities",
+                "native_observation",
+            ] {
+                o.remove(key);
+            }
+            for v in o.values_mut() {
+                compact_history(v);
+            }
+        }
+        Value::Array(a) => {
+            for v in a {
+                compact_history(v);
+            }
+        }
+        _ => {}
     }
 }
 pub struct Brain {
@@ -497,5 +536,36 @@ mod tests {
         assert!(recent.to_string().contains("explicitly respawn"));
         assert!(!tool_failed(&json!({"receipt":{"outcome":"observed"}})));
         assert!(tool_failed(&json!({"success":false,"exit_code":101})));
+    }
+    #[test]
+    fn history_recovers_older_native_receipts_by_action_kind() {
+        let t = tempfile::tempdir().unwrap();
+        let j = Journal::open(&t.path().join("brain.sqlite")).unwrap();
+        j.event(
+            "action_intent",
+            json!({"action":{"kind":"look","yaw":15},"before":{"world":"large"}}),
+        )
+        .unwrap();
+        j.event(
+            "action_receipt",
+            json!({"action_id":"durable-native-id","outcome":"observed"}),
+        )
+        .unwrap();
+        for n in 0..20 {
+            j.event("choice", json!({"summary":format!("later inspection {n}")}))
+                .unwrap();
+        }
+        assert!(
+            !j.recent()
+                .unwrap()
+                .to_string()
+                .contains("durable-native-id")
+        );
+        assert!(
+            j.history("look")
+                .unwrap()
+                .to_string()
+                .contains("durable-native-id")
+        );
     }
 }

@@ -42,6 +42,15 @@ using the same state directory; operators must still stop any legacy controller
 before assigning the same character. The gateway enforces controller identity.
 The harness records its own pending action before dispatch and offers explicit
 status/reconciliation tools. Current state does not establish a historical effect.
+Search includes older journal events and action receipts, so a short context
+window does not prevent the agent retrieving its actual action IDs. Source
+editing uses separate path and UTF-8 content fields without nested JSON source
+encoding. Completed tool activity persists across reasoning turns.
+
+Finite terminal jobs clean up their process group, including background children.
+Normal completion, run-budget exit and handled termination disconnect the SDK
+character rather than leaving it unattended. Abrupt process/container loss still
+needs deployment supervision; this is not a proven background Survival controller.
 
 Model `complete` is recorded as a claim with an observation. It cannot certify an
 evaluation or evidence gate. This initial harness has not established autonomous

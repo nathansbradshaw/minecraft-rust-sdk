@@ -30,7 +30,9 @@ Tools and input:
 - write: set path to the relative file path and input to the actual UTF-8 Rust
   source. Do not wrap input in another JSON object or double-escape source text.
 - list: relative directory, or empty string for the project root.
-- search: literal text to find in your remembered experiences and notes.
+- search: literal text to find in labelled memory and older journal events,
+  including durable action IDs and receipt outcomes. Search an action kind such
+  as look to recover receipts older than the recent transcript.
 - terminal: a shell command executed in the project directory, with bounded time
   and output. Use cargo --offline when a vendored dependency configuration exists.
 - remember: JSON {"kind":"fact|report|hypothesis|episode|skill","text":"..."}.

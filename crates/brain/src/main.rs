@@ -19,5 +19,24 @@ async fn run() -> Result<()> {
     let config: Config =
         serde_json::from_slice(&private_read(std::path::Path::new(&args[1]), 16384)?)?;
     let mut brain = Brain::open(config).await?;
-    brain.run().await
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let result = tokio::select! {
+        result = brain.run() => result,
+        _ = terminate.recv() => Ok(()),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+    // A bounded pilot ending must not leave its character unattended in Survival.
+    // Pending IDs stay in the journal for explicit reconciliation on reconnect.
+    let disconnected = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        brain.client.disconnect(),
+    )
+    .await;
+    let clean = matches!(disconnected, Ok(Ok(())));
+    brain.journal.event("controller_exit", serde_json::json!({"disconnected":clean,"pending_action":brain.journal.get("pending_action")?,"error":result.as_ref().err().map(ToString::to_string)}))?;
+    result?;
+    if !clean {
+        return Err("Controller stopped but SDK disconnect was not confirmed".into());
+    }
+    Ok(())
 }

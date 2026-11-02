@@ -56,6 +56,16 @@ fn local_shell(command: &str) -> tokio::process::Command {
     c.args(["-c", command]);
     c
 }
+struct ProcessGroup(u32);
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        // Also clean up background descendants on timeout, cancellation or
+        // ordinary shell exit; a finite tool must not leave a second controller.
+        unsafe {
+            libc::kill(-(self.0 as i32), libc::SIGKILL);
+        }
+    }
+}
 pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     ensure(
         !command.is_empty() && command.len() <= 8192,
@@ -82,6 +92,7 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     c.process_group(0);
     let mut child = c.spawn()?;
     let pid = child.id().ok_or("Process ID unavailable")?;
+    let group = ProcessGroup(pid);
     let stdout = child.stdout.take().ok_or("stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("stderr unavailable")?;
     let out = tokio::spawn(bounded_output(stdout));
@@ -93,6 +104,7 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     let status = loop {
         tokio::select! {s=child.wait()=>break s?,_=&mut deadline=>{timed_out=true;unsafe{libc::kill(-(pid as i32),libc::SIGKILL);};let _=child.kill().await;break child.wait().await?;},_=tokio::time::sleep(Duration::from_secs(1))=>{if let Err(e)=brain.refresh().await{brain.journal.event("observation_error",json!({"error":e.to_string()}))?;}}}
     };
+    drop(group);
     // Bound inherited open pipes even if a subprocess detached from its parent.
     let stdout = tokio::time::timeout(Duration::from_secs(2), out).await???;
     let stderr = tokio::time::timeout(Duration::from_secs(2), err).await???;
@@ -152,7 +164,9 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
             }
             Ok(json!(names))
         }
-        "search" => brain.journal.recall(&choice.input),
+        "search" => Ok(
+            json!({"memory":brain.journal.recall(&choice.input)?,"history":brain.journal.history(&choice.input)?}),
+        ),
         "terminal" => terminal(brain, &choice.input).await,
         "remember" => {
             #[derive(Deserialize)]
