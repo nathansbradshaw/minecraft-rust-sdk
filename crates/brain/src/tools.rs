@@ -223,12 +223,18 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                 "Bounded goal required",
             )?;
             brain.goal = choice.input.clone();
-            brain.journal.set("goal", &brain.goal)?;
+            brain.journal.select_goal(
+                &brain.goal,
+                "agent_goal_selected",
+                json!({"goal":brain.goal,"reason":choice.summary}),
+                None,
+            )?;
             Ok(json!({"goal":brain.goal}))
         }
         "complete" => {
+            let claimed_goal = brain.goal.clone();
             brain.refresh().await?;
-            brain.journal.event("model_completion_claim",json!({"claim":choice.input,"observed":crate::projection(&brain.observed),"externally_verified":false}))?;
+            brain.journal.event("model_completion_claim",json!({"goal":claimed_goal,"claim":choice.input,"observed":crate::projection(&brain.observed),"externally_verified":false}))?;
             Ok(
                 json!({"recorded":"model claim","native_observation":crate::projection(&brain.observed),"benchmark_pass_granted":false}),
             )

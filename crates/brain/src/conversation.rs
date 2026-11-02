@@ -82,12 +82,10 @@ impl Handle {
                             Err(e)=>{journal.event("conversation_model_error",json!({"error":e.to_string(),"next_action":"Investigate the failed request; no unchanged automatic retry. A new incoming message is a new event."}))?;continue;}
                         };
                         journal.event("conversation_choice",json!({"reply":reply,"usage":usage}))?;
-                        if !reply.goal.trim().is_empty() && brain.get("goal")?.as_deref()!=Some(&reply.goal) {
-                            brain.set("goal",&reply.goal)?;
-                            brain.set("player_request",&context["messages"].to_string())?;
+                        if !reply.goal.trim().is_empty() {
+                            brain.select_goal(&reply.goal,"player_goal_selected",json!({"goal":reply.goal,"reason":reply.reason,"chat_sequence":sequence}),Some(&context["messages"].to_string()))?;
                             brain.set("develop_next","true")?;
                             brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Rust program for composed work. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
-                            brain.event("player_goal_selected",json!({"goal":reply.goal,"reason":reply.reason,"chat_sequence":sequence}))?;
                         }
                         if !reply.message.is_empty() {
                             let action=Action::Chat{message:reply.message};action.validate()?;

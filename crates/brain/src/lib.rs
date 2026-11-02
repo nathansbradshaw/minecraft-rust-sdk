@@ -133,6 +133,66 @@ impl Journal {
         self.db.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
         Ok(())
     }
+    /// One durable revision per accepted task, including repeated goal text.
+    pub fn select_goal(
+        &self,
+        goal: &str,
+        kind: &str,
+        data: Value,
+        player_request: Option<&str>,
+    ) -> Result<i64> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        tx.execute(
+            "INSERT INTO events(at,kind,data) VALUES(?1,?2,?3)",
+            params![now(), kind, data.to_string()],
+        )?;
+        let id = tx.last_insert_rowid();
+        for (key, value) in [
+            ("goal", goal),
+            ("goal_revision", &id.to_string()),
+            ("completed_goal", ""),
+            ("completed_revision", ""),
+            ("inspection_streak", "0"),
+        ] {
+            tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+        }
+        if let Some(request) = player_request {
+            tx.execute("INSERT INTO meta(key,value) VALUES('player_request',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[request])?;
+        }
+        tx.commit()?;
+        println!("{}", json!({"event":kind,"sequence":id,"data":data}));
+        Ok(id)
+    }
+    fn complete_goal(&self, goal: &str, revision: &str) -> Result<bool> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let get = |key: &str| -> rusqlite::Result<Option<String>> {
+            tx.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+                .optional()
+        };
+        if get("goal")?
+            .as_deref()
+            .is_some_and(|current| current != goal)
+            || get("goal_revision")?.unwrap_or_default() != revision
+        {
+            return Ok(false);
+        }
+        for (key, value) in [("completed_goal", goal), ("completed_revision", revision)] {
+            tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+    fn goal_completed(&self, goal: &str) -> Result<bool> {
+        Ok(self.get("completed_goal")?.as_deref() == Some(goal)
+            && self.get("completed_revision")?.unwrap_or_default()
+                == self.get("goal_revision")?.unwrap_or_default())
+    }
     fn note_intention(&self, id: &str, independent: bool) -> Result<()> {
         if !independent || self.get("pending_action")?.unwrap_or_default().is_empty() {
             self.set("pending_action", id)?;
@@ -521,8 +581,10 @@ impl Brain {
                     &self.cfg.workspace,
                     &self.cfg.state,
                 )?;
+                let stalled_revision = self.journal.get("goal_revision")?.unwrap_or_default();
                 self.journal.event("execution_stalled",json!({"inspection_calls":inspected,"goal":self.goal,"source_sha256":source,"thinking_lane":"paused pending changed source or goal","body_and_chat":"remain active","next_action":"Investigate the recorded context/tool boundary; no unchanged model polling"}))?;
                 while self.goal == inspected_goal
+                    && self.journal.get("goal_revision")?.unwrap_or_default() == stalled_revision
                     && progress::workspace_fingerprint_excluding_state(
                         &self.cfg.workspace,
                         &self.cfg.state,
@@ -535,8 +597,8 @@ impl Brain {
                 inspected = 0;
             }
             while self.cfg.await_chat_goal
-                && (self.goal == self.cfg.goal
-                    || self.journal.get("completed_goal")?.as_deref() == Some(&self.goal))
+                && ((self.goal == self.cfg.goal && self.journal.get("goal_revision")?.is_none())
+                    || self.journal.goal_completed(&self.goal)?)
             {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 self.refresh().await?;
@@ -566,6 +628,7 @@ impl Brain {
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
             let develop = self.journal.get("develop_next")?.as_deref() == Some("true");
             let requested_goal = self.goal.clone();
+            let requested_revision = self.journal.get("goal_revision")?.unwrap_or_default();
             let lanes = self.body.as_ref().map(|h| h.shared.model_lanes.clone());
             let future = async {
                 let _permit = match lanes {
@@ -580,7 +643,9 @@ impl Brain {
             };
             next = tokio::time::Instant::now() + Duration::from_secs(self.cfg.model_interval_secs);
             self.refresh().await?;
-            if self.goal != requested_goal {
+            if self.goal != requested_goal
+                || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision
+            {
                 self.journal.event("superseded_reasoning",json!({"requested_goal":requested_goal,"current_goal":self.goal,"discarded_result":true}))?;
                 continue;
             }
@@ -592,7 +657,10 @@ impl Brain {
                     // Preserve responsive gameplay/chat while the operator or a
                     // new player goal supplies a changed condition. Repeating a
                     // rejected inference request is not investigation.
-                    while self.goal == requested_goal {
+                    while self.goal == requested_goal
+                        && self.journal.get("goal_revision")?.unwrap_or_default()
+                            == requested_revision
+                    {
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         self.refresh().await?;
                     }
@@ -609,12 +677,20 @@ impl Brain {
             } else if choice.tool == "complete" {
                 self.journal.set("develop_next", "false")?;
             }
-            let completed = choice.tool == "complete";
+            let completing = choice.tool == "complete";
             let source_before = progress::workspace_fingerprint_excluding_state(
                 &self.cfg.workspace,
                 &self.cfg.state,
             )?;
             let result = tools::execute(self, &choice).await;
+            let completed = completing
+                && result.is_ok()
+                && self
+                    .journal
+                    .complete_goal(&requested_goal, &requested_revision)?;
+            if completing && result.is_ok() && !completed {
+                self.journal.event("superseded_completion",json!({"goal":requested_goal,"goal_revision":requested_revision,"completed_new_work":false}))?;
+            }
             let source_after = progress::workspace_fingerprint_excluding_state(
                 &self.cfg.workspace,
                 &self.cfg.state,
@@ -647,9 +723,6 @@ impl Brain {
             }
             if completed && self.cfg.exit_on_complete {
                 break;
-            }
-            if completed {
-                self.journal.set("completed_goal", &self.goal)?;
             }
         }
         self.journal.event("brain_run_budget_finished",json!({"run":self.run_id,"goal":self.goal,"completion_authority":"external_native_evidence"}))?;
@@ -751,6 +824,54 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_task_survives_restart_but_repeated_or_superseding_requests_are_new_work() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("brain.sqlite");
+        let first;
+        {
+            let j = Journal::open(&path).unwrap();
+            first = j
+                .select_goal(
+                    "collect wood",
+                    "player_goal_selected",
+                    json!({}),
+                    Some("first chat"),
+                )
+                .unwrap()
+                .to_string();
+            assert!(j.complete_goal("collect wood", &first).unwrap());
+        }
+        let j = Journal::open(&path).unwrap();
+        assert!(j.goal_completed("collect wood").unwrap());
+        let repeated = j
+            .select_goal(
+                "collect wood",
+                "player_goal_selected",
+                json!({}),
+                Some("second chat"),
+            )
+            .unwrap()
+            .to_string();
+        assert_ne!(first, repeated);
+        assert!(!j.goal_completed("collect wood").unwrap());
+        assert!(!j.complete_goal("collect wood", &first).unwrap());
+        assert_eq!(
+            j.get("player_request").unwrap().as_deref(),
+            Some("second chat")
+        );
+        assert!(j.complete_goal("collect wood", &repeated).unwrap());
+        j.select_goal(
+            "craft tools",
+            "player_goal_selected",
+            json!({}),
+            Some("third chat"),
+        )
+        .unwrap();
+        assert!(!j.complete_goal("collect wood", &repeated).unwrap());
+        assert!(!j.goal_completed("craft tools").unwrap());
+        assert_eq!(j.get("goal").unwrap().as_deref(), Some("craft tools"));
+    }
     #[test]
     fn pending_identity_survives_independent_failure_and_only_matching_resolution_clears_it() {
         let t = tempfile::tempdir().unwrap();
