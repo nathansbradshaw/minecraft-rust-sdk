@@ -517,10 +517,16 @@ impl Brain {
             if inspected_goal == self.goal
                 && inspected >= self.cfg.max_inspections_without_execution
             {
-                let source = progress::workspace_fingerprint(&self.cfg.workspace)?;
+                let source = progress::workspace_fingerprint_excluding_state(
+                    &self.cfg.workspace,
+                    &self.cfg.state,
+                )?;
                 self.journal.event("execution_stalled",json!({"inspection_calls":inspected,"goal":self.goal,"source_sha256":source,"thinking_lane":"paused pending changed source or goal","body_and_chat":"remain active","next_action":"Investigate the recorded context/tool boundary; no unchanged model polling"}))?;
                 while self.goal == inspected_goal
-                    && progress::workspace_fingerprint(&self.cfg.workspace)? == source
+                    && progress::workspace_fingerprint_excluding_state(
+                        &self.cfg.workspace,
+                        &self.cfg.state,
+                    )? == source
                 {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     self.refresh().await?;
