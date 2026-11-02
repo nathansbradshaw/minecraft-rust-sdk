@@ -35,6 +35,12 @@ fn allowed(path: &str) -> bool {
     if path.starts_with("crates/") {
         return path.ends_with(".rs")
             || path.ends_with("/Cargo.toml")
+            || matches!(
+                path,
+                "crates/brain/README.md"
+                    | "crates/brain/Cargo.container.toml"
+                    | "crates/brain/src/system.md"
+            )
             || path == "crates/java-1-21-1/packet-ids.json";
     }
     if path.starts_with("docs/") {

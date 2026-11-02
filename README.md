@@ -60,6 +60,11 @@ Coding agents can run `mc-sdk mcp PROFILE` as a stdio MCP server after connectin
 It exposes discovery, observation, typed gameplay actions, status and explicit
 reconciliation. Code editing/execution uses the agent's container terminal.
 
+The experimental [container-local Rust brain](crates/brain/README.md) adds a
+Luna/Sol tool loop that can inspect, edit, compile and run Rust programs against
+the SDK. Its source checks and individual pilot actions do not establish
+autonomous Survival, retained learning or competitive agent performance.
+
 ## Gameplay and receipts
 
 Actions cover collision-limited walking, short drops, explicit jumping movement,
