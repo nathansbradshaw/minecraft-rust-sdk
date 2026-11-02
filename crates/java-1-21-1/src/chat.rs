@@ -11,6 +11,24 @@ pub struct ChatState {
     pub messages: VecDeque<Value>,
 }
 impl ChatState {
+    /// Java 767's signed-command envelope also carries unsigned arguments for
+    /// an admitted SDK connection. Never fabricate player signatures. The
+    /// server's scoped decoder and ordinary command permissions remain final.
+    pub fn command_payload(
+        &self,
+        command: &str,
+        timestamp_ms: i64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut bytes = minecraft_sdk_wire::encode_string(command)?;
+        bytes.extend(timestamp_ms.to_be_bytes());
+        bytes.extend(0i64.to_be_bytes());
+        bytes.extend(minecraft_sdk_java_1_21_1::encode_signed_varint(0));
+        bytes.extend(minecraft_sdk_java_1_21_1::encode_signed_varint(
+            self.pending,
+        ));
+        bytes.extend(self.bits());
+        Ok(bytes)
+    }
     pub fn receive(&mut self, payload: &[u8]) -> Result<Option<i32>, Box<dyn std::error::Error>> {
         if payload.len() < 18 {
             return Err("Truncated player chat packet".into());
@@ -75,6 +93,29 @@ impl ChatState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn command_envelope_contains_time_empty_signatures_and_last_seen_update() {
+        let state = ChatState {
+            pending: 3,
+            ..ChatState::default()
+        };
+        let bytes = state.command_payload("tell target hello", 123456).unwrap();
+        let (command, prefix) = decode_string_prefix(&bytes).unwrap();
+        assert_eq!(command, "tell target hello");
+        assert_eq!(
+            i64::from_be_bytes(bytes[prefix..prefix + 8].try_into().unwrap()),
+            123456
+        );
+        assert_eq!(
+            i64::from_be_bytes(bytes[prefix + 8..prefix + 16].try_into().unwrap()),
+            0
+        );
+        let (signature_count, count_len) = decode_varint_prefix(&bytes[prefix + 16..]).unwrap();
+        assert_eq!(signature_count, 0);
+        let (offset, offset_len) = decode_varint_prefix(&bytes[prefix + 16 + count_len..]).unwrap();
+        assert_eq!(offset, 3);
+        assert_eq!(&bytes[prefix + 16 + count_len + offset_len..], &[0, 0, 0]);
+    }
     #[test]
     fn signed_chat_acknowledgements_are_bounded_and_retained_across_sends() {
         let mut state = ChatState::default();

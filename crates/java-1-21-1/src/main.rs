@@ -759,8 +759,14 @@ impl Player {
                 return Ok(());
             }
             Action::Command { command } => {
-                body.extend(text(command)?);
-                "chat_command"
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis() as i64;
+                let mut chat = self.chat.lock().map_err(|_| "Chat state unavailable")?;
+                let body = chat.command_payload(command, now)?;
+                self.send("chat_command_signed", &body)?;
+                chat.pending = 0;
+                return Ok(());
             }
             Action::Respawn => {
                 body.extend(vi(0));
