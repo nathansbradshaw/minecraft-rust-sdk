@@ -756,24 +756,32 @@ fn motion_frame(
     let velocity = if supported {
         if (delta[1] - 0.42).abs() < 0.001 {
             0.42
+        } else if delta[1].abs() < 0.001 {
+            0.
         } else {
-            -0.08
+            -0.0784
         }
     } else {
         previous
             .filter(|(p, _)| (0..3).all(|i| (p[i] - start[i]).abs() < 0.05))
-            .ok_or("Airborne motion requires a continuous verified trajectory")?
-            .1
+            .map(|(_, velocity)| velocity)
+            // Reconnects/corrections may discard the trajectory. Only ordinary
+            // downward gravity is admitted without tracked airborne momentum.
+            .unwrap_or(-0.0784)
     };
     let (next, ground) =
         minecraft_sdk_java_1_21_1::physics::step(start, [delta[0], 0., delta[2]], velocity, &boxes);
     let wanted = [target.x, target.y, target.z];
-    if !(0..3).all(|i| (next[i] - wanted[i]).abs() < 0.001) {
+    if !(0..3).all(|i| (next[i] - wanted[i]).abs() < 0.03) {
         return Err("Motion frame violates collision or gravity".into());
     }
+    let (end_support, end_contact) =
+        minecraft_sdk_java_1_21_1::physics::step(next, [0.; 3], -0.0784, &boxes);
+    let ground =
+        ground || (velocity <= 0. && end_contact && (end_support[1] - next[1]).abs() < 1e-7);
     let clipped = (next[1] - start[1] - velocity).abs() > 1e-7;
     let following = if ground {
-        -0.08
+        -0.0784
     } else {
         ((if clipped { 0. } else { velocity }) - 0.08) * 0.98
     };
@@ -1308,6 +1316,85 @@ fn compact(action: &Action, o: &Observation) -> Value {
 #[cfg(test)]
 mod movement_tests {
     use super::*;
+    #[test]
+    fn leaving_support_allows_one_level_frame_then_requires_gravity() {
+        let mut o = Observation {
+            revision: "test".into(),
+            player: json!({"position":[1.25,1.,0.5],"on_ground":true}),
+            world: json!({"blocks":[{"position":[0,0,0],"collision":[[0.,0.,0.,1.,1.,1.]]}]}),
+            menu: json!({}),
+        };
+        let (p, ground, v) = motion_frame(
+            &o,
+            &Position {
+                x: 1.5,
+                y: 1.,
+                z: 0.5,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!ground);
+        assert!((v + 0.0784).abs() < 1e-9);
+        o.player["position"] = json!(p);
+        o.player["on_ground"] = json!(false);
+        assert!(
+            motion_frame(
+                &o,
+                &Position {
+                    x: 1.5,
+                    y: 1.,
+                    z: 0.5
+                },
+                Some((p, v))
+            )
+            .is_err()
+        );
+        let (fallen, _, _) = motion_frame(
+            &o,
+            &Position {
+                x: 1.5,
+                y: 0.9216,
+                z: 0.5,
+            },
+            Some((p, v)),
+        )
+        .unwrap();
+        assert!((fallen[1] - 0.9216).abs() < 1e-9);
+        assert!(
+            motion_frame(
+                &o,
+                &Position {
+                    x: 1.5,
+                    y: 1.42,
+                    z: 0.5
+                },
+                None
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn rounding_never_sends_requested_position_inside_collision() {
+        let o = Observation {
+            revision: "test".into(),
+            player: json!({"position":[0.5,1.02,0.5],"on_ground":false}),
+            world: json!({"blocks":[{"position":[0,0,0],"collision":[[0.,0.,0.,1.,1.,1.]]}]}),
+            menu: json!({}),
+        };
+        let (p, ground, _) = motion_frame(
+            &o,
+            &Position {
+                x: 0.5,
+                y: 1.01,
+                z: 0.5,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(p[1], 1.);
+        assert!(ground);
+    }
     #[test]
     fn frames_enforce_collision_gravity_and_continuity() {
         let mut observation = Observation {
