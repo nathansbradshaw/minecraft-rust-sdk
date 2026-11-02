@@ -18,3 +18,8 @@ closure; release checks must review licenses and advisories for that closure.
 collects sanitized SPDX declarations and packaged license texts for the pinned
 Linux dependency closure. Binary distributions and the supplied Docker images
 include this collection. No installed game/mod JAR is embedded in this project.
+
+The coding image also installs the distribution's Rust ripgrep package for source
+search. Ripgrep is offered under MIT or Unlicense; its packaged copyright/notice
+and completion-file notices remain under `/usr/share/doc/ripgrep/`. Base-image
+and operating-system packages retain their own distribution license notices.

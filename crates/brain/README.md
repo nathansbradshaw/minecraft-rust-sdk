@@ -55,6 +55,10 @@ cannot be mistaken for a planning improvement.
 
 The workspace should contain an ordinary Rust Cargo project with the SDK and
 Tokio dependencies and an appropriate dependency cache/vendor configuration.
+The supplied coding image includes Rust `rg` and sets `MC_SDK_SOURCE` to its
+readable SDK tree. An operator using an editable workspace copy should set this
+environment variable to that copy when launching the harness. This is a source
+discovery path inside the container, not a host-directory mount or permission.
 The harness sets `MC_SDK_PROFILE` for programs, with the already-connected private
 profile. Programs can use `Client::with_profile`, `observe`, and typed actions;
 they must preserve action IDs and inspect receipts instead of replaying uncertain
