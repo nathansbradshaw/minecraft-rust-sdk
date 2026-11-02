@@ -142,8 +142,8 @@ impl Spec {
             "Bounded failures and artifact bindings required",
         )?;
         ensure(
-            !self.actions.is_empty() && self.actions.len() <= 32,
-            "One to 32 native actions required",
+            !self.actions.is_empty() && self.actions.len() <= 128,
+            "One to 128 native actions required",
         )?;
         let mut ids = std::collections::BTreeSet::new();
         for expected in &self.actions {
