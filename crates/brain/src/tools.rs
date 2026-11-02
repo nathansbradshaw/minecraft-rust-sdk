@@ -83,6 +83,7 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     let mut c = local_shell(command);
     c.current_dir(&brain.cfg.workspace)
         .env("MC_SDK_PROFILE", &brain.cfg.profile)
+        .env("MC_SDK_STATE", &brain.cfg.state)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_BUILD_JOBS", "1")
         .env("CARGO_PROFILE_DEV_DEBUG", "0")

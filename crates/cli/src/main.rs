@@ -106,7 +106,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.len() < 2 {
-        return Err("Usage: mc-sdk discover URL | register URL NAME PROFILE | connect PROFILE REQUEST_ID | disconnect PROFILE | observe PROFILE | act PROFILE ACTION.json | status PROFILE ID | reconcile PROFILE ID | rotate-key PROFILE | mcp PROFILE".into());
+        return Err("Usage: mc-sdk discover URL | register URL NAME PROFILE | connect PROFILE REQUEST_ID | disconnect PROFILE | observe PROFILE | act PROFILE ACTION.json | navigate PROFILE GOAL.json JOURNAL.json [OPTIONS.json] | status PROFILE ID | reconcile PROFILE ID | rotate-key PROFILE | mcp PROFILE".into());
     }
     let path = Path::new(&args[1]);
     let mut profile = load(path)?;
@@ -129,6 +129,25 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             json!({"disconnected":true})
         }
         "observe" => serde_json::to_value(client.observe().await?)?,
+        "navigate" => {
+            let goal: navigation::Goal = serde_json::from_slice(&std::fs::read(
+                args.get(2).ok_or("Navigation goal JSON required")?,
+            )?)?;
+            let state = Path::new(
+                args.get(3)
+                    .ok_or("Client navigation journal path required")?,
+            );
+            let options = match args.get(4) {
+                Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+                None => navigation::Options::default(),
+            };
+            let report = navigation::navigate(&client, goal, state, options).await?;
+            if report.status != "reached" {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                std::process::exit(2);
+            }
+            serde_json::to_value(report)?
+        }
         "query" => {
             let query: ObservationQuery = serde_json::from_slice(&std::fs::read(
                 args.get(2).ok_or("Observation query JSON file required")?,

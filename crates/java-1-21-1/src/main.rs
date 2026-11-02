@@ -1,6 +1,7 @@
 use minecraft_sdk_core::*;
 mod chat;
 mod control;
+mod routes;
 use minecraft_sdk_java_1_21_1::{Wire, encode_signed_varint as vi};
 use minecraft_sdk_wire::{decode_string_prefix, decode_varint_prefix, encode_string as text};
 use serde::Deserialize;
@@ -156,6 +157,7 @@ impl Tables {
     }
 }
 struct Player {
+    route_preview_at: Option<Instant>,
     corrections: Arc<AtomicU64>,
     correcting: Arc<AtomicBool>,
     control: Option<control::Job>,
@@ -384,6 +386,7 @@ fn connect(
             thread::sleep(Duration::from_millis(100));
         }
         Ok(Player {
+            route_preview_at: None,
             corrections,
             correcting,
             control: None,
@@ -1090,6 +1093,7 @@ fn dispatch(
                     "minecraft:chat",
                     "minecraft:commands",
                     "minecraft:respawn",
+                    routes::CAPABILITY,
                 ]
                 .into_iter()
                 .filter(|c| {
@@ -1114,7 +1118,11 @@ fn dispatch(
                         .map(String::from),
                 )
                 .collect(),
-                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":discovery["observation_query_schemas"]}),
+                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":({
+                    let mut schemas=discovery["observation_query_schemas"].as_object().cloned().unwrap_or_default();
+                    schemas.insert(routes::CAPABILITY.into(),routes::schema());
+                    Value::Object(schemas)
+                })}),
             })),
             AdapterOperation::Connect => {
                 if players.contains_key(&request.bot_id) {
@@ -1171,6 +1179,49 @@ fn dispatch(
                         ErrorCode::SessionRequired,
                         "Player is not connected",
                     ));
+                }
+                if query.capability == routes::CAPABILITY {
+                    routes::validate(&query.input).map_err(|e| {
+                        ApiError::new(
+                            ErrorCode::InvalidRequest,
+                            format!("Movement preview input refused: {e}"),
+                        )
+                    })?;
+                    let player = players.get_mut(&request.bot_id).ok_or_else(|| {
+                        ApiError::new(ErrorCode::SessionRequired, "Player disconnected")
+                    })?;
+                    let busy = player.correcting.load(Ordering::Acquire)
+                        || player.control.as_ref().is_some_and(control::Job::running);
+                    let remaining = player
+                        .route_preview_at
+                        .map(|at| {
+                            routes::INTERVAL_MS.saturating_sub(at.elapsed().as_millis() as u64)
+                        })
+                        .unwrap_or(0);
+                    if busy || remaining > 0 {
+                        if remaining == 0 {
+                            player.route_preview_at = Some(Instant::now());
+                        }
+                        return Ok(AdapterResponse::ObservationData(
+                            json!({"format":"minecraft-movement-options-v1","origin":null,"scene":"","options":[],"complete":false,"next_offset":null,"retry_after_ms":remaining.max(if busy{routes::INTERVAL_MS}else{100}),"busy":busy,"prediction_not_effect_proof":true}),
+                        ));
+                    }
+                    player.route_preview_at = Some(Instant::now());
+                    let before = native.observe(&request.player_uuid).map_err(|_| {
+                        ApiError::new(
+                            ErrorCode::NotReady,
+                            "Movement preview observation unavailable",
+                        )
+                    })?;
+                    let result = routes::page(&before, &query.input, config.control_max_ticks)
+                        .map_err(|e| {
+                            ApiError::new(
+                                ErrorCode::InvalidRequest,
+                                format!("Movement preview refused: {e}"),
+                            )
+                        })?;
+                    player.route_preview_at = Some(Instant::now());
+                    return Ok(AdapterResponse::ObservationData(result));
                 }
                 if !discovery["observation_capabilities"]
                     .as_array()
