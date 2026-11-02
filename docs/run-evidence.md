@@ -71,7 +71,9 @@ mc-sdk-evidence reaction-latency PRIVATE_TRACE.jsonl NATIVE_REPORT.json NEW_SUMM
 ```
 
 Capture every attempted movement ID in the native report and bind it to the
-complete trace. The Rust summary reports acknowledgement timing separately
+complete trace. Capture accepts at most 128 selected IDs; the existing 64 KiB
+manifest and 8 MiB report budgets still apply. Exceeding a budget fails rather
+than dropping attempts. The Rust summary reports acknowledgement timing separately
 from a conservative physical-reaction bound: the native observation sample
 precedes local receipt, and its same-JVM clock is compared with the first
 verified movement sample. Missing, rejected, unverified or incompatible-clock
