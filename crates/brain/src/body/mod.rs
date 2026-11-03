@@ -300,7 +300,7 @@ async fn proxy(
             }
         } else {
             LocalActionResponse::Error(ApiError::new(
-                ErrorCode::Conflict,
+                ErrorCode::LocalPreempted,
                 "Body admission deadline exceeded before gateway dispatch; no mutation was submitted. Inspect current observation and body reason before another intention.",
             ))
         }

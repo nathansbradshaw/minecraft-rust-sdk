@@ -43,6 +43,21 @@ responses up to 5,000 bytes are retained in the model view; larger queries need
 smaller pages or a Rust SDK program. Capability errors, origin changes and
 deployment pacing remain visible. Read-only queries are inspections, not gameplay
 progress, and cannot install plugins or override the acting identity or endpoint.
+The `navigate` tool composes the existing Rust SDK navigator in a protected child
+using the current character session. It accepts the SDK's closed position or
+block-reach goal, keeps an actor/server/goal-bound route journal, and returns a
+report after at most thirty seconds (or the shorter deployment tool timeout).
+The responsive body can preempt its finite movement. The reference client shares
+the body's known-hazard exclusions; the core SDK imposes no behavior policy.
+Inspect remaining distance, outcome and pending IDs before resuming. Reaching a
+pose proves no collection or task completion. This built-in helper is not a
+model-generated skill and does not count toward learning evaluations.
+Local control protocol version 2 distinguishes a body rejection before gateway
+dispatch (`local_preempted`) from an ambiguous transport failure. The navigator
+preserves that rejected local intention without inventing a native receipt or
+blocking forever on an absent server ID. Network errors retain the original
+pending ID for inspection. Recompile older protected clients against the matching
+SDK; version mismatches fail explicitly before dispatch.
 
 Build `cargo build --locked -p minecraft-sdk-brain` and run inside the isolated
 coding container:

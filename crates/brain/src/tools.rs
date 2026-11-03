@@ -253,6 +253,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                 json!({"view":"capability_query","capability":query.capability,"input_sha256":crate::digest(query.input.to_string().as_bytes()),"result":result,"scope":"Read-only SDK capability result for this character; query is not a gameplay mutation or evidence of task completion"}),
             )
         }
+        "navigate" => crate::navigation::execute(brain, &choice.input).await,
         "sdk" => brain.act(serde_json::from_str(&choice.input)?).await,
         "status" => Ok(serde_json::to_value(brain.inspect(&choice.input).await?)?),
         "reconcile" => brain.settle(&choice.input).await,

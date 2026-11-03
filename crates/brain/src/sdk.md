@@ -87,6 +87,8 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   player:1.62; use an appropriate interaction range). Choose the block from fresh
   observations. The helper uses a persistent local graph and finite controls;
   it never mines, teleports, breaks obstacles or chooses your task.
+  The brain's navigate tool composes this same helper through its body arbiter;
+  use it for a bounded route rather than one model turn per local waypoint.
 - Put its journal under MC_SDK_STATE, using a distinct file per goal. Reuse that
   journal to resume; pending IDs are inspected rather than replayed. Options
   controls operation deadline, actions, nodes and caller-supplied forbidden block

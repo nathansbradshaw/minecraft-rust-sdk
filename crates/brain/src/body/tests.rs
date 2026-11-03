@@ -291,7 +291,7 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
         .unwrap();
     let response: LocalActionResponse = serde_json::from_slice(&bytes).unwrap();
     assert!(
-        matches!(response,LocalActionResponse::Error(e) if e.code==ErrorCode::Conflict && e.message.contains("no mutation was submitted"))
+        matches!(response,LocalActionResponse::Error(e) if e.code==ErrorCode::LocalPreempted && e.message.contains("no mutation was submitted"))
     );
     waiting.await.unwrap().unwrap();
     shared.emergency.store(false, Ordering::Release);
@@ -304,6 +304,6 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
     let trace = shared.feedback.lock().unwrap().since(0);
     assert_eq!(
         trace["requests"][0]["response"]["error"]["code"],
-        "conflict"
+        "local_preempted"
     );
 }

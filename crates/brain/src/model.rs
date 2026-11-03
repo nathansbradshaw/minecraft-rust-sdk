@@ -88,10 +88,11 @@ pub struct Choice {
     #[serde(default)]
     pub experiment: bool,
 }
-pub const TOOLS: [&str; 15] = [
+pub const TOOLS: [&str; 16] = [
     "develop",
     "observe",
     "query",
+    "navigate",
     "sdk",
     "status",
     "reconcile",

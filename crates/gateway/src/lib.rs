@@ -66,9 +66,10 @@ impl IntoResponse for HttpError {
             ErrorCode::Unauthorized | ErrorCode::Revoked => StatusCode::UNAUTHORIZED,
             ErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
             ErrorCode::NotFound => StatusCode::NOT_FOUND,
-            ErrorCode::Conflict | ErrorCode::SessionRequired | ErrorCode::UncertainOutcome => {
-                StatusCode::CONFLICT
-            }
+            ErrorCode::Conflict
+            | ErrorCode::LocalPreempted
+            | ErrorCode::SessionRequired
+            | ErrorCode::UncertainOutcome => StatusCode::CONFLICT,
             ErrorCode::UnsupportedCapability | ErrorCode::UnsupportedVersion => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }

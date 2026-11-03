@@ -6,22 +6,20 @@ type Cells<'a> = HashMap<[i32; 3], &'a Value>;
 pub fn point(v: &Value) -> Option<[f64; 3]> {
     Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?])
 }
+pub(crate) const KNOWN_HAZARDS: &[&str] = &[
+    "minecraft:lava",
+    "minecraft:water",
+    "minecraft:fire",
+    "minecraft:soul_fire",
+    "minecraft:magma_block",
+    "minecraft:campfire",
+    "minecraft:soul_campfire",
+    "minecraft:cactus",
+    "minecraft:sweet_berry_bush",
+    "minecraft:powder_snow",
+];
 fn hazardous(b: &Value) -> bool {
-    b["dangerous"] == true
-        || [
-            "minecraft:lava",
-            "minecraft:water",
-            "minecraft:fire",
-            "minecraft:soul_fire",
-            "minecraft:magma_block",
-            "minecraft:campfire",
-            "minecraft:soul_campfire",
-            "minecraft:cactus",
-            "minecraft:sweet_berry_bush",
-            "minecraft:powder_snow",
-        ]
-        .iter()
-        .any(|id| b["block"] == *id)
+    b["dangerous"] == true || KNOWN_HAZARDS.iter().any(|id| b["block"] == *id)
 }
 fn block<'a>(cells: &Cells<'a>, p: [i32; 3]) -> Option<&'a Value> {
     cells.get(&p).copied()
