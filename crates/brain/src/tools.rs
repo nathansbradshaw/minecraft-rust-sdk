@@ -75,6 +75,15 @@ fn run_command(bin: &str) -> Result<String> {
         "cargo run --offline --bin {bin} --message-format=json"
     ))
 }
+fn observation_query(input: &str) -> Result<minecraft_sdk::ObservationQuery> {
+    ensure(
+        input.len() <= 10000,
+        "Bounded typed observation query required",
+    )?;
+    let query: minecraft_sdk::ObservationQuery = serde_json::from_str(input)?;
+    query.validate()?;
+    Ok(query)
+}
 struct ProcessGroup(u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
@@ -233,6 +242,17 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                 crate::views::focused(&brain.observed, &choice.input)
             }
         }
+        "query" => {
+            let query = observation_query(&choice.input)?;
+            let result = brain.client.read_observation(&query).await?;
+            ensure(
+                result.to_string().len() <= 5000,
+                "Capability response exceeds the model view budget; request a smaller page or use an SDK program for the full result",
+            )?;
+            Ok(
+                json!({"view":"capability_query","capability":query.capability,"input_sha256":crate::digest(query.input.to_string().as_bytes()),"result":result,"scope":"Read-only SDK capability result for this character; query is not a gameplay mutation or evidence of task completion"}),
+            )
+        }
         "sdk" => brain.act(serde_json::from_str(&choice.input)?).await,
         "status" => Ok(serde_json::to_value(brain.inspect(&choice.input).await?)?),
         "reconcile" => brain.settle(&choice.input).await,
@@ -325,6 +345,24 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_only_queries_retain_typed_bounds_without_actor_or_endpoint_overrides() {
+        let good = json!({"capability":"minecraft:block_search","input":{"tag":"minecraft:logs","radius":32,"limit":8,"offset":0}});
+        let parsed = observation_query(&good.to_string()).unwrap();
+        assert_eq!(parsed.input["tag"], "minecraft:logs");
+        for key in ["actor", "player_uuid", "url", "path", "command", "plugin"] {
+            let mut bad = good.clone();
+            bad[key] = json!("override");
+            assert!(observation_query(&bad.to_string()).is_err());
+        }
+        for bad in [
+            json!({"capability":"not a registry id","input":{}}),
+            json!({"capability":"minecraft:block_search","input":[]}),
+            json!({"capability":"minecraft:block_search","input":{"value":"x".repeat(8192)}}),
+        ] {
+            assert!(observation_query(&bad.to_string()).is_err());
+        }
+    }
     #[test]
     fn run_selects_one_binary_without_allowing_shell_injection() {
         assert_eq!(

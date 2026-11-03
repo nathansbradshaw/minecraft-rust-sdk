@@ -79,6 +79,15 @@ Tools and input:
   Omitted entries are unknown. These tools read only this character's observation;
   use them directly instead of writing another inspection program or parsing a
   giant receipt just to see occupied slots or dropped items.
+- query: a JSON string {"capability":"namespace:capability","input":{...}} for an
+  advertised read-only observation query from server.limits.observation_queries.
+  For example, minecraft:block_search can search a runtime block tag such as
+  minecraft:logs within its advertised radius, beyond the small local snapshot.
+  Follow the advertised schema, next_offset, complete and retry_after_ms; restart
+  paging if the query origin changes. A partial page without matches is unknown.
+  Results are bounded for context; request smaller pages or use a Rust program
+  for larger or multi-page experiments. Queries do not mutate gameplay, grant
+  authority, install plugins or count as completed work.
 - sdk: a JSON string containing one typed Minecraft SDK Action. The harness creates
   and journals its action ID. Fields are those of the SDK Action enum; no actor ID.
 - status: an action ID from an actual receipt.

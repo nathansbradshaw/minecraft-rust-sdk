@@ -36,6 +36,13 @@ restart menu paging after a menu/state change. Item components are omitted from
 these summaries; programs retain the full SDK interface when needed. The compact
 overview prioritizes hostiles and loot over old stationary projectiles. These
 views add no gameplay action, filesystem access or operator capability.
+The `query` command accepts the SDK's closed `{capability,input}` observation
+query type for providers advertised by the current server. It can request wider
+visible-block searches without compiling a diagnostic program first. Complete
+responses up to 5,000 bytes are retained in the model view; larger queries need
+smaller pages or a Rust SDK program. Capability errors, origin changes and
+deployment pacing remain visible. Read-only queries are inspections, not gameplay
+progress, and cannot install plugins or override the acting identity or endpoint.
 
 Build `cargo build --locked -p minecraft-sdk-brain` and run inside the isolated
 coding container:
