@@ -188,6 +188,15 @@ respawn. This initial policy is experimental: eating, combat effectiveness,
 fluids, complex navigation and general Survival strength require further native
 evidence. Health, shelter and threats do not gate model reasoning or conversation.
 
+The body can attempt cooldown-ready defense against a visible hostile within
+three blocks while its finite escape continues. It does not pursue targets or
+interrupt a running item interaction to attack. Native player permissions,
+reach, sight and damage verification still apply. Owned escape routes with less
+than 0.2 blocks of displacement over 14 advancing game ticks are cancelled and
+excluded from the next local route selection. Observation lag, a new entity life,
+dimension or native clock epoch resets this progress window. These mechanics
+require hazard-scene evidence; passing transport tests is not a Survival claim.
+
 Generated SDK programs inherit `MC_SDK_ARBITER`, a private same-UID Unix socket.
 It accepts bounded typed actions and no credentials/actor override. Urgent body
 control defers ordinary program actions; conversation remains available. Stalled,

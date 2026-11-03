@@ -1,5 +1,6 @@
 //! Replaceable container-local safety behavior, independent of model/terminal work.
 pub mod geometry;
+mod tactics;
 #[cfg(test)]
 mod tests;
 use crate::{Journal, Result, ensure};
@@ -358,6 +359,7 @@ async fn controller(
     let mut body_sprint = false;
     let mut inspected_interaction = String::new();
     let mut cancelled_item_use = String::new();
+    let mut progress = tactics::Progress::default();
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -410,6 +412,7 @@ async fn controller(
             conditions = changed;
         }
         let active = &observed.player["control"];
+        let stuck = progress.stuck(&observed, &owned_control);
         let incoming = geometry::incoming(&observed);
         let burning = observed.player["fire_ticks"]
             .as_i64()
@@ -453,6 +456,7 @@ async fn controller(
         }
         if danger {
             let _guard = shared.mutation.lock().await;
+            let mut cancelling_control = false;
             if interaction["held_item_use"] == true
                 && interaction["outcome"] == "running"
                 && let Some(id) = interaction["action_id"].as_str()
@@ -480,11 +484,19 @@ async fn controller(
             if active["outcome"] == "running"
                 && (active["action_id"].as_str() != Some(&owned_control)
                     || incoming
-                    || toward_threat)
+                    || toward_threat
+                    || stuck)
             {
                 if active["cancel_requested"] != true
                     && let Some(id) = active["action_id"].as_str()
                 {
+                    cancelling_control = true;
+                    if stuck {
+                        if let Some(target) = geometry::point(&active["target"]) {
+                            rejected_routes.push(geometry::target_key(target));
+                        }
+                        j.event("body_stuck_route",json!({"action_id":id,"position":p,"game_time":observed.world["game_time"],"reason":"owned escape has less than 0.2 blocks displacement over 14 advancing native ticks; cancel and try another observed route"}))?;
+                    }
                     send(
                         &client,
                         j,
@@ -544,25 +556,22 @@ async fn controller(
                             let sprint = send(&client, j, Action::Sprint { enabled: true }).await?;
                             body_sprint = sprint.outcome == Outcome::Observed;
                         }
-                    } else if let Some((enemy, d)) = nearby
-                        && d <= 3.
-                        && last_attack.elapsed() > Duration::from_millis(650)
-                    {
-                        if let Some(id) = enemy["entity_id"].as_i64() {
-                            send(
-                                &client,
-                                j,
-                                Action::Attack {
-                                    entity: i32::try_from(id)?,
-                                },
-                            )
-                            .await?;
-                            last_attack = Instant::now();
-                        }
                     } else {
                         *shared.reason.lock().map_err(|_|"Body state unavailable")?="Danger has no supported safe route; investigate perception/body capability".into();
                     }
                 }
+            }
+            // Native movement and interaction have independent finite lanes.
+            // Do not stop escaping just to defend against an adjacent hostile,
+            // or wait for the route's expiry before attempting knockback.
+            if !dead
+                && !cancelling_control
+                && last_attack.elapsed() >= Duration::from_millis(650)
+                && let Some(entity) = tactics::defensive_target(&observed)
+            {
+                let receipt = send(&client, j, Action::Attack { entity }).await?;
+                last_attack = Instant::now();
+                j.event("body_defensive_attack",json!({"entity":entity,"action_id":receipt.action_id,"outcome":receipt.outcome,"native_effect_verified":receipt.evidence["native_effect_verified"],"observed_control":active,"reason":"cooldown-ready defense without pausing escape; server validates sight/reach and damage"}))?;
             }
         } else if shared.urgent() && safe_since.elapsed() > Duration::from_secs(3) {
             if body_sprint {
