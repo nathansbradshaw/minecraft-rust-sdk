@@ -327,7 +327,19 @@ impl Journal {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or(Value::Null);
-        compact_history(&mut value);
+        // The latest requested read is the tool's answer, not redundant receipt
+        // history. Its records have already been paged/bounded at the tool edge.
+        // Removing world here used to leave valid page counts with no records.
+        let requested_page = (value["tool"] == "observe"
+            && matches!(
+                value["result"]["view"].as_str(),
+                Some("blocks" | "entities" | "menu" | "inventory")
+            )
+            && value["result"]["page"].is_object())
+            || (value["tool"] == "query" && value["result"]["view"] == "capability_query");
+        if !requested_page {
+            compact_history(&mut value);
+        }
         Ok(value)
     }
     fn recent(&self) -> Result<Value> {
@@ -1744,6 +1756,34 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("durable-native-id")
+        );
+    }
+    #[test]
+    fn latest_focused_pages_survive_journal_and_model_context() {
+        let t = tempfile::tempdir().unwrap();
+        let j = Journal::open(&t.path().join("brain.sqlite")).unwrap();
+        let observation = Observation {
+            revision: "native-page".into(),
+            player: json!({"uuid":"actor","dimension":"custom:world","position":[3,64,9],"inventory":[]}),
+            world: json!({"blocks":[{"position":[4,64,9],"block":"custom:resource","state":"sample"}],"entities":[{"entity_id":73,"type":"minecraft:item","position":[4.5,64,9.5],"item":{"item":"custom:resource","count":2}}]}),
+            menu: json!({"menu_id":7,"state_id":8,"slots":[{"slot":0,"inventory_slot":0,"player_inventory":false,"item":"custom:result","count":1}]}),
+        };
+        for view in ["blocks", "entities", "menu", "inventory"] {
+            let page =
+                views::focused(&observation, &json!({"view":view,"limit":16}).to_string()).unwrap();
+            j.event("tool_result", json!({"tool":"observe","result":page}))
+                .unwrap();
+            let mut context = json!({"last_tool_result":j.last_result().unwrap(),"recent":vec!["old history ".repeat(1000);20],"observation":projection(&observation)});
+            fit_context(&mut context).unwrap();
+            assert_eq!(
+                context["last_tool_result"]["result"], page,
+                "The requested {view} records and pagination must reach the model intact"
+            );
+        }
+        j.event("tool_result",json!({"tool":"sdk","result":{"receipt":{"evidence":{"before":{"world":{"blocks":["large"]}},"after":{"world":{"blocks":["large"]}}}},"after":{"world":{"blocks":["large"]}}}})).unwrap();
+        assert!(
+            !j.last_result().unwrap().to_string().contains("large"),
+            "Full receipt history remains compacted"
         );
     }
     #[test]
