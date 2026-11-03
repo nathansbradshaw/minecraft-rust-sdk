@@ -558,7 +558,11 @@ impl Brain {
         )?;
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
         journal.context_contract(&digest(
-            concat!("sdk-shaped-observation-v1\n", include_str!("sdk.md")).as_bytes(),
+            concat!(
+                "sdk-shaped-observation-v1\nfocused-observation-v1\n",
+                include_str!("sdk.md")
+            )
+            .as_bytes(),
         ))?;
         let mut random = [0; 16];
         use std::io::Read;
@@ -832,7 +836,7 @@ impl Brain {
                 .get("activity")?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
-            let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","inventory":"occupied slots only, original slot numbers","menus":"slot contents require a fresh full SDK observation"},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
+            let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
             context["last_experiment"] = self
                 .journal

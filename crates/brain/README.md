@@ -12,6 +12,8 @@ such as `{"view":"menu","limit":16}` or
 `entities` and `blocks` read only the current character's existing observation.
 Pages preserve runtime IDs, output and empty-slot bindings, menu/state IDs and
 observation revision. Limits are 1–32 records, additionally bounded by bytes;
+fields retain SDK nesting (`menu.slots`, `player.inventory`, `world.entities`,
+`world.blocks`).
 `page.next_offset` and `total_in_snapshot` disclose omissions. Pages are live,
 not an atomic multi-page snapshot: match stable entity IDs/slot numbers and
 restart menu paging after a menu/state change. Item components are omitted from

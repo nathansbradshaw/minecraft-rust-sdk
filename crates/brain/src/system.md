@@ -43,6 +43,8 @@ Tools and input:
   pages include output, input and empty slot bindings. Follow page.next_offset;
   pages are live, not an atomic snapshot. Match entity IDs or slot numbers;
   restart menu paging if menu/state ID changes. Revision records observation time.
+  Fields keep SDK nesting: menu.slots, player.inventory, world.entities and
+  world.blocks. A focused response is a labelled partial observation.
   Omitted entries are unknown. These tools read only this character's observation;
   use them directly instead of writing another inspection program or parsing a
   giant receipt just to see occupied slots or dropped items.
