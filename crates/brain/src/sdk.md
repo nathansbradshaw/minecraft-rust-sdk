@@ -62,6 +62,14 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   fresh observation when appropriate. The caller chooses slots and verifies effects.
   menu::item_count(&observation, item_id) counts retained player inventory only,
   excluding a prepared output or carried cursor stack. Do not print every air slot.
+- If advertised, minecraft:recipes discovers exact installed recipe IDs using
+  recipe, output item or type selectors and bounded offset/limit pagination.
+  The Rust recipes::Query helper builds that same read-only query. Recipe IDs
+  are distinct from output item IDs or material categories. Inspect known,
+  result_known, ingredient omissions and custom/dynamic limitations; follow
+  next_offset/complete and retry_after_ms. Queries do not unlock recipes, prove
+  ingredients suffice or establish menu compatibility. Unknown recipe IDs and
+  locked book entries are refused before dispatch by the matching integration.
 - Rust ClickSlot.mode remains u8; click_mode constants cover PICKUP=0,
   QUICK_MOVE=1, SWAP=2, CLONE=3, THROW=4, QUICK_CRAFT=5, PICKUP_ALL=6.
   SDK JSON also accepts the corresponding snake_case names; serialization sends
