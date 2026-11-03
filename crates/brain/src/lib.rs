@@ -432,12 +432,13 @@ impl Brain {
                 "minecraft:survival_facts",
                 "minecraft:ranged_observation",
                 "minecraft:pending_actions",
+                "minecraft:session_material_preservation",
             ]
             .iter()
             .all(|c| info.capabilities.iter().any(|v| v == c))
             {
                 let _ = client.disconnect().await;
-                return Err("Default Survival brain requires finite controls, survival/ranged facts and pending-action inspection".into());
+                return Err("Default Survival brain requires finite controls, survival/ranged facts, pending-action inspection and session material preservation".into());
             }
             match body::Handle::start(
                 profile.clone(),

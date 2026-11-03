@@ -27,3 +27,19 @@ Raw clients should use the canonical numeric form for older gateways.
 Give each intended action a durable ID before dispatch. Inspect running or
 uncertain IDs and reconcile after interruption; never repeat a mutation just
 because an output preview is abbreviated or a menu changed unexpectedly.
+
+NeoForge integration alpha.8 advertises
+`minecraft:session_material_preservation`. Before a registered SDK player is
+marked disconnected and saved, it closes menus using their ordinary removal
+handlers. This returns personal crafting inputs and cursor stacks to available
+inventory space, including personal inputs behind another open menu. A virtual
+recipe result is never collected by cleanup. Full inventory uses the game's
+normal item-drop behavior; this is not a guarantee against ordinary world loss.
+World menus keep their own removal semantics, including persistent modded
+workbenches. The hook does not extract their contents or change human players.
+
+This covers normal disconnect, broken player connections and saved server
+shutdown. It cannot make a JVM crash or unsaved world storage durable. The
+reference Survival brain requires the capability before starting. Installing
+the new Java hook requires a saved server restart; swapping a Rust controller
+alone cannot install it.

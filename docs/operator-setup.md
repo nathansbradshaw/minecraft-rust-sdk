@@ -9,6 +9,9 @@ anything on your machine.
    Install NeoForge 21.1.233 for Minecraft 1.21.1 and this release's thin
    `minecraft-sdk-neoforge` JAR in `mods/`. It works without an installed modpack.
    Keep `online-mode=true` and your existing player capacity and permissions.
+   The reference Survival brain requires integration alpha.8's
+   `minecraft:session_material_preservation` capability; see [menus.md](menus.md)
+   for disconnect behavior and durability limits.
 2. Save and restart Minecraft to install the Java hooks. They cannot be installed
    through the Rust adapter's process interface. The module creates a private
    `minecraft-sdk/` directory and a mode-600 `native.token`. The token changes
