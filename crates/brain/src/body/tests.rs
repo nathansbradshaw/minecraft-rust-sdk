@@ -1,6 +1,10 @@
 use super::*;
 #[tokio::test]
 async fn controller_defends_without_ending_escape_then_cancels_a_stuck_route() {
+    controller_projectile_scenario(false).await;
+    controller_projectile_scenario(true).await;
+}
+async fn controller_projectile_scenario(replace_projectile: bool) {
     // Transport fixture only: the game is deliberately held at one position
     // while its tick counter advances. This is not native gameplay evidence.
     let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -59,7 +63,7 @@ async fn controller_defends_without_ending_escape_then_cancels_a_stuck_route() {
                 serde_json::to_value(Observation {
                     revision:tick.to_string(),
                     player:json!({"entity_id":1,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"attack_strength":1.,"control":control}),
-                    world:json!({"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,"entities":[{"entity_id":9,"visible":true,"hostile":true,"position":[2.5,1.,0.5]}]}),
+                    world:json!({"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,"entities":[{"entity_id":9,"visible":true,"hostile":true,"position":[2.5,1.,0.5]},{"entity_id":if replace_projectile && tick>=116{11}else{10},"uuid":if replace_projectile && tick>=116{"new-projectile-fixture"}else{"projectile-fixture"},"visible":true,"projectile":true,"position":[2.5,1.9,0.5],"velocity":[-0.25,0.,0.]}]}),
                     menu:json!({}),
                 }).unwrap()
             } else {
@@ -76,6 +80,17 @@ async fn controller_defends_without_ending_escape_then_cancels_a_stuck_route() {
                         defended_while_moving = control["outcome"] == "running";
                     }
                     Action::CancelControl { action_id } => {
+                        if replace_projectile {
+                            assert!(
+                                (116..124).contains(&tick),
+                                "A new incoming projectile should replan before the stuck window"
+                            );
+                        } else {
+                            assert!(
+                                tick >= 124,
+                                "Repeated samples of the same projectile must not cancel the dodge before the native stuck window"
+                            );
+                        }
                         assert_eq!(control["action_id"], *action_id);
                         assert!(defended_while_moving);
                         finished = true;

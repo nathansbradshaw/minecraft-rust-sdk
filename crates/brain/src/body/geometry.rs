@@ -195,14 +195,17 @@ fn descending_route(
     })
 }
 pub fn incoming(o: &Observation) -> bool {
+    !incoming_projectiles(o).is_empty()
+}
+pub(super) fn incoming_projectiles(o: &Observation) -> Vec<String> {
     let Some(start) = point(&o.player["position"]) else {
-        return false;
+        return Vec::new();
     };
-    o.world["entities"]
+    let mut ids: Vec<_> = o.world["entities"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|e| {
+        .filter(|e| {
             if e["visible"] != true || e["projectile"] != true {
                 return false;
             }
@@ -223,6 +226,18 @@ pub fn incoming(o: &Observation) -> bool {
                 .sqrt();
             (0.0..=12.).contains(&t) && miss < 1.5
         })
+        .map(|e| {
+            e["uuid"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|id| format!("uuid:{id}"))
+                .or_else(|| e["entity_id"].as_i64().map(|id| format!("entity:{id}")))
+                .unwrap_or_else(|| "unidentified-projectile".into())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 pub fn target_key(p: [f64; 3]) -> [i32; 3] {
     p.map(|v| (v * 10.).round() as i32)
