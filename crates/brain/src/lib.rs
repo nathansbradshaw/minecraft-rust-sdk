@@ -118,6 +118,9 @@ pub struct Config {
 fn conversation_default() -> bool {
     true
 }
+fn model_context_contract(instructions: &str) -> String {
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1","sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+}
 pub struct Journal {
     db: Connection,
 }
@@ -551,13 +554,7 @@ impl Brain {
             "Another brain owns this state directory",
         )?;
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
-        journal.context_contract(&digest(
-            concat!(
-                "sdk-shaped-observation-v1\nfocused-observation-v1\nretrievable-memory-v1\ncontainer-inspection-memory-v1\n",
-                include_str!("sdk.md")
-            )
-            .as_bytes(),
-        ))?;
+        journal.context_contract(&model_context_contract(&cfg.instructions))?;
         let imported = journal.import_program_history(&cfg.state)?;
         if imported > 0 {
             journal.event(
@@ -1256,6 +1253,10 @@ mod tests {
     use super::*;
     #[test]
     fn context_pressure_preserves_complete_standing_instructions() {
+        assert_ne!(
+            model_context_contract("preserve builds"),
+            model_context_contract("")
+        );
         let instructions = "Retain this deployment preference across all player tasks. ".repeat(30);
         let mut context = json!({"goal":"new player task","deployment_instructions":instructions,"server":"s".repeat(3000),"observation":{"world":{"blocks":(0..100).map(|n|json!({"position":[n,64,0],"block":"minecraft:stone"})).collect::<Vec<_>>()},"player":{"position":[1.,64.,2.]}},"recent":["x".repeat(16000)],"sdk_reference":include_str!("sdk.md")});
         fit_context(&mut context).unwrap();
