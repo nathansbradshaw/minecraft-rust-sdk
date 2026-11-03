@@ -198,6 +198,16 @@ pub fn incoming(o: &Observation) -> bool {
     !incoming_projectiles(o).is_empty()
 }
 pub(super) fn incoming_projectiles(o: &Observation) -> Vec<String> {
+    incoming_with_stationary(o, &[])
+}
+pub(super) fn projectile_key(e: &Value) -> Option<String> {
+    e["uuid"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|id| format!("uuid:{id}"))
+        .or_else(|| e["entity_id"].as_i64().map(|id| format!("entity:{id}")))
+}
+pub(super) fn incoming_with_stationary(o: &Observation, stationary: &[String]) -> Vec<String> {
     let Some(start) = point(&o.player["position"]) else {
         return Vec::new();
     };
@@ -207,6 +217,9 @@ pub(super) fn incoming_projectiles(o: &Observation) -> Vec<String> {
         .flatten()
         .filter(|e| {
             if e["visible"] != true || e["projectile"] != true {
+                return false;
+            }
+            if projectile_key(e).is_some_and(|id| stationary.contains(&id)) {
                 return false;
             }
             let (Some(p), Some(v)) = (point(&e["position"]), point(&e["velocity"])) else {
@@ -226,14 +239,7 @@ pub(super) fn incoming_projectiles(o: &Observation) -> Vec<String> {
                 .sqrt();
             (0.0..=12.).contains(&t) && miss < 1.5
         })
-        .map(|e| {
-            e["uuid"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(|id| format!("uuid:{id}"))
-                .or_else(|| e["entity_id"].as_i64().map(|id| format!("entity:{id}")))
-                .unwrap_or_else(|| "unidentified-projectile".into())
-        })
+        .map(|e| projectile_key(e).unwrap_or_else(|| "unidentified-projectile".into()))
         .collect();
     ids.sort();
     ids.dedup();
@@ -246,6 +252,13 @@ pub fn evade(o: &Observation) -> Option<Escape> {
     evade_avoiding(o, &[])
 }
 pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
+    evade_with_stationary(o, blocked, &[])
+}
+pub(super) fn evade_with_stationary(
+    o: &Observation,
+    blocked: &[[i32; 3]],
+    stationary: &[String],
+) -> Option<Escape> {
     let start = point(&o.player["position"])?;
     let mut threats = Vec::new();
     let mut projectile_danger = false;
@@ -265,6 +278,7 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
             threats.push((p, e["ranged_attack"] == true));
         }
         if e["projectile"] == true
+            && !projectile_key(e).is_some_and(|id| stationary.contains(&id))
             && let Some(v) = point(&e["velocity"])
         {
             let vv = v.iter().map(|x| x * x).sum::<f64>();

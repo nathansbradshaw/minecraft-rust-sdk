@@ -361,6 +361,7 @@ async fn controller(
     let mut inspected_interaction = String::new();
     let mut cancelled_item_use = String::new();
     let mut progress = tactics::Progress::default();
+    let mut projectiles = tactics::Projectiles::default();
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -414,22 +415,27 @@ async fn controller(
         }
         let active = &observed.player["control"];
         let stuck = progress.stuck(&observed, &owned_control);
-        let incoming_projectiles = geometry::incoming_projectiles(&observed);
+        let stationary_projectiles = projectiles.stationary(&observed);
+        let incoming_projectiles =
+            geometry::incoming_with_stationary(&observed, &stationary_projectiles);
         let incoming = !incoming_projectiles.is_empty();
         let new_projectile = incoming_projectiles
             .iter()
             .any(|id| !owned_projectiles.contains(id));
+        // Leaving and then re-entering the collision corridor is a new threat,
+        // including a previously stationary projectile that resumes moving.
+        owned_projectiles.retain(|id| incoming_projectiles.contains(id));
         let burning = observed.player["fire_ticks"]
             .as_i64()
             .is_some_and(|n| n > 0);
         let escape = if active["outcome"] != "running" {
-            geometry::evade_avoiding(&observed, &rejected_routes)
+            geometry::evade_with_stationary(&observed, &rejected_routes, &stationary_projectiles)
         } else {
             None
         };
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
         if cycles.is_multiple_of(10) || observed.player["health"] != previous_health {
-            j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming,"incoming_projectile_ids":incoming_projectiles}))?;
+            j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming,"incoming_projectile_ids":incoming_projectiles,"stationary_projectile_ids":stationary_projectiles,"stationary_scope":"client inference from advancing native positions, not a server flight flag or future guarantee"}))?;
             previous_health = observed.player["health"].clone();
         }
         let danger = dead

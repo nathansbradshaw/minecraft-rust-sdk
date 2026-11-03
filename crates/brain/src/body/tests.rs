@@ -62,7 +62,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
                 tick += 4;
                 serde_json::to_value(Observation {
                     revision:tick.to_string(),
-                    player:json!({"entity_id":1,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"attack_strength":1.,"control":control}),
+                    player:json!({"uuid":"own","entity_id":1,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"attack_strength":1.,"control":control}),
                     world:json!({"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,"entities":[{"entity_id":9,"visible":true,"hostile":true,"position":[2.5,1.,0.5]},{"entity_id":if replace_projectile && tick>=116{11}else{10},"uuid":if replace_projectile && tick>=116{"new-projectile-fixture"}else{"projectile-fixture"},"visible":true,"projectile":true,"position":[2.5,1.9,0.5],"velocity":[-0.25,0.,0.]}]}),
                     menu:json!({}),
                 }).unwrap()

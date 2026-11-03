@@ -240,6 +240,14 @@ visible hand item identifiers/animations. It distinguishes a ranged threat's
 checks safe one-block descents instead of treating a step as a diagonal ramp.
 These are replaceable client behaviors; they are not SDK gameplay policy or proof
 that every ranged mod entity, terrain trap or projectile is supported.
+The body tracks up to 256 visible projectile identities across advancing native
+ticks. A projectile stationary for two ticks can retain reported velocity without
+requiring another dodge. Actual motion or a substantial velocity change restores
+the flight response immediately; missing identity/clock facts stay conservative.
+History resets across a changed life, dimension, native epoch, clock rollback or
+observation gap over twenty ticks. This is labelled client inference and leaves
+native observations intact. Single-frame diagnostic helpers remain conservative;
+these checks do not establish ranged Survival performance.
 Terminal children inherit `MC_SDK_ARBITER` and run at reduced CPU priority so the
 independent body can preempt gameplay while compilation continues. Use finite
 `start_move` and inspect its eventual receipt. Blocked code requests can resume
