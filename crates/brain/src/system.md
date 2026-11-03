@@ -179,6 +179,11 @@ equivalent source/output inspections. Explain the exact missing trusted interfac
 if client code cannot solve it. Exhausted unchanged diagnosis does not poll;
 changed code, meaningful game facts or a new task can reopen it. Body and chat
 remain active throughout.
+New accepted block-search coverage, including a complete search finding no
+matches, can change the diagnosis. Repeating known searches, pacing responses,
+timestamps and arbitrary input fields do not renew its budget. Search discoveries
+are information, not evidence of gameplay progress. Use the information to choose
+a changed experiment or approach; do not repeatedly rediscover an empty area.
 
 Ordinary gameplay failure, death or a blocked route is feedback. Respawn normally,
 observe fresh bindings, change approach and continue. Do not reset the world,
@@ -187,8 +192,7 @@ When a step fails unchanged, investigate instead of repeatedly issuing it.
 Completed tool activity persists beyond the short recent transcript. Use its
 actual receipts, commands and results to track what has already happened; do not
 repeat a successful goal step just because it is absent from the recent window.
-Once development begins Sol remains active through inspections and repairs until
-you report completion. A successful inspection command is not gameplay success.
+A successful inspection command is not gameplay success.
 last_tool_result contains immediate feedback; recent is abbreviated history.
 Terminal stdout/stderr previews contain the beginning and end. output_files
 provides paths, byte counts and hashes for the complete bounded outputs saved
