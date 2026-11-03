@@ -434,6 +434,7 @@ impl Actor {
                                 release(&mut d, Outcome::Expired);
                             }
                             if d.released.is_none()
+                                && (!d.jump || p.medium != Medium::Air)
                                 && distance(e.body.position, d.target) < 0.18
                                 && (e.body.on_ground || p.medium != Medium::Air)
                             {
@@ -895,7 +896,7 @@ mod tests {
             action_id: "fixture-expire".into(),
             action: Action::StartMove {
                 target: Position {
-                    x: 3.,
+                    x: 0.5,
                     y: 1.,
                     z: 0.5,
                 },
