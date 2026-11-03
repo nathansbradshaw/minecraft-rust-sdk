@@ -202,11 +202,9 @@ impl Job {
         r.action_id = id.into();
         let released = r.evidence["input_released"] == true;
         r.evidence = json!({"interaction_action_id":self.id,"interaction_outcome":r.outcome,"interaction":r.evidence,"input_released":released,"native_effect_verified":released});
-        if r.outcome.terminal() {
-            if released {
-                r.outcome = Outcome::Observed;
-                r.error = None;
-            }
+        if r.outcome.terminal() && released {
+            r.outcome = Outcome::Observed;
+            r.error = None;
         }
         Ok(r)
     }
