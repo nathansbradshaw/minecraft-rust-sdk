@@ -1252,6 +1252,9 @@ fn dispatch(
                         ApiError::new(ErrorCode::NotReady, "Native observation unavailable")
                     })?;
                 if let Some(player) = players.get(&request.bot_id) {
+                    if let Some(job) = &player.interaction {
+                        job.freshen(&mut observation);
+                    }
                     if let Some(job) = &player.control {
                         observation.player["control"] = job.observation();
                     }

@@ -153,6 +153,7 @@ pub(super) struct Job {
     cancel: Arc<AtomicBool>,
     reported: AtomicBool,
     state: Arc<Mutex<Receipt>>,
+    latest: Arc<Mutex<Option<Observation>>>,
 }
 impl Job {
     pub fn running(&self) -> bool {
@@ -180,6 +181,18 @@ impl Job {
     }
     pub fn observation(&self) -> Value {
         self.state.lock().map(|r|json!({"action_id":self.id,"outcome":r.outcome,"progress":r.evidence["progress"],"input_released":r.evidence["input_released"],"held_item_use":self.held})).unwrap_or_else(|_|json!({"action_id":self.id,"outcome":"uncertain"}))
+    }
+    pub fn freshen(&self, o: &mut Observation) {
+        if let Ok(latest) = self.latest.lock()
+            && let Some(after) = latest.as_ref()
+            && same_lane(o, after)
+        {
+            let metadata = o.player.get("physical_controller").cloned();
+            *o = after.clone();
+            if let Some(metadata) = metadata {
+                o.player["physical_controller"] = metadata;
+            }
+        }
     }
     pub fn status(&self, id: &str) -> Result<Receipt> {
         let mut r = self
@@ -242,11 +255,13 @@ impl Job {
             error: None,
         }));
         let cancel = Arc::new(AtomicBool::new(false));
+        let latest = Arc::new(Mutex::new(None));
         let ctx = Context {
             native,
             before,
             request: request.clone(),
             state: state.clone(),
+            latest: latest.clone(),
             cancel: cancel.clone(),
             alive: player.alive.clone(),
             corrections: player.corrections.clone(),
@@ -278,6 +293,7 @@ impl Job {
             cancel_id: None,
             cancel,
             state,
+            latest,
             reported: AtomicBool::new(false),
         }
     }
@@ -287,6 +303,7 @@ struct Context {
     before: Observation,
     request: ActionRequest,
     state: Arc<Mutex<Receipt>>,
+    latest: Arc<Mutex<Option<Observation>>>,
     cancel: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     corrections: Arc<AtomicU64>,
@@ -318,6 +335,15 @@ impl Context {
         released: bool,
         reason: &str,
     ) {
+        // Publish before the terminal status, so a subsequent observation cannot
+        // go backwards behind its completed effect. Never replace newer native
+        // samples or cross an actor, dimension or server-clock boundary.
+        if let Some(after) = after
+            && same_lane(&self.before, after)
+            && let Ok(mut latest) = self.latest.lock()
+        {
+            *latest = Some(after.clone());
+        }
         if let Ok(mut r) = self.state.lock() {
             r.outcome = outcome.clone();
             r.evidence["after"] = after
@@ -637,12 +663,14 @@ mod tests {
                 error: None,
             }));
             let cancel = Arc::new(AtomicBool::new(false));
+            let latest = Arc::new(Mutex::new(None));
             let alive = Arc::new(AtomicBool::new(true));
             let ctx = Context {
                 native: self.native.clone(),
                 before: self.observed.lock().unwrap().clone(),
                 request: request.clone(),
                 state: state.clone(),
+                latest: latest.clone(),
                 cancel: cancel.clone(),
                 alive: alive.clone(),
                 corrections: Arc::new(AtomicU64::new(0)),
@@ -658,6 +686,7 @@ mod tests {
                 cancel_id: None,
                 cancel,
                 state,
+                latest,
                 reported: AtomicBool::new(false),
             };
             (job, thread::spawn(move || ctx.run()), alive)
@@ -683,6 +712,7 @@ mod tests {
     #[test]
     fn a_delayed_menu_effect_stays_running_then_preserves_the_terminal_receipt_until_inspected() {
         let lab = Lab::new();
+        let mut stale = observation();
         let (job, worker, _) = lab.start(
             Action::Interact {
                 entity: 7,
@@ -701,6 +731,20 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Observed);
         assert_eq!(r.evidence["native_effect_verified"], true);
         assert!(!job.needs_status());
+        job.freshen(&mut stale);
+        assert_eq!(stale.menu["menu_id"], 2);
+        stale.player["uuid"] = json!("foreign");
+        stale.menu["menu_id"] = json!(0);
+        job.freshen(&mut stale);
+        assert_eq!(stale.menu["menu_id"], 0);
+        stale.player["uuid"] = json!("own");
+        stale.world["sample_clock"]["nanos"] = json!("999999999");
+        stale.menu["menu_id"] = json!(3);
+        job.freshen(&mut stale);
+        assert_eq!(
+            stale.menu["menu_id"], 3,
+            "A terminal receipt cannot overwrite a newer native observation"
+        );
     }
     #[test]
     fn ordinary_absence_expires_but_losing_the_connection_is_uncertain() {
