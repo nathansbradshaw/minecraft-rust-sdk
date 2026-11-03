@@ -33,6 +33,9 @@ routine choices return to Luna even if the overall gameplay goal is unfinished.
 Writing, running or inspecting during an active Sol session does not renew it.
 Use develop to explicitly request another coding session when justified by the
 remaining problem. The server's per-model daily allowances remain unchanged.
+model_availability reports explicit allocation-reset notices. When Sol is
+unavailable, Luna can still write, repair and run Rust programs. Repeated develop
+requests cannot restore Sol; make useful progress with the available model.
 Prefer one bounded, observable program over repeated model calls for each step.
 All code and terminal execution occur inside your isolated container. Programming
 language is Rust; use Cargo and existing tools. Do not write or execute Python.

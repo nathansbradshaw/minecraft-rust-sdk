@@ -834,6 +834,16 @@ impl Brain {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 self.refresh().await?;
             }
+            let preferred = self.journal.take_development_turn()?;
+            let develop = loop {
+                if let Some(model) = self.journal.available_model(preferred, now())? {
+                    break model;
+                }
+                // Both allocations are exhausted. Keep the physical and chat
+                // lanes responsive without resubmitting denied requests.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                self.refresh().await?;
+            };
             let pending = self.journal.get("pending_action")?.unwrap_or_default();
             let activity: Value = self
                 .journal
@@ -842,6 +852,7 @@ impl Brain {
                 .unwrap_or(json!([]));
             let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
+            context["model_availability"] = self.journal.model_availability(now())?;
             context["last_experiment"] = self
                 .journal
                 .get("last_experiment")?
@@ -850,8 +861,7 @@ impl Brain {
             fit_context(&mut context)?;
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
-            let develop = self.journal.take_development_turn()?;
-            self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
+            self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"preferred_development":preferred,"quota_fallback":preferred != develop,"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
             let requested_goal = self.goal.clone();
             let requested_revision = self.journal.get("goal_revision")?.unwrap_or_default();
             let lanes = self.body.as_ref().map(|h| h.shared.model_lanes.clone());
@@ -868,6 +878,14 @@ impl Brain {
             };
             next = tokio::time::Instant::now() + Duration::from_secs(self.cfg.model_interval_secs);
             self.refresh().await?;
+            // Allocation applies to the character even if chat replaced the
+            // goal while this inference was pending.
+            let daily_unavailable = match &answer {
+                Err(error) => self
+                    .journal
+                    .remember_daily_reset(develop, error.as_ref(), now())?,
+                Ok(_) => false,
+            };
             if self.goal != requested_goal
                 || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision
             {
@@ -880,6 +898,10 @@ impl Brain {
                     let retry_at = model::retry_at(e.as_ref());
                     self.journal
                         .event("model_error", json!({"error":e.to_string(),"turn":turn,"retry_at_utc":retry_at,"unchanged_failure_polling":false}))?;
+                    if daily_unavailable {
+                        self.journal.event("model_allocation_unavailable",json!({"development":develop,"retry_at_utc":retry_at,"other_model_work_allowed":true,"allowances_changed":false}))?;
+                        continue;
+                    }
                     // Preserve responsive gameplay/chat while the operator or a
                     // new player goal supplies a changed condition. Repeating a
                     // rejected inference request is not investigation.
