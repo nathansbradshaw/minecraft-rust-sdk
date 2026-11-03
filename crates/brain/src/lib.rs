@@ -12,6 +12,7 @@ pub mod memory;
 pub mod model;
 pub mod navigation;
 pub mod output;
+mod ownership;
 pub mod progress;
 mod routing;
 pub mod tools;
@@ -520,6 +521,7 @@ pub struct Brain {
     pub observed: Observation,
     pub goal: String,
     _lock: fs::File,
+    _actor_lock: fs::File,
 }
 impl Brain {
     pub async fn open(cfg: Config) -> Result<Self> {
@@ -589,6 +591,10 @@ impl Brain {
         let run_id = digest(&random)[..24].to_owned();
         let goal = journal.get("goal")?.unwrap_or_else(|| cfg.goal.clone());
         let mut profile: Profile = serde_json::from_slice(&private_read(&cfg.profile, 16384)?)?;
+        let actor_lock = ownership::acquire(
+            &profile,
+            &std::env::temp_dir().join("minecraft-sdk-brain-actors"),
+        )?;
         let mut client = Client::with_profile(&profile)?.without_local_arbiter();
         let info = client.verify_instance(&profile.instance_id).await?;
         let imported = journal
@@ -669,6 +675,7 @@ impl Brain {
             observed,
             goal,
             _lock: lock,
+            _actor_lock: actor_lock,
         })
     }
     pub async fn refresh(&mut self) -> Result<()> {

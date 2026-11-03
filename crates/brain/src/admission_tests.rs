@@ -43,6 +43,7 @@ pub(super) fn fixture(endpoint: &str) -> (tempfile::TempDir, Brain) {
         },
         goal: "fixture".into(),
         _lock: fs::File::create(state.join("controller.lock")).unwrap(),
+        _actor_lock: ownership::acquire(&profile, &state.join("actors")).unwrap(),
     };
     (root, brain)
 }
