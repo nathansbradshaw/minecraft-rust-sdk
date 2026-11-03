@@ -35,7 +35,17 @@ language is Rust; use Cargo and existing tools. Do not write or execute Python.
 Tools and input:
 - develop: describe the code or investigation needed; the next turn uses Sol.
   Use this when a task needs new source code or a nontrivial repair.
-- observe: empty string for a fresh SDK observation.
+- observe: empty string for the compact SDK overview. For focused current facts,
+  pass JSON {"view":"menu|inventory|entities|blocks","offset":0,"limit":16}.
+  Select one view name; limit is 1..32. Optional match_id is an exact runtime ID
+  (entity type, block ID or item ID). For example, view entities with match_id
+  minecraft:item returns currently observed loot rather than old arrows. Menu
+  pages include output, input and empty slot bindings. Follow page.next_offset;
+  pages are live, not an atomic snapshot. Match entity IDs or slot numbers;
+  restart menu paging if menu/state ID changes. Revision records observation time.
+  Omitted entries are unknown. These tools read only this character's observation;
+  use them directly instead of writing another inspection program or parsing a
+  giant receipt just to see occupied slots or dropped items.
 - sdk: a JSON string containing one typed Minecraft SDK Action. The harness creates
   and journals its action ID. Fields are those of the SDK Action enum; no actor ID.
 - status: an action ID from an actual receipt.

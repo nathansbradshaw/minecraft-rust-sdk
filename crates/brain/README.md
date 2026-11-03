@@ -6,6 +6,19 @@ It runs only in a non-root container. The trusted inference service returns data
 and source; it never receives host tool execution permission. SDK gateway/server
 credentials and authoritative journals remain outside the container.
 
+The `observe` tool accepts an empty input for a compact overview, or a JSON query
+such as `{"view":"menu","limit":16}` or
+`{"view":"entities","match_id":"minecraft:item"}`. Views `menu`, `inventory`,
+`entities` and `blocks` read only the current character's existing observation.
+Pages preserve runtime IDs, output and empty-slot bindings, menu/state IDs and
+observation revision. Limits are 1–32 records, additionally bounded by bytes;
+`page.next_offset` and `total_in_snapshot` disclose omissions. Pages are live,
+not an atomic multi-page snapshot: match stable entity IDs/slot numbers and
+restart menu paging after a menu/state change. Item components are omitted from
+these summaries; programs retain the full SDK interface when needed. The compact
+overview prioritizes hostiles and loot over old stationary projectiles. These
+views add no gameplay action, filesystem access or operator capability.
+
 Build `cargo build --locked -p minecraft-sdk-brain` and run inside the isolated
 coding container:
 

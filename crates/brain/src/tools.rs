@@ -211,7 +211,11 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
         }
         "observe" => {
             brain.refresh().await?;
-            Ok(crate::projection(&brain.observed))
+            if choice.input.trim().is_empty() {
+                Ok(crate::projection(&brain.observed))
+            } else {
+                crate::views::focused(&brain.observed, &choice.input)
+            }
         }
         "sdk" => brain.act(serde_json::from_str(&choice.input)?).await,
         "status" => Ok(serde_json::to_value(brain.inspect(&choice.input).await?)?),
