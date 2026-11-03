@@ -5,6 +5,15 @@ use serde_json::Value;
 pub const API_VERSION: u32 = 1;
 pub const ADAPTER_VERSION: u32 = 2;
 
+/// Native arrival contract in blocks, shared by adapters and navigation clients.
+/// This says nothing about dispatch, identity or receipt authenticity.
+pub const MOVEMENT_TARGET_TOLERANCE: f64 = 0.15;
+pub fn movement_target_reached(actual: [f64; 3], target: [f64; 3]) -> bool {
+    actual.into_iter().chain(target).all(f64::is_finite)
+        && (0..3).map(|i| (actual[i] - target[i]).powi(2)).sum::<f64>()
+            < MOVEMENT_TARGET_TOLERANCE.powi(2)
+}
+
 /// Stable click-intent codes. The version adapter owns protocol encoding.
 pub mod click_mode {
     pub const PICKUP: u8 = 0;

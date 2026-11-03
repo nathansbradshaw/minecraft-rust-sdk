@@ -101,6 +101,13 @@ physical controller, which sends ordinary player packets. Own observations and n
 actions remain available. `cancel_control` references that same character's
 durable action ID and has its own durable request ID. Inspect both IDs through
 normal action status. Cancellation releases input; gravity and momentum continue.
+An `observed` arrival must place the native feet pose strictly within 0.15 blocks
+of the requested target. The adapter and navigator share this arrival contract.
+The controller brakes before releasing input; post-release drift cannot silently
+widen the tolerance. Receipts retain the target and tolerance for inspection.
+Navigation retains a terminal, verified pose outside that target as
+`target_not_reached`, preserving the native outcome and retiring the intention
+without replay. Missing native proof or mismatched actor bindings stay fenced.
 The release is checked against fresh native poses without requiring a guaranteed
 safe landing. A legal action may cause ordinary fall damage or death.
 
