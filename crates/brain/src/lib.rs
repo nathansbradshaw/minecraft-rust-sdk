@@ -7,6 +7,7 @@ pub mod memory;
 pub mod model;
 pub mod output;
 pub mod progress;
+mod routing;
 pub mod tools;
 pub mod versions;
 pub mod views;
@@ -217,6 +218,8 @@ impl Journal {
             ("inspection_streak", "0"),
             ("investigation_remaining", "0"),
             ("needs_investigation", "false"),
+            ("develop_next", "false"),
+            ("development_turns_remaining", "0"),
         ] {
             tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
         }
@@ -837,7 +840,8 @@ impl Brain {
             fit_context(&mut context)?;
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
-            let develop = self.journal.get("develop_next")?.as_deref() == Some("true");
+            let develop = self.journal.take_development_turn()?;
+            self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
             let requested_goal = self.goal.clone();
             let requested_revision = self.journal.get("goal_revision")?.unwrap_or_default();
             let lanes = self.body.as_ref().map(|h| h.shared.model_lanes.clone());
@@ -887,8 +891,11 @@ impl Brain {
             if !choice.notes.is_empty() {
                 self.journal.set("working_notes", &choice.notes)?;
             }
-            if ["develop", "write", "terminal", "run"].contains(&choice.tool.as_str()) {
-                self.journal.set("develop_next", "true")?;
+            if choice.tool == "develop"
+                || (!develop
+                    && (choice.tool == "write" || (choice.tool == "terminal" && choice.experiment)))
+            {
+                self.journal.request_development()?;
             } else if choice.tool == "complete" {
                 self.journal.set("develop_next", "false")?;
             }
@@ -967,7 +974,9 @@ impl Brain {
                     self.journal.activity(&choice, &value)?;
                     if tool_failed(&value) && !goal_changed {
                         self.journal.set("needs_investigation", "true")?;
-                        self.journal.set("develop_next", "true")?;
+                        if !develop {
+                            self.journal.request_development()?;
+                        }
                         self.journal.set("development_request", "Investigate the last tool failure using its error and current observation. Do not repeat an unchanged rejected action; repair its precondition or the program first.")?;
                     }
                     self.journal
@@ -981,7 +990,9 @@ impl Brain {
                         "tool_result",
                         json!({"tool":choice.tool,"error":e.to_string()}),
                     )?;
-                    self.journal.set("develop_next", "true")?;
+                    if !develop {
+                        self.journal.request_development()?;
+                    }
                 }
             }
             if completed && self.cfg.exit_on_complete {
