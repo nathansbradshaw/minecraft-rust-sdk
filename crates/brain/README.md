@@ -96,6 +96,29 @@ Search includes older journal events and action receipts, so a short context
 window does not prevent the agent retrieving its actual action IDs. Source
 editing uses separate path and UTF-8 content fields without nested JSON source
 encoding. Completed tool activity persists across reasoning turns.
+
+Memory search uses bounded ranked word/stem matches instead of requiring the
+entire goal to occur as one substring. Results retain their origin, instance,
+dimension and historical observation revision. Agent-authored notes remain
+notes even when called facts; remembered locations need fresh observation, and
+live entity/menu/session handles are not retained as reusable observations.
+
+Rust experiments save content-addressed source before execution and associate
+the version with the resulting client diagnostics. Identical files share storage.
+Successful older `write` events can recover historical file candidates; a write
+is not proof that its source compiled or achieved a goal. New versions retain the
+Rust crate sources and Cargo manifests/lockfile within a 1 MiB capture budget.
+Capture failure is reported and does not prevent an experiment. Source existence
+and a successful exit never grant benchmark success or independent reliability.
+
+`minecraft-sdk-brain memory-index STATE` indexes existing successful writes
+without opening a character connection or calling a model. `memory-search STATE
+QUERY` retrieves labelled memories. `skill-inspect STATE VERSION` lists exact
+source/blob references; `skill-restore STATE WORKSPACE VERSION` first preserves
+current source, validates every hash, and restores files without executing them.
+Inspect dependencies, compile, obtain current observations and use new intention
+IDs for new work. Inspect/reconcile genuine interrupted intentions without replay.
+
 The latest tool result has a separate context budget so ordinary source output
 is not silently replaced by its abbreviated history. `minecraft-sdk-brain
 context STATE_DIRECTORY` prints the last exact model context for local debugging;

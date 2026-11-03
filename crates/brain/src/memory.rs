@@ -1,0 +1,265 @@
+//! Container-local recollection, never trusted gameplay or benchmark authority.
+use crate::{Journal, Observation, Result, digest, ensure, now};
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
+
+pub(crate) fn initialize(db: &Connection) -> Result<()> {
+    db.execute_batch("BEGIN IMMEDIATE;
+        CREATE INDEX IF NOT EXISTS events_kind_id ON events(kind,id);
+        CREATE TABLE IF NOT EXISTS memory_sources(memory_id INTEGER PRIMARY KEY, origin TEXT NOT NULL, provenance TEXT NOT NULL);
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(text, tokenize='porter unicode61');
+        CREATE TRIGGER IF NOT EXISTS memory_search_insert AFTER INSERT ON memory BEGIN INSERT INTO memory_search(rowid,text) VALUES(new.id,new.text); END;
+        CREATE TRIGGER IF NOT EXISTS memory_search_update AFTER UPDATE OF text ON memory BEGIN DELETE FROM memory_search WHERE rowid=old.id; INSERT INTO memory_search(rowid,text) VALUES(new.id,new.text); END;
+        INSERT INTO memory_search(rowid,text) SELECT id,text FROM memory WHERE id NOT IN (SELECT rowid FROM memory_search);
+        CREATE TABLE IF NOT EXISTS observed_places(key TEXT PRIMARY KEY, memory_id INTEGER NOT NULL, signature TEXT NOT NULL);
+        COMMIT;")?;
+    Ok(())
+}
+
+fn terms(query: &str) -> Vec<String> {
+    let mut words = std::collections::BTreeSet::new();
+    for word in query.split(|c: char| !c.is_alphanumeric()).take(256) {
+        let word = word.to_lowercase();
+        if word.len() >= 2
+            && word.len() <= 64
+            && ![
+                "the", "and", "from", "with", "that", "this", "then", "please", "resume", "into",
+                "both", "have", "has", "was", "are", "for", "its", "can", "get", "use", "verify",
+            ]
+            .contains(&word.as_str())
+        {
+            words.insert(word);
+        }
+        if words.len() == 24 {
+            break;
+        }
+    }
+    words.into_iter().collect()
+}
+
+fn preview(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text.to_owned();
+    }
+    let mut end = bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [historical text truncated]", &text[..end])
+}
+
+impl Journal {
+    pub(crate) fn remember_from(
+        &self,
+        kind: &str,
+        text: &str,
+        origin: &str,
+        provenance: &Value,
+    ) -> Result<i64> {
+        ensure(
+            ["fact", "report", "hypothesis", "episode", "skill"].contains(&kind),
+            "Memory kind required",
+        )?;
+        ensure(
+            !text.trim().is_empty() && text.len() <= 16384,
+            "Memory exceeds budget or is empty",
+        )?;
+        ensure(
+            provenance.to_string().len() <= 3072,
+            "Bounded memory provenance required",
+        )?;
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO memory(at,kind,text) VALUES(?1,?2,?3)",
+            params![now(), kind, text],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO memory_sources(memory_id,origin,provenance) VALUES(?1,?2,?3)",
+            params![id, origin, provenance.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn remember(&self, kind: &str, text: &str) -> Result<()> {
+        // Even a model note named 'fact' cannot manufacture SDK provenance.
+        self.remember_from(
+            kind,
+            text,
+            "agent_note",
+            &json!({"authority":"agent-authored note; not native evidence"}),
+        )?;
+        Ok(())
+    }
+
+    pub fn recall(&self, query: &str) -> Result<Value> {
+        ensure(query.len() <= 4096, "Bounded memory query required")?;
+        let words = terms(query);
+        let select = "SELECT m.id,m.at,m.kind,m.text,coalesce(s.origin,'legacy_agent_note'),coalesce(s.provenance,'{}') FROM memory m LEFT JOIN memory_sources s ON s.memory_id=m.id";
+        let fts = words
+            .iter()
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = if fts.is_empty() {
+            format!("{select} ORDER BY m.id DESC LIMIT 16")
+        } else {
+            format!(
+                "{select} JOIN memory_search ON memory_search.rowid=m.id WHERE memory_search MATCH ?1 ORDER BY bm25(memory_search),m.id DESC LIMIT 16"
+            )
+        };
+        let mut stmt = self.db.prepare(&sql)?;
+        let mut rows = if fts.is_empty() {
+            stmt.query([])?
+        } else {
+            stmt.query([fts])?
+        };
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let provenance: Value = serde_json::from_str(&row.get::<_, String>(5)?)?;
+            let value = json!({"id":row.get::<_,i64>(0)?,"at":row.get::<_,i64>(1)?,"kind":row.get::<_,String>(2)?,"text":preview(&row.get::<_,String>(3)?,600),"origin":row.get::<_,String>(4)?,"provenance":provenance,"binding":"historical; reobserve before using any location, menu, entity or inventory claim","native_authority":false});
+            if serde_json::to_vec(&result)?.len() + value.to_string().len() + 2 > 4800 {
+                continue;
+            }
+            result.push(value);
+            if result.len() == 8 {
+                break;
+            }
+        }
+        Ok(json!(result))
+    }
+
+    /// Store historical static discoveries, not live entity/menu handles. Only
+    /// changed observations create a new version; repeated clock ticks do not.
+    pub fn remember_observation(&self, instance: &str, o: &Observation) -> Result<()> {
+        let p = &o.player;
+        let provenance = json!({"instance_id":instance,"player_uuid":p["uuid"],"dimension":p["dimension"],"revision":o.revision,"sample_clock":o.world["sample_clock"],"authority":"SDK observation as seen by this client; historical, not current or external proof"});
+        let mut blocks: Vec<_> = o.world["blocks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| b["block"] != "minecraft:air" && b["block"].is_string())
+            .collect();
+        let distance = |b: &&Value| {
+            (0..3)
+                .map(|i| {
+                    (b["position"][i].as_f64().unwrap_or(1e9)
+                        - p["position"][i].as_f64().unwrap_or(0.))
+                    .powi(2)
+                })
+                .sum::<f64>()
+        };
+        blocks.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+        for block in blocks.into_iter().take(32) {
+            let key = digest(
+                json!([instance, p["dimension"], block["position"]])
+                    .to_string()
+                    .as_bytes(),
+            );
+            let signature = digest(
+                json!([block["block"], block["state"]])
+                    .to_string()
+                    .as_bytes(),
+            );
+            let previous = self.db.query_row(
+                "SELECT signature FROM observed_places WHERE key=?1",
+                [&key],
+                |r| r.get::<_, String>(0),
+            );
+            match previous {
+                Ok(old) if old == signature => continue,
+                Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let text = format!(
+                "Observed {} at {} in dimension {}",
+                block["block"].as_str().unwrap_or("unknown"),
+                block["position"],
+                p["dimension"]
+            );
+            let id = self.remember_from("fact", &text, "sdk_observation", &provenance)?;
+            self.db.execute("INSERT INTO observed_places(key,memory_id,signature) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET memory_id=excluded.memory_id,signature=excluded.signature",params![key,id,signature])?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn different_goal_phrasing_retrieves_labelled_memory_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.sqlite");
+        {
+            let j = Journal::open(&path).unwrap();
+            j.remember(
+                "report",
+                "A player reports spruce logs north of the village",
+            )
+            .unwrap();
+            j.remember(
+                "hypothesis",
+                "Crafting planks could unlock a wooden pickaxe",
+            )
+            .unwrap();
+            j.remember("fact", "A player claims entity7 carries diamonds")
+                .unwrap();
+        }
+        let j = Journal::open(&path).unwrap();
+        let rows = j.recall("Please collect a spruce log then return").unwrap();
+        assert_eq!(rows[0]["kind"], "report");
+        assert_eq!(rows[0]["origin"], "agent_note");
+        assert_eq!(
+            j.recall("Resume crafting the table and wooden pickaxe")
+                .unwrap()[0]["kind"],
+            "hypothesis"
+        );
+        let claimed = j.recall("diamonds").unwrap();
+        assert_eq!(claimed[0]["origin"], "agent_note");
+        assert_eq!(claimed[0]["native_authority"], false);
+        assert!(j.recall("\" OR memory_search:* [ ]").is_ok());
+    }
+    #[test]
+    fn discoveries_are_actor_scoped_historical_and_do_not_persist_live_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.sqlite");
+        let o = Observation {
+            revision: "sample-one".into(),
+            player: json!({"uuid":"own","dimension":"mod:forest","position":[1,64,2],"inventory":[{"slot":1,"item":"mod:berry","count":3}]}),
+            world: json!({"blocks":[{"block":"mod:tree","state":"grown","position":[1,64,2]}],"entities":[{"entity_id":7}],"sample_clock":{"epoch":"server","nanos":"100"}}),
+            menu: json!({"menu_id":9}),
+        };
+        {
+            let j = Journal::open(&path).unwrap();
+            j.remember_observation("first-instance", &o).unwrap();
+            j.remember_observation("first-instance", &o).unwrap();
+            assert_eq!(j.recall("tree").unwrap().as_array().unwrap().len(), 1);
+        }
+        let j = Journal::open(&path).unwrap();
+        let remembered = j.recall("tree").unwrap();
+        assert_eq!(remembered[0]["origin"], "sdk_observation");
+        assert_eq!(remembered[0]["provenance"]["dimension"], "mod:forest");
+        assert!(!remembered.to_string().contains("entity_id"));
+        assert!(!remembered.to_string().contains("menu_id"));
+        j.remember_observation("second-instance", &o).unwrap();
+        assert_eq!(j.recall("tree").unwrap().as_array().unwrap().len(), 2);
+    }
+    #[test]
+    fn retrieval_is_byte_bounded_without_cutting_provenance_or_identifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(&dir.path().join("brain.sqlite")).unwrap();
+        for _ in 0..24 {
+            j.remember("report", &format!("wood {}", "🪵".repeat(3000)))
+                .unwrap();
+        }
+        let result = j.recall("wood").unwrap();
+        assert!(result.to_string().len() <= 4800);
+        assert!(!result.as_array().unwrap().is_empty());
+        for row in result.as_array().unwrap() {
+            assert_eq!(row["origin"], "agent_note");
+            assert_eq!(row["native_authority"], false);
+        }
+    }
+}
