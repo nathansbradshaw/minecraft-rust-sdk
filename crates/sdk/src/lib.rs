@@ -251,7 +251,24 @@ impl Client {
                 )
             })?;
         let receipt = self.act(request).await?;
-        self.wait_receipt(&request.action_id, receipt, until).await
+        let receipt = self
+            .wait_receipt(&request.action_id, receipt, until)
+            .await?;
+        if receipt.outcome.terminal()
+            && let Action::CancelUseItem { action_id } | Action::CancelControl { action_id } =
+                &request.action
+        {
+            // The cancellation and the original intention have separate durable
+            // journal rows. Flush the original before its adapter slot is reused.
+            let original = self.action_status(action_id).await?;
+            if original.action_id != *action_id {
+                return Err(ApiError::new(
+                    ErrorCode::Conflict,
+                    "Cancelled action receipt identity changed",
+                ));
+            }
+        }
+        Ok(receipt)
     }
     /// Observe an already dispatched ID without resubmitting it.
     pub async fn wait_for_action(&self, id: &str, wait: Duration) -> Result<Receipt> {

@@ -64,6 +64,35 @@ fn action() -> ActionRequest {
 }
 
 #[tokio::test]
+async fn cancellation_flushes_both_durable_ids_using_reads_only() {
+    let (client, task) = peer(vec![
+        (Outcome::Running, "stable-action"),
+        (Outcome::Observed, "stable-action"),
+        (Outcome::Cancelled, "underlying-id"),
+    ])
+    .await;
+    let request = ActionRequest {
+        action_id: "stable-action".into(),
+        action: Action::CancelUseItem {
+            action_id: "underlying-id".into(),
+        },
+    };
+    assert_eq!(
+        client
+            .perform(&request, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .outcome,
+        Outcome::Observed
+    );
+    let methods = task.await.unwrap();
+    assert_eq!(methods.len(), 3);
+    assert!(methods[0].starts_with("POST "));
+    assert!(methods[1].contains("/actions/stable-action "));
+    assert!(methods[2].contains("/actions/underlying-id ") && methods[2].starts_with("GET "));
+}
+
+#[tokio::test]
 async fn waiting_for_delayed_completion_posts_once_and_only_reads_the_original_id() {
     let (client, task) = peer(vec![
         (Outcome::Running, "stable-action"),
