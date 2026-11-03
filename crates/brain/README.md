@@ -209,8 +209,30 @@ allowances. Restarting with the same contract does not reset that cost guard.
 
 `max_inspections_without_execution` defaults to eight (deployment range 1–64).
 The first unchanged inspection of a new goal counts toward that ceiling.
-Unchanged read/list/terminal inspections cannot spend the entire model allowance:
-source edits, SDK execution, inventory changes or completion reset this hint.
-At the ceiling, only execution inference waits for changed source or goal; body
-and conversation continue. Source fingerprints exclude compiler caches. This
-cost guard is not proof of useful gameplay; native evidence still decides gates.
+At that ceiling or a tool failure, Sol gets a bounded investigation phase
+(`investigation_turns`, default4, range1–8). It receives current observations and
+`last_experiment`, retained across subsequent file/log inspections. Terminal
+choices mark compilation/execution with `experiment: true`; existing callers
+without that field decode as false. Local-arbiter gameplay also identifies an
+experiment, independently of that declaration.
+
+Terminal feedback includes typed local action requests, current receipt outcomes,
+preserved IDs and inventory-count deltas. Pending receipt refresh is read-only
+and bounded to two seconds; it never reconciles or replays a mutation. The local
+trace keeps at most64records and returns at most16 per command, reporting omitted
+records. It covers only that arbiter: direct clients can bypass it. Neither this
+editable trace nor process exit can certify game effects or benchmark success.
+The authoritative action journal remains outside the container.
+The `run` tool takes an exact Cargo binary name, uses explicit `--bin` selection
+and returns up to four structured Rust compiler errors plus complete output-file
+references. Compilation and execution use the ordinary bounded container process
+group; this does not grant host execution or select a gameplay strategy.
+
+The per-subject diagnostic budget persists in SQLite, including when code is
+reverted or a controller restarts. Receipt IDs, elapsed time and printed clocks
+do not make a repeated failure novel. Changed code, meaningful game facts, a
+changed interface contract or a new task can open a different subject. Exhausted
+unchanged diagnosis records a defect boundary and stops polling that subject;
+body/chat and unrelated tasks continue. Source fingerprints exclude compiler
+caches. These cost hints are not evidence of useful gameplay; native evidence
+still decides gates.

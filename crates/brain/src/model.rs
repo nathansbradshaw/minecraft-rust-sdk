@@ -75,8 +75,10 @@ pub struct Choice {
     pub summary: String,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub experiment: bool,
 }
-pub const TOOLS: [&str; 13] = [
+pub const TOOLS: [&str; 14] = [
     "develop",
     "observe",
     "sdk",
@@ -87,12 +89,13 @@ pub const TOOLS: [&str; 13] = [
     "list",
     "search",
     "terminal",
+    "run",
     "remember",
     "goal",
     "complete",
 ];
 pub fn schema() -> Value {
-    json!({"type":"object","properties":{"tool":{"type":"string","enum":TOOLS},"input":{"type":"string","maxLength":10000},"path":{"type":"string","maxLength":256},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048}},"required":["tool","input","path","summary","notes"],"additionalProperties":false})
+    json!({"type":"object","properties":{"tool":{"type":"string","enum":TOOLS},"input":{"type":"string","maxLength":10000},"path":{"type":"string","maxLength":256},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
 pub struct Model {
     http: reqwest::Client,
@@ -158,7 +161,8 @@ impl Model {
                 4096,
             )
             .await?;
-        let choice: Choice = serde_json::from_str(&content)?;
+        let choice: Choice =
+            serde_json::from_str(&content).map_err(|e| format!("Invalid model tool JSON: {e}"))?;
         ensure(
             TOOLS.contains(&choice.tool.as_str())
                 && choice.input.len() <= 10000
@@ -215,7 +219,7 @@ impl Model {
             )?;
             bytes.extend(chunk);
         }
-        let envelope: Value = serde_json::from_slice(&bytes)?;
+        let envelope = response_envelope(status, &bytes)?;
         if status != 200 {
             return Err(Box::new(http_failure(status, &envelope, crate::now())));
         }
@@ -228,6 +232,17 @@ impl Model {
             json!({"model":model,"elapsed_ms":started.elapsed().as_millis(),"response_bytes":bytes.len(),"prompt_sha256":crate::digest(prompt.as_bytes()),"host_tools_executed":false}),
         ))
     }
+}
+fn response_envelope(status: u16, bytes: &[u8]) -> Result<Value> {
+    serde_json::from_slice(bytes).map_err(|_| {
+        // Proxy error pages may contain deployment information. Retain the
+        // HTTP boundary without copying untrusted response bodies into context.
+        Box::new(http_failure(
+            status,
+            &json!({"error":"non_json_response"}),
+            crate::now(),
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })
 }
 fn conversation_prompt(path: Option<&Path>) -> Result<String> {
     use std::io::Read;
@@ -254,6 +269,16 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn proxy_error_pages_preserve_status_without_leaking_the_response_or_retrying() {
+        let error = response_envelope(502, b"<html>private upstream detail</html>").unwrap_err();
+        assert_eq!(error.to_string(), "model_http_502: non_json_response");
+        assert_eq!(retry_at(error.as_ref()), None);
+        assert_eq!(
+            response_envelope(200, br#"{"done":true}"#).unwrap()["done"],
+            true
+        );
+    }
     #[test]
     fn conversation_prompt_can_change_atomically_without_reloading_the_player() {
         let dir = tempfile::tempdir().unwrap();
