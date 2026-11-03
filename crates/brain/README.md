@@ -6,6 +6,16 @@ It runs only in a non-root container. The trusted inference service returns data
 and source; it never receives host tool execution permission. SDK gateway/server
 credentials and authoritative journals remain outside the container.
 
+Local schema/range validation runs before a pending intention is recorded. For
+pre-fix invalid intentions, reconciliation requires a fresh authenticated gateway
+`not_found`, the matching character/instance/run journal, and an intention that
+still fails SDK validation. It records local bookkeeping recovery, never a game
+receipt or verified historical effect, and never replays the request. Valid but
+unconfirmed intentions retain normal uncertainty handling. The model's reconcile
+tool uses this path; `minecraft-sdk-brain reconcile-pending PRIVATE_CONFIG.json`
+also performs one scoped reconciliation without inference, with normal body and
+disconnect cleanup. It requires exclusive ownership of that controller state.
+
 Luna handles routine choices. Explicit development, code writes and failed
 routine experiments can request a Sol session of at most four decisions. The
 remaining session is saved before each inference request, so restarting does not
