@@ -327,7 +327,19 @@ impl Journal {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or(Value::Null);
-        compact_history(&mut value);
+        // The latest requested read is the tool's answer, not redundant receipt
+        // history. Its records have already been paged/bounded at the tool edge.
+        // Removing world here used to leave valid page counts with no records.
+        let requested_page = (value["tool"] == "observe"
+            && matches!(
+                value["result"]["view"].as_str(),
+                Some("blocks" | "entities" | "menu" | "inventory")
+            )
+            && value["result"]["page"].is_object())
+            || (value["tool"] == "query" && value["result"]["view"] == "capability_query");
+        if !requested_page {
+            compact_history(&mut value);
+        }
         Ok(value)
     }
     fn recent(&self) -> Result<Value> {
@@ -1744,6 +1756,56 @@ mod tests {
                 .unwrap()
                 .to_string()
                 .contains("durable-native-id")
+        );
+    }
+    #[test]
+    fn latest_focused_pages_survive_journal_and_model_context() {
+        let t = tempfile::tempdir().unwrap();
+        let j = Journal::open(&t.path().join("brain.sqlite")).unwrap();
+        let mut observation = Observation {
+            revision: "native-page".into(),
+            player: json!({"uuid":"actor","dimension":"custom:world","position":[3,64,9],"inventory":[]}),
+            world: json!({"blocks":[{"position":[4,64,9],"block":"custom:resource","state":"sample"}],"entities":[{"entity_id":73,"type":"minecraft:item","position":[4.5,64,9.5],"item":{"item":"custom:resource","count":2}}]}),
+            menu: json!({"menu_id":7,"state_id":8,"slots":[{"slot":0,"inventory_slot":0,"player_inventory":false,"item":"custom:result","count":1}]}),
+        };
+        observation.world["blocks"] = json!((0..64).map(|n|json!({"position":[n,64,9],"block":format!("custom:{}{n}","resource".repeat(24)),"state":"properties".repeat(20),"may_interact":true,"collision":[[0,0,0,1,1,1]]})).collect::<Vec<_>>());
+        observation.world["entities"] = json!((0..64).map(|n|json!({"entity_id":n,"type":"minecraft:item","position":[n,64,9],"item":{"item":format!("custom:{}{n}","resource".repeat(24)),"count":2}})).collect::<Vec<_>>());
+        for view in ["blocks", "entities", "menu", "inventory"] {
+            let page =
+                views::focused(&observation, &json!({"view":view,"limit":32}).to_string()).unwrap();
+            j.event("tool_result", json!({"tool":"observe","result":page}))
+                .unwrap();
+            let mut context = json!({"last_tool_result":j.last_result().unwrap(),"recent":vec!["old history ".repeat(1000);20],"observation":projection(&observation),"sdk_reference":include_str!("sdk.md"),"deployment_instructions":"rules ".repeat(300)});
+            for field in [
+                "server",
+                "memory",
+                "inspected_containers",
+                "completed_tool_activity",
+                "last_experiment",
+                "working_notes",
+                "player_request",
+                "development_request",
+            ] {
+                context[field] = json!("historical context ".repeat(500));
+            }
+            fit_context(&mut context).unwrap();
+            assert_eq!(
+                context["last_tool_result"]["result"], page,
+                "The requested {view} records and pagination must reach the model intact"
+            );
+        }
+        let query = json!({"view":"capability_query","result":{"world":{"blocks":[{"position":[4,64,9],"block":"custom:resource"}]}}});
+        j.event("tool_result", json!({"tool":"query","result":query}))
+            .unwrap();
+        assert_eq!(
+            j.last_result().unwrap()["result"],
+            query,
+            "Requested capability data is also retained"
+        );
+        j.event("tool_result",json!({"tool":"sdk","result":{"receipt":{"evidence":{"before":{"world":{"blocks":["large"]}},"after":{"world":{"blocks":["large"]}}}},"after":{"world":{"blocks":["large"]}}}})).unwrap();
+        assert!(
+            !j.last_result().unwrap().to_string().contains("large"),
+            "Full receipt history remains compacted"
         );
     }
     #[test]
