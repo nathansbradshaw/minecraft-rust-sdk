@@ -89,9 +89,15 @@ impl Handle {
                                 continue;
                             }
                         };
-                        sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;
                         journal.event("conversation_choice",json!({"reply":reply,"usage":usage}))?;
-                        if brain.conversation_goal(&reply,&requested_revision,&context["messages"])? {
+                        let selected=brain.conversation_goal(&reply,&requested_revision,&context["messages"])?;
+                        let current_revision=brain.get("goal_revision")?.unwrap_or_default();
+                        if retry_changed_goal(selected,&reply,&requested_revision,&current_revision) {
+                            journal.event("conversation_goal_superseded",json!({"requested_revision":requested_revision,"current_revision":current_revision,"retry_on_changed_revision":true,"acknowledgement_sent":false,"messages_retained":true}))?;
+                            continue;
+                        }
+                        sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;
+                        if selected {
                             brain.set("develop_next","false")?;
                             brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Rust program for composed work. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
                         } else {
@@ -126,5 +132,40 @@ impl Handle {
             .await??;
         }
         Ok(())
+    }
+}
+
+fn retry_changed_goal(
+    selected: bool,
+    reply: &crate::model::Conversation,
+    requested: &str,
+    current: &str,
+) -> bool {
+    !selected
+        && reply.goal_action == crate::model::GoalAction::Replace
+        && !reply.goal.trim().is_empty()
+        && requested != current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Conversation, GoalAction};
+    #[test]
+    fn only_a_changed_revision_retries_an_unaccepted_new_task() {
+        let mut reply = Conversation {
+            message: "I will collect it".into(),
+            goal_action: GoalAction::Replace,
+            goal: "collect wood".into(),
+            reason: "player request".into(),
+        };
+        assert!(retry_changed_goal(false, &reply, "old", "new"));
+        assert!(!retry_changed_goal(false, &reply, "same", "same"));
+        assert!(!retry_changed_goal(true, &reply, "old", "new"));
+        reply.goal_action = GoalAction::Continue;
+        assert!(!retry_changed_goal(false, &reply, "old", "new"));
+        reply.goal_action = GoalAction::Replace;
+        reply.goal.clear();
+        assert!(!retry_changed_goal(false, &reply, "old", "new"));
     }
 }
