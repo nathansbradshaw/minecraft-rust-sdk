@@ -98,18 +98,19 @@ async fn run() -> Result<()> {
         );
         return Ok(());
     }
-    if args.len() != 2 || args[0] != "run" {
+    if args.len() != 2 || (args[0] != "run" && args[0] != "reconcile-pending") {
         return Err(
-            "Usage: minecraft-sdk-brain run PRIVATE_CONFIG.json (inside isolated container)".into(),
+            "Usage: minecraft-sdk-brain run|reconcile-pending PRIVATE_CONFIG.json (inside isolated container)".into(),
         );
     }
+    let reconcile_only = args[0] == "reconcile-pending";
     let config: Config =
         serde_json::from_slice(&private_read(std::path::Path::new(&args[1]), 16384)?)?;
     if config.conversation && !config.body.enabled {
         return Err("Independent conversation requires the responsive body".into());
     }
     let mut brain = Brain::open(config).await?;
-    let conversation = if brain.cfg.conversation {
+    let conversation = if brain.cfg.conversation && !reconcile_only {
         match minecraft_sdk_brain::conversation::Handle::start(
             brain.cfg.clone(),
             brain
@@ -135,7 +136,15 @@ async fn run() -> Result<()> {
     let conversation_failed = conversation.as_ref().map(|h| h.failed.clone());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = tokio::select! {
-        result = brain.run() => result,
+        result = async {
+            if reconcile_only {
+                let id=brain.journal.get("pending_action")?.unwrap_or_default();
+                minecraft_sdk_brain::ensure(!id.is_empty(),"No pending local intention to reconcile")?;
+                let result=brain.settle(&id).await?;
+                println!("{}",serde_json::json!({"event":"pending_reconciliation_result","result":result,"model_requests":0,"mutation_replayed":false}));
+                Ok(())
+            } else {brain.run().await}
+        } => result,
         _ = terminate.recv() => Ok(()),
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = async {if let Some(body)=body {body.failed.notified().await;}else{std::future::pending::<()>().await;}} => Err("Background Survival controller stopped".into()),

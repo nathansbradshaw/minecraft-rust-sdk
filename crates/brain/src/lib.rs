@@ -1,5 +1,8 @@
 //! Container-local coding-agent harness. Trusted gameplay authority stays in SDK
 //! gateway/server components. Model completion claims never certify game effects.
+mod admission;
+#[cfg(test)]
+mod admission_tests;
 pub mod body;
 pub mod containers;
 pub mod conversation;
@@ -681,6 +684,9 @@ impl Brain {
         Ok(())
     }
     pub async fn act(&mut self, action: minecraft_sdk::Action) -> Result<Value> {
+        // A local schema/range failure never reached gateway admission. Record
+        // durable pending identity only after this same SDK validator accepts it.
+        action.validate()?;
         let safety = self.body.as_ref().map(|h| h.shared.clone());
         let _guard = if let Some(s) = &safety {
             ensure(
@@ -707,7 +713,21 @@ impl Brain {
         );
         let cancelling = matches!(&action,minecraft_sdk::Action::CancelControl{action_id}|minecraft_sdk::Action::CancelUseItem{action_id} if action_id==&previous);
         if !previous.is_empty() && !independent && !cancelling {
-            self.inspect(&previous).await?;
+            if let Err(error) = self.inspect(&previous).await {
+                let recovered = match error.downcast_ref::<minecraft_sdk::ApiError>() {
+                    Some(error) => admission::reconcile_invalid(
+                        &self.journal,
+                        &previous,
+                        &self.server.instance_id,
+                        self.observed.player["uuid"].as_str().unwrap_or_default(),
+                        error,
+                    )?,
+                    None => None,
+                };
+                if recovered.is_none() {
+                    return Err(error);
+                }
+            }
             previous = self.journal.get("pending_action")?.unwrap_or_default();
         }
         ensure(
@@ -771,7 +791,21 @@ impl Brain {
         Ok(receipt)
     }
     pub async fn settle(&mut self, id: &str) -> Result<Value> {
-        let receipt = self.client.action_status(id).await?;
+        let receipt = match self.client.action_status(id).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some(proof) = admission::reconcile_invalid(
+                    &self.journal,
+                    id,
+                    &self.server.instance_id,
+                    self.observed.player["uuid"].as_str().unwrap_or_default(),
+                    &error,
+                )? {
+                    return Ok(proof);
+                }
+                return Err(error.into());
+            }
+        };
         let receipt = if receipt.outcome.terminal() || receipt.outcome == Outcome::Running {
             receipt
         } else {
