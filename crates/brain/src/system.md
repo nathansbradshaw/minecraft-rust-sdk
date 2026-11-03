@@ -145,6 +145,9 @@ attack {entity}; interact {entity,hand}; sprint/sneak {enabled}; respawn;
 click_slot {menu_id,state_id,slot,button,mode}; craft {recipe,menu_id,make_all};
 close_menu {menu_id}; drop_selected {entire_stack}; chat {message}.
 Include "kind" for every action. Inspect the SDK source/docs for exact versions.
+For place/use_block, hit is a block-local offset in0..1 on every axis; block is
+the clicked integer world coordinate. Absolute world coordinates in hit are
+invalid. The JSON action kind is place, not place_block.
 Movement returns running, then observed/cancelled/expired/failed; poll status or
 observe its progress. The background Survival controller may cancel movement
 and defer new program actions while evading. Continue coding/chatting; inspect

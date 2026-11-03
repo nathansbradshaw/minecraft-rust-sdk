@@ -1,5 +1,11 @@
 # Observed menu intentions
 
+For block interaction, SDK JSON uses `place` and `use_block`. `block` identifies
+the clicked block in integer world coordinates; `hit` is a relative offset within
+that block, with each coordinate in0..1. Face0 is down,1 up,2 north,3 south,4 west
+and5 east. A top-face offset can be `[0.5, 1.0, 0.5]`. Absolute world coordinates
+in `hit` are locally invalid. Use fresh observations and verify the native effect.
+
 The optional Rust `menu` helpers build actions; they do not dispatch, select a
 strategy or replay a mutation. Supply runtime recipe/item IDs and observed slot
 identifiers. No menu layout, material, server address or mod list is built in.

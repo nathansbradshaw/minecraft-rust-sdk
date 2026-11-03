@@ -32,6 +32,12 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   finite, ordinary movement. Action::CancelControl { action_id:String } cancels
   that control. Legacy Move, Jump and MotionFrame are disabled in protected
   coding deployments; old examples using them require adaptation.
+- Block interaction JSON uses kind `place` or `use_block`, not `place_block`.
+  block is the clicked block's integer world position. hit is a block-local
+  [x,y,z] offset with every coordinate in0..1, not an absolute world position.
+  Face numbers are0 down,1 up,2 north,3 south,4 west,5 east; for example a
+  top-face hit can be [0.5,1.0,0.5]. Use a fresh observed target and normal reach;
+  a valid request still needs its own native effect verification.
 - client.act(&ActionRequest{action_id:String,action}).await? returns Receipt.
   Outcome::Running means poll client.action_status(&id).await? until terminal.
   client.perform(&request, Duration::from_secs(10)).await? dispatches once and
@@ -41,6 +47,9 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   inventory transfer and entity interactions as well as finite controls.
   Observed verifies the requested effect. Cancelled, Expired, Failed and Rejected
   are feedback, not success. Reobserve/replan after defensive cancellation.
+- Observed dig start proves mining began; observed finish proves a block-state
+  change. Neither proves item acquisition. Player inventory is the evidence for
+  retained drops; visible item-entity positions are observations, not inventory.
 - StartUseItem { hand:Hand, max_ticks:u16 } holds use for a finite native-tick
   budget; CancelUseItem { action_id:String } releases that action's held input.
   Legacy UseItem is also bounded by the deployment control budget. Using an item
