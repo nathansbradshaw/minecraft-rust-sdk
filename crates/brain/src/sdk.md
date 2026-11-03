@@ -9,6 +9,28 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
 - Import Client, Profile, Action, ActionRequest, Position, Outcome. Load Profile
   from MC_SDK_PROFILE; Client::with_profile(&profile) uses its existing session.
   Generated programs must not connect/disconnect the harness's character.
+  Profile is a Serde data type: deserialize the JSON file rather than calling
+  Profile::load (that method does not exist). This connected-session bootstrap
+  uses the same API as crates/sdk/examples/observe.rs:
+
+  ```rust
+  use minecraft_sdk::{Client, Profile};
+  #[tokio::main]
+  async fn main() -> Result<(), Box<dyn std::error::Error>> {
+      let path = std::env::var_os("MC_SDK_PROFILE").ok_or("MC_SDK_PROFILE missing")?;
+      let profile: Profile = serde_json::from_slice(&std::fs::read(path)?)?;
+      let client = Client::with_profile(&profile)?;
+      client.verify_instance(&profile.instance_id).await?;
+      let observed = client.observe().await?;
+      println!("revision={} health={}", observed.revision, observed.player["health"]);
+      Ok(())
+  }
+  ```
+
+  Keep profile/key/session contents private. Source lookup: Profile and Client
+  are defined near the beginning of crates/sdk/src/lib.rs; Action and Observation
+  are re-exported from crates/core/src/lib.rs. Read narrow relevant ranges when a
+  broad search preview omits the middle of its saved output.
 - Observation.player and .world are serde_json::Value; .revision is String.
   player.position is exactly [x,y,z]. A compact context is a sample; a program can
   inspect client.observe().await? for full local facts and collision geometry.
