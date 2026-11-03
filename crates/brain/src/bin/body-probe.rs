@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     let run=async {
         if args[1]=="compile" {
             let compiler_started=Instant::now();
-            let result=tools::terminal(&mut brain,"cd /workspace/brain/source && cargo build --offline --release -p minecraft-sdk-brain --bin minecraft-sdk-brain").await?;
+            let result=tools::terminal(&mut brain,"cargo build --offline --message-format=json").await?;
             brain.journal.event("body_probe_compiler",json!({"result":result,"elapsed_ms":compiler_started.elapsed().as_millis(),"success_is_not_survival_proof":true}))?;
             // A failed compiler is also a required resilience case. Preserve its
             // error and keep the body running for the declared trial duration.

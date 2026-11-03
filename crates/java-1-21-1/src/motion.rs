@@ -869,6 +869,24 @@ mod tests {
         o
     }
     #[test]
+    fn submerged_held_input_can_surface_without_a_sticky_ground_jump() {
+        let mut o = input_prediction_fixture();
+        o.player["in_water"] = json!(true);
+        o.player["on_ground"] = json!(false);
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            row["block"] = json!(if row["position"][1] == 1 {
+                "minecraft:water"
+            } else {
+                "minecraft:air"
+            });
+        }
+        let frames = control::preview(&o, [0.5, 2., 0.5], false).unwrap();
+        assert!(frames.len() < 100);
+        assert!((frames.last().unwrap().0[1] - 2.).abs() < 0.08);
+        o.player["velocity"] = json!([0.03, -0.02, 0.01]);
+        assert!(control::preview(&o, [0.5, 2., 0.5], false).is_ok());
+    }
+    #[test]
     fn input_preview_rejects_the_native_diagonal_gap_that_constant_speed_admitted() {
         let o = diagonal_gap_fixture();
         assert!(

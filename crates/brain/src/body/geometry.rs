@@ -131,6 +131,135 @@ pub fn threatened(o: &Observation) -> bool {
                 })
         })
 }
+/// Immersion needs an independent body even before damage or a hostile appears.
+pub fn water_danger(o: &Observation) -> bool {
+    o.player["in_water"] == true
+}
+
+/// Local policy, not permission or a path-completion claim. Prefer an observed
+/// dry landing; when air is low, first raise the eyes into observed air. Water
+/// is allowed along this route, but unknown cells, other hazards and collisions
+/// are not. The adapter separately admits the real held-input trajectory.
+fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
+    if !water_danger(o) {
+        return None;
+    }
+    let start = point(&o.player["position"])?;
+    let cells: Cells<'_> = o.world["blocks"]
+        .as_array()?
+        .iter()
+        .filter_map(|b| point(&b["position"]).map(|p| (p.map(|v| v as i32), b)))
+        .collect();
+    let obstacles = boxes(o);
+    let passable = |p: [f64; 3]| {
+        for x in [(p[0] - 0.3).floor() as i32, (p[0] + 0.3).floor() as i32] {
+            for z in [(p[2] - 0.3).floor() as i32, (p[2] + 0.3).floor() as i32] {
+                for y in p[1].floor() as i32..=(p[1] + 1.8).floor() as i32 {
+                    if block(&cells, [x, y, z])
+                        .is_none_or(|b| b["block"] != "minecraft:water" && hazardous(b))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        !obstacles.iter().any(|b| intersects(p, b))
+    };
+    let mut candidates = Vec::new();
+    let mut shores = Vec::new();
+    for b in &obstacles {
+        let p = [(b[0] + b[3]) / 2., b[4], (b[2] + b[5]) / 2.];
+        candidates.push(p);
+        if supported(&cells, p, &obstacles) && clear(&cells, p, &obstacles) {
+            shores.push(p);
+        }
+    }
+    for rise in [0.5, 1., 1.5, 2.] {
+        candidates.push([start[0], start[1] + rise, start[2]]);
+        for n in 0..16 {
+            let angle = f64::from(n) * std::f64::consts::PI / 8.;
+            for length in [0.8, 1.6, 2.4] {
+                candidates.push([
+                    start[0] + angle.cos() * length,
+                    start[1] + rise,
+                    start[2] + angle.sin() * length,
+                ]);
+            }
+        }
+    }
+    let low_air = o.player["air"].as_i64().is_some_and(|n| n < 100);
+    let shore_distance = |p: [f64; 3]| {
+        shores
+            .iter()
+            .map(|q| (p[0] - q[0]).hypot(p[2] - q[2]))
+            .fold(8., f64::min)
+    };
+    let start_shore_distance = shore_distance(start);
+    let mut best: Option<(f64, Escape)> = None;
+    for p in candidates {
+        let horizontal = (p[0] - start[0]).hypot(p[2] - start[2]);
+        let rise = p[1] - start[1];
+        if horizontal > 3.
+            || !(-0.05..=2.01).contains(&rise)
+            || (horizontal < 0.1 && rise < 0.1)
+            || blocked.contains(&target_key(p))
+            || ![0., 0.6].into_iter().any(|arc| {
+                (0..=24).all(|i| {
+                    let t = f64::from(i) / 24.;
+                    let mut q =
+                        std::array::from_fn(|axis| start[axis] + (p[axis] - start[axis]) * t);
+                    q[1] += arc * (std::f64::consts::PI * t).sin();
+                    passable(q)
+                })
+            })
+        {
+            continue;
+        }
+        let eye = [
+            p[0].floor() as i32,
+            (p[1] + 1.62).floor() as i32,
+            p[2].floor() as i32,
+        ];
+        let breathable = block(&cells, eye).is_some_and(|b| !hazardous(b));
+        let dry = supported(&cells, p, &obstacles) && clear(&cells, p, &obstacles);
+        if !breathable && !dry && rise < 0.1 {
+            continue;
+        }
+        let score = if breathable {
+            if low_air { 100. } else { 20. }
+        } else {
+            0.
+        } + if dry { 50. } else { 0. }
+            + rise * 2.
+            - horizontal
+            + (start_shore_distance - shore_distance(p)) * 4.
+            - if breathable { rise * 3. } else { 0. };
+        if best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((
+                score,
+                Escape {
+                    target: Position {
+                        x: p[0],
+                        y: p[1],
+                        z: p[2],
+                    },
+                    // Upward water steering holds swim input; a ground-jump request
+                    // must not persist into the next grounded phase.
+                    jump: false,
+                    reason: if dry {
+                        "leave water for observed dry support"
+                    } else if breathable {
+                        "swim toward observed breathing space"
+                    } else {
+                        "swim upward through observed water"
+                    }
+                    .into(),
+                },
+            ));
+        }
+    }
+    best.map(|(_, route)| route)
+}
 // A descent is not a diagonal ramp through the ground. Validate the observed
 // surfaces under each footprint sample and its vertical clearance; the finite
 // server control still validates the actual collision/gravity trajectory.
@@ -259,6 +388,9 @@ pub(super) fn evade_with_stationary(
     blocked: &[[i32; 3]],
     stationary: &[String],
 ) -> Option<Escape> {
+    if water_danger(o) {
+        return water_escape(o, blocked);
+    }
     let start = point(&o.player["position"])?;
     let mut threats = Vec::new();
     let mut projectile_danger = false;
@@ -451,6 +583,85 @@ mod tests {
             world: json!({"blocks":blocks,"entities":[{"visible":true,"hostile":true,"position":[2.5,1.,0.5]}]}),
             menu: Value::Null,
         }
+    }
+    fn pool() -> Observation {
+        let mut o = world();
+        o.player = json!({"position":[0.5,1.,0.5],"on_ground":false,"in_water":true,"air":40,"max_air":300});
+        o.world["entities"] = json!([]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if (1..=2).contains(&b["position"][1].as_i64().unwrap()) {
+                b["block"] = json!("minecraft:water");
+            }
+        }
+        o
+    }
+    #[test]
+    fn water_without_hostiles_still_requires_a_breathing_route() {
+        let o = pool();
+        assert!(!threatened(&o));
+        assert!(water_danger(&o));
+        let route = evade(&o).expect("Submerged idle players must surface independently");
+        assert!(!route.jump);
+        assert!(route.target.y > 1.);
+        assert!(route.target.y + 1.62 >= 3.);
+        assert_eq!(route.target.x, 0.5);
+        assert_eq!(route.target.z, 0.5);
+    }
+    #[test]
+    fn water_escape_does_not_invent_air_or_swim_through_a_ceiling() {
+        let mut o = pool();
+        o.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["position"][1] != 3);
+        assert!(
+            evade(&o).is_none(),
+            "Unknown overhead cells are not breathable evidence"
+        );
+        let mut o = pool();
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][1] == 3 {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        assert!(evade(&o).is_none());
+    }
+    #[test]
+    fn a_reachable_dry_bank_beats_remaining_in_water() {
+        let mut o = pool();
+        o.player["position"] = json!([0.5, 2., 0.5]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = &b["position"];
+            if p[0].as_i64().unwrap() >= 2 && p[1] == 1 {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            } else if p[0].as_i64().unwrap() >= 2 && p[1] == 2 {
+                b["block"] = json!("minecraft:air");
+            }
+        }
+        let route = evade(&o).unwrap();
+        assert!(route.target.x >= 2.);
+        assert_eq!(route.target.y, 2.);
+        assert!(route.reason.contains("dry support"));
+        o.player["in_water"] = json!(false);
+        assert!(evade(&o).is_none());
+    }
+    #[test]
+    fn a_bank_beyond_one_control_pulls_the_surfacing_waypoint_toward_shore() {
+        let mut o = pool();
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][0] == 4 && (1..=2).contains(&b["position"][1].as_i64().unwrap()) {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let route = evade(&o).unwrap();
+        assert!(
+            route.target.x > 1.,
+            "Surfacing must also progress toward the observed shore"
+        );
+        assert!(route.target.y + 1.62 >= 3.);
     }
     #[test]
     fn a_narrow_lower_landing_across_a_gap_uses_an_observed_jump_target() {
