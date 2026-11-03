@@ -10,6 +10,10 @@ public final class SdkMod {
             try{var service=new SdkService(event.getServer());NativeBlockSearch.install(service);SdkService.active=service;}
             catch(Exception failure){throw new IllegalStateException("SDK integration failed closed",failure);}
         });
-        NeoForge.EVENT_BUS.addListener((ServerStoppingEvent event)->{var service=SdkService.active;SdkService.active=null;if(service!=null)service.close();});
+        NeoForge.EVENT_BUS.addListener((ServerStoppingEvent event)->{
+            var service=SdkService.active;
+            if(service!=null){for(var player:java.util.List.copyOf(event.getServer().getPlayerList().getPlayers()))SessionMaterials.close(service,player);}
+            SdkService.active=null;if(service!=null)service.close();
+        });
     }
 }
