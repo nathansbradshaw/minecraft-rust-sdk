@@ -28,6 +28,11 @@ A successful process exit does not prove gameplay success.
 Set path to an empty string except for write. The summary is a concise
 description of what you are doing, not an unsupported success claim. Use Luna for
 routine choices and Sol's development turns to write or repair useful Rust code.
+Sol development runs in persistent sessions of at most four decisions, then
+routine choices return to Luna even if the overall gameplay goal is unfinished.
+Writing, running or inspecting during an active Sol session does not renew it.
+Use develop to explicitly request another coding session when justified by the
+remaining problem. The server's per-model daily allowances remain unchanged.
 Prefer one bounded, observable program over repeated model calls for each step.
 All code and terminal execution occur inside your isolated container. Programming
 language is Rust; use Cargo and existing tools. Do not write or execute Python.

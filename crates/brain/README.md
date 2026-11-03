@@ -6,6 +6,14 @@ It runs only in a non-root container. The trusted inference service returns data
 and source; it never receives host tool execution permission. SDK gateway/server
 credentials and authoritative journals remain outside the container.
 
+Luna handles routine choices. Explicit development, code writes and failed
+routine experiments can request a Sol session of at most four decisions. The
+remaining session is saved before each inference request, so restarting does not
+renew it. Inspections, successful existing programs and further writes during
+that session do not replenish it. The next routine decision returns to Luna;
+`develop` can explicitly request further coding work. Provider admission budgets
+and body/conversation execution remain independent of this scheduling hint.
+
 The `observe` tool accepts an empty input for a compact overview, or a JSON query
 such as `{"view":"menu","limit":16}` or
 `{"view":"entities","match_id":"minecraft:item"}`. Views `menu`, `inventory`,
