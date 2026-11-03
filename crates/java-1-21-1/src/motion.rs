@@ -508,8 +508,10 @@ impl Actor {
                         let accel = if p.medium == Medium::Air {
                             if body.on_ground {
                                 speed * 0.21600002 / friction.max(0.01).powi(3)
+                            } else if p.sprinting {
+                                0.026
                             } else {
-                                if p.sprinting { 0.026 } else { 0.02 }
+                                0.02
                             }
                         } else {
                             0.02
