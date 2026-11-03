@@ -58,6 +58,8 @@ pub enum ErrorCode {
     Unauthorized,
     Revoked,
     Conflict,
+    /// Container-local arbiter refused before forwarding any gameplay request.
+    LocalPreempted,
     SessionRequired,
     ServerFull,
     UnsupportedVersion,
@@ -441,7 +443,7 @@ pub struct Observation {
     pub world: Value,
     pub menu: Value,
 }
-pub const LOCAL_CONTROL_VERSION: u32 = 1;
+pub const LOCAL_CONTROL_VERSION: u32 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalActionRequest {

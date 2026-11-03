@@ -99,7 +99,35 @@ fn fingerprint(root: &Path, state: Option<&Path>) -> Result<String> {
 }
 
 pub fn executed(tool: &str, result: &serde_json::Value, before: &str, after: &str) -> bool {
+    let navigation_moved = tool == "navigate"
+        && result["position_before"]
+            .as_array()
+            .zip(result["position_after"].as_array())
+            .is_some_and(|(before, after)| {
+                before.len() == 3
+                    && after.len() == 3
+                    && (0..3)
+                        .map(|i| {
+                            before[i]
+                                .as_f64()
+                                .zip(after[i].as_f64())
+                                .map(|(a, b)| (a - b).powi(2))
+                                .unwrap_or(0.)
+                        })
+                        .sum::<f64>()
+                        > 0.04
+            })
+        && result["local_action_feedback"]["requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| {
+                row["request"]["action"]["kind"] == "start_move"
+                    && row["response"]["outcome"] == "observed"
+                    && row["response"]["native_effect_verified"] == true
+            });
     before != after
+        || navigation_moved
         || tool == "complete"
         || (tool == "sdk" && !crate::tool_failed(result))
         || result["inventory_changed"] == true
@@ -120,6 +148,18 @@ pub fn next_inspection_count(previous: u32, same_goal: bool, executed: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn navigation_cost_guard_requires_observed_own_movement_not_exit_zero_or_body_motion() {
+        let mut result = json!({"success":true,"position_before":[0,64,0],"position_after":[2,64,0],"local_action_feedback":{"requests":[]}});
+        assert!(!executed("navigate", &result, "same", "same"));
+        result["local_action_feedback"]["requests"] = json!([{"request":{"action":{"kind":"start_move"}},"response":{"outcome":"running","native_effect_verified":false}}]);
+        assert!(!executed("navigate", &result, "same", "same"));
+        result["local_action_feedback"]["requests"][0]["response"] =
+            json!({"outcome":"observed","native_effect_verified":true});
+        assert!(executed("navigate", &result, "same", "same"));
+        result["position_after"] = json!([0, 64, 0]);
+        assert!(!executed("navigate", &result, "same", "same"));
+    }
     #[test]
     fn new_receipt_ids_and_wall_clocks_do_not_masquerade_as_new_information() {
         let mut result = json!({"success":true,"exit_code":0,"local_action_feedback":{"requests":[{"request":{"action_id":"first","action":{"kind":"dig","block":{"x":1,"y":2,"z":3},"face":1,"stage":"start"}},"response":{"action_id":"first","outcome":"uncertain","native_effect_verified":false}}]}});

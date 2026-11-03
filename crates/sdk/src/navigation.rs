@@ -679,8 +679,37 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
         j.save()?;
         // Persist before dispatch. Even an interrupted HTTP request is inspected
         // on the next invocation; it is never automatically submitted again.
-        client.act(&request).await?;
+        if let Err(error) = client.act(&request).await {
+            if let Some(report) = retire_local_preemption(client, j, &error)? {
+                return Ok(report);
+            }
+            // Network errors and remote failures cannot prove non-dispatch.
+            // Retain the exact pending ID for inspection/reconciliation.
+            return Err(error);
+        }
     }
+}
+
+fn retire_local_preemption(
+    client: &Client,
+    j: &mut Journal,
+    error: &ApiError,
+) -> Result<Option<Report>> {
+    if client.local_arbiter.is_none() || error.code != ErrorCode::LocalPreempted {
+        return Ok(None);
+    }
+    let mut attempt = j
+        .state
+        .pending
+        .take()
+        .ok_or_else(|| local("Local rejected intention vanished"))?;
+    attempt.outcome = Some(Outcome::Rejected);
+    attempt.arrival_verification = Some(
+        serde_json::json!({"kind":"local_pre_dispatch_rejection","native_effect_verified":false,"gateway_dispatch_attempted":false,"error":error}),
+    );
+    j.state.history.push(attempt);
+    j.save()?;
+    Ok(Some(j.report("preempted","Body rejected this intention before gateway dispatch. It was retained as a local rejection, not a native receipt. Resume after changed conditions with a new intention; this ID was not replayed.")))
 }
 
 #[cfg(test)]
@@ -782,6 +811,72 @@ mod tests {
         })
         .unwrap()
         .without_local_arbiter()
+    }
+    #[test]
+    fn only_explicit_local_pre_dispatch_rejection_retires_pending_without_native_claims() {
+        let temp = Temp::new();
+        let path = temp.0.join("nav.json");
+        let mut j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+        j.state.pending = Some(Attempt {
+            request: ActionRequest {
+                action_id: "local-denial".into(),
+                action: Action::StartMove {
+                    target: Position {
+                        x: 1.5,
+                        y: 1.,
+                        z: 0.5,
+                    },
+                    jump: false,
+                    max_ticks: 60,
+                },
+            },
+            origin: [0.5, 1., 0.5],
+            scene: "fixture".into(),
+            target: [1.5, 1., 0.5],
+            outcome: None,
+            arrival_verification: None,
+        });
+        j.save().unwrap();
+        let mut client = client("http://127.0.0.1:1".into());
+        let denied = error(ErrorCode::LocalPreempted, "No gateway dispatch");
+        assert!(
+            retire_local_preemption(&client, &mut j, &denied)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            j.state.pending.is_some(),
+            "a remote error cannot establish non-dispatch"
+        );
+        client.local_arbiter = Some(temp.0.join("body.sock"));
+        for code in [
+            ErrorCode::Conflict,
+            ErrorCode::Internal,
+            ErrorCode::UncertainOutcome,
+        ] {
+            assert!(
+                retire_local_preemption(&client, &mut j, &error(code, "ambiguous"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(j.state.pending.is_some());
+        }
+        let report = retire_local_preemption(&client, &mut j, &denied)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.status, "preempted");
+        assert!(report.pending_action.is_none());
+        drop(j);
+        let j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+        assert_eq!(j.state.history.len(), 1);
+        assert_eq!(j.state.history[0].request.action_id, "local-denial");
+        let evidence = j.state.history[0].arrival_verification.as_ref().unwrap();
+        assert_eq!(evidence["gateway_dispatch_attempted"], false);
+        assert_eq!(evidence["native_effect_verified"], false);
+        assert!(
+            j.state.blocked.is_empty(),
+            "arbitration did not evaluate physical feasibility"
+        );
     }
     #[tokio::test]
     async fn terminal_target_miss_is_retained_without_replay_while_unbound_receipts_stay_fenced() {

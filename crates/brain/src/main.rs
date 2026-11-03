@@ -11,6 +11,9 @@ async fn main() {
 }
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "navigation-worker" {
+        return minecraft_sdk_brain::navigation::worker(std::path::Path::new(&args[1])).await;
+    }
     if args.len() == 2 && args[0] == "container-memory" {
         let cfg: Config =
             serde_json::from_slice(&private_read(std::path::Path::new(&args[1]), 16384)?)?;

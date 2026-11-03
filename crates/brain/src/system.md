@@ -90,6 +90,17 @@ Tools and input:
   authority, install plugins or count as completed work.
 - sdk: a JSON string containing one typed Minecraft SDK Action. The harness creates
   and journals its action ID. Fields are those of the SDK Action enum; no actor ID.
+- navigate: a typed SDK navigation goal as JSON. For distant observed targets,
+  prefer this over a single start_move or manually paging movement_options.
+  Position goal: {"kind":"position","dimension":"runtime:dimension","target":[x,y,z],"distance":0.5}.
+  Interaction pose: {"kind":"block_reach","dimension":"runtime:dimension","block":[x,y,z],"distance":4.0,"eye_height":1.62}.
+  Use actual dimension/coordinates; upright Java players normally use eye_height
+  1.62. The existing Rust helper runs in a protected child for at most thirty
+  seconds per call with a persistent goal journal. Inspect navigation.report and
+  current position. Reached proves only an interaction pose, never collection.
+  Partial movement or uncertainty retains IDs; resuming the same goal inspects
+  pending work without replay. The body can preempt finite movement for danger.
+  This helper does not mine, place blocks, teleport or change your task.
 - status: an action ID from an actual receipt.
 - reconcile: an existing uncertain action ID. This inspects current state, never
   replays the mutation and never proves its historical effect.

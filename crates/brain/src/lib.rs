@@ -6,6 +6,7 @@ pub mod conversation;
 pub mod feedback;
 pub mod memory;
 pub mod model;
+pub mod navigation;
 pub mod output;
 pub mod progress;
 mod routing;
@@ -357,7 +358,7 @@ impl Journal {
         Ok(json!(out))
     }
     fn activity(&self, choice: &model::Choice, result: &Value) -> Result<()> {
-        if !["sdk", "write", "terminal", "run"].contains(&choice.tool.as_str())
+        if !["sdk", "write", "terminal", "run", "navigate"].contains(&choice.tool.as_str())
             || tool_failed(result)
         {
             return Ok(());
