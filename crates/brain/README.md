@@ -151,6 +151,13 @@ independent body can preempt gameplay while compilation continues. Use finite
 after danger clears; they do not retain a character-wide action lease.
 
 The `conversation` option defaults to true and requires the responsive body.
+Conversation output explicitly chooses `goal_action: "continue"` or `"replace"`.
+Continuation leaves goal revisions, development mode, completion and inspection
+state intact, even if a model repeats the goal text. Repeating an active goal is
+also continuation; a fresh request for the same completed task creates new work.
+Replacement is conditional on the revision seen by conversation inference, so
+a delayed reply cannot overwrite a newer task. All delivered chat still reaches
+conversation context, including join/leave notices and ordinary player requests.
 It uses Luna only when new chat arrives and runs independently of Sol and terminal
 work. `await_chat_goal: true` waits for a player-supplied goal and waits again after
 completion, instead of spending inference on an unchanged idle condition. Its

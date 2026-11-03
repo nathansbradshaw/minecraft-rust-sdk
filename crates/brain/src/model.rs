@@ -98,10 +98,17 @@ pub struct Model {
     http: reqwest::Client,
     endpoint: String,
 }
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalAction {
+    Continue,
+    Replace,
+}
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Conversation {
     pub message: String,
+    pub goal_action: GoalAction,
     pub goal: String,
     pub reason: String,
 }
@@ -163,7 +170,7 @@ impl Model {
         Ok((choice, usage))
     }
     pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {
-        let format = json!({"type":"object","properties":{"message":{"type":"string","maxLength":256},"goal":{"type":"string","maxLength":2048},"reason":{"type":"string","maxLength":512}},"required":["message","goal","reason"],"additionalProperties":false});
+        let format = json!({"type":"object","properties":{"message":{"type":"string","maxLength":256},"goal_action":{"type":"string","enum":["continue","replace"]},"goal":{"type":"string","maxLength":2048},"reason":{"type":"string","maxLength":512}},"required":["message","goal_action","goal","reason"],"additionalProperties":false});
         let (content, usage) = self
             .request(
                 context,
