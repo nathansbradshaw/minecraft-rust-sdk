@@ -1447,12 +1447,6 @@ fn dispatch(
                             "Control duration exceeds this deployment's advertised limit",
                         ));
                     }
-                    if before.player["on_ground"] != true {
-                        return Err(ApiError::new(
-                            ErrorCode::UnsupportedCapability,
-                            "This finite waypoint adapter currently requires observed ground support",
-                        ));
-                    }
                     let planning_started = Instant::now();
                     let job = control::Job::start(
                         player,

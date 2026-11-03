@@ -761,6 +761,16 @@ impl Actor {
                 "Target exceeds the currently observed local waypoint range",
             ));
         }
+        let mut predicted = before.clone();
+        predicted.player["position"] = json!(e.body.position);
+        predicted.player["velocity"] = json!(e.body.velocity);
+        predicted.player["on_ground"] = json!(e.body.on_ground);
+        preview(&predicted, target, *jump).map_err(|error| {
+            ApiError::new(
+                ErrorCode::UnsupportedCapability,
+                format!("No supported held-input trajectory: {error}"),
+            )
+        })?;
         e.drive = Some(Drive {
             action: request.clone(),
             target,
@@ -843,8 +853,7 @@ mod tests {
             world: json!({"blocks":blocks}),
         }
     }
-    #[test]
-    fn input_preview_rejects_the_native_diagonal_gap_that_constant_speed_admitted() {
+    fn diagonal_gap_fixture() -> Observation {
         let mut o = input_prediction_fixture();
         for row in o.world["blocks"].as_array_mut().unwrap() {
             if row["position"][0] == -1
@@ -856,6 +865,12 @@ mod tests {
                 row["collision"] = json!([]);
             }
         }
+        o.player["entity_id"] = json!(7);
+        o
+    }
+    #[test]
+    fn input_preview_rejects_the_native_diagonal_gap_that_constant_speed_admitted() {
+        let o = diagonal_gap_fixture();
         assert!(
             control::preview(&o, [-1.5, 1., 1.5], true).is_err(),
             "A reachable constant-speed arc is not evidence that held-input acceleration can reach its landing"
@@ -1017,6 +1032,43 @@ mod tests {
         )
         .unwrap();
         wait_until(|| packets.load(Ordering::Acquire) >= 3);
+        let unreachable = ActionRequest {
+            action_id: "fixture-reject-before-input".into(),
+            action: Action::StartMove {
+                target: Position {
+                    x: -1.5,
+                    y: 1.,
+                    z: 1.5,
+                },
+                jump: true,
+                max_ticks: 100,
+            },
+        };
+        let rejected_state = Arc::new(Mutex::new(Receipt {
+            action_id: unreachable.action_id.clone(),
+            outcome: Outcome::Running,
+            adapter_version: VERSION.into(),
+            evidence: json!({}),
+            error: None,
+        }));
+        assert_eq!(
+            actor
+                .start_control(
+                    diagonal_gap_fixture(),
+                    &unreachable,
+                    0,
+                    rejected_state.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::UnsupportedCapability,
+        );
+        assert!(
+            actor.engine.lock().unwrap().drive.is_none(),
+            "Rejected admission cannot install input"
+        );
+        assert_eq!(rejected_state.lock().unwrap().evidence, json!({}));
         let request = ActionRequest {
             action_id: "fixture-expire".into(),
             action: Action::StartMove {
