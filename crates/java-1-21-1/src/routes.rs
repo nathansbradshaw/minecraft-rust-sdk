@@ -121,7 +121,7 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     // A changed control contract invalidates failed edges from old predictions
     // even if their terrain and endpoints are unchanged.
-    "java767-input-preview-v2".hash(&mut hash);
+    "java767-input-preview-v3".hash(&mut hash);
     input.target.map(|p| p.map(f64::to_bits)).hash(&mut hash);
     before.player["dimension"].to_string().hash(&mut hash);
     before.player["movement_speed"].to_string().hash(&mut hash);
@@ -180,13 +180,13 @@ mod tests {
             for y in -3..=4 {
                 for z in -4..=4 {
                     let solid = y == 0 || (wall && x == 1 && (1..=3).contains(&y));
-                    blocks.push(json!({"position":[x,y,z],"block":if solid{"fixture:solid"}else{"fixture:air"},"collision":if solid{json!([[0,0,0,1,1,1]])}else{json!([])}}));
+                    blocks.push(json!({"position":[x,y,z],"block":if solid{"fixture:solid"}else{"fixture:air"},"friction":0.6,"speed_factor":1.,"collision":if solid{json!([[0,0,0,1,1,1]])}else{json!([])}}));
                 }
             }
         }
         Observation {
             revision: "fixture".into(),
-            player: json!({"uuid":"fixture","dimension":"fixture:world","position":[0.5,1.0,0.5],"on_ground":true,"movement_speed":0.1}),
+            player: json!({"uuid":"fixture","dimension":"fixture:world","position":[0.5,1.0,0.5],"velocity":[0.,0.,0.],"on_ground":true,"movement_speed":0.1,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
             world: json!({"blocks":blocks}),
             menu: Value::Null,
         }

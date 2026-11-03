@@ -2,9 +2,9 @@
 use super::*;
 type Frame = ([f64; 3], bool);
 pub(super) fn preview(before: &Observation, target: [f64; 3], jump: bool) -> AnyResult<Vec<Frame>> {
-    // Preview the requested motion, never require a guaranteed safe outcome
-    // after every possible airborne release. Passive physics handles release.
-    motion_plan(before, target, jump)
+    // The same held-input model drives admission, queries and execution.
+    // Future collisions, damage and explicit cancellation remain game feedback.
+    motion::preview(before, target, jump)
 }
 pub(super) struct FirstEffectContext {
     pub clock: Value,
