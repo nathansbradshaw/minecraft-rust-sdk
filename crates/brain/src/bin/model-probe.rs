@@ -55,9 +55,21 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if args.len() == 5 && args[2] == "conversation" && args[3].len() <= 128 {
+        let context: serde_json::Value = serde_json::from_slice(
+            &minecraft_sdk_brain::private_read(std::path::Path::new(&args[4]), 32768)?,
+        )?;
+        let model = Model::new(&args[0], std::path::Path::new(&args[1]))?;
+        let (reply, usage) = model.converse(&context).await?;
+        println!(
+            "{}",
+            json!({"label":args[3],"reply":reply,"usage":usage,"tools_executed":false,"gameplay_actions":0,"evidence":"conversation-only replay; not controller or gameplay success"})
+        );
+        return Ok(());
+    }
     if args.len() != 4 || !["routine", "develop"].contains(&args[2].as_str()) || args[3].len() > 128
     {
-        return Err("model-probe HTTPS_ENDPOINT ALLOCATED_KEY routine|develop LABEL".into());
+        return Err("model-probe HTTPS_ENDPOINT ALLOCATED_KEY routine|develop LABEL | model-probe HTTPS_ENDPOINT ALLOCATED_KEY conversation LABEL PRIVATE_CONTEXT.json".into());
     }
     let model = Model::new(&args[0], std::path::Path::new(&args[1]))?;
     let start = minecraft_sdk_brain::now();
