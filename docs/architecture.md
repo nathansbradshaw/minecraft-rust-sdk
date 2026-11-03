@@ -80,25 +80,27 @@ key/controller binding as normal observations. Rust `Client::read_observation`,
 Input is at most 8 KiB and an object; responses are at most 8 MiB. Default observations
 retain their 1 MiB client bound. Missing providers return `unsupported_capability`.
 
-`motion_frame` is an optional typed action for programs simulating individual
-walking frames. The Java adapter checks swept collision, ordinary per-frame
-distance, gravity and continuous airborne velocity, and derives ground contact.
-A caller cannot supply its own ground flag. Unsupported airborne states fail
-closed. `move` is the older blocking waypoint operation. Since alpha.6 the Java
-adapter disables blocking `move`, `motion_frame` and `jump` by default. An operator
-can enable `allow_blocking_locomotion` for legacy conformance work. Public coding
-deployments should leave it disabled and use `start_move`, including its jump
-option. A caller cannot hold the observation lane using a legacy walk.
+The alpha.9 Java adapter uses one continuous physical writer for each admitted
+player connection. It requires the alpha.9 NeoForge physics facts. Idle gravity,
+collisions and momentum continue outside coding-agent containers and independently
+of model requests or gameplay actions. Native observations supply dimensions,
+effective jump strength, gravity, surface friction and effects. Server relocation
+invalidates old trajectories; native velocity/explosion packets preserve external
+momentum. Unsupported flight physics fails explicitly. Legacy blocking `move`,
+`motion_frame` and `jump`, and `allow_blocking_locomotion=true`, are unsupported
+with this controller. Use `start_move`, including its jump option.
 
 Rust alpha.5 additionally advertises `minecraft:finite_locomotion`. `start_move`
 accepts a waypoint, `jump` and positive `max_ticks` (fifty milliseconds per tick).
 Discovery advertises the deployment's `finite_control_max_ticks`; the Rust
 adapter configuration defaults to 100 and permits an operator budget of 1–600.
-It returns `running` immediately, then drives ordinary player position packets
-in a separate bounded control thread. Own observations and non-conflicting
+It returns `running` immediately and leases finite input to the connection's
+physical controller, which sends ordinary player packets. Own observations and non-conflicting
 actions remain available. `cancel_control` references that same character's
 durable action ID and has its own durable request ID. Inspect both IDs through
-normal action status; cancellation can remain running while gravity settles.
+normal action status. Cancellation releases input; gravity and momentum continue.
+The release is checked against fresh native poses without requiring a guaranteed
+safe landing. A legal action may cause ordinary fall damage or death.
 
 `observed` means the requested target was observed, `cancelled`/`expired` mean
 the corresponding finite control ended, and `failed` means execution ended
@@ -109,14 +111,12 @@ which never replays or retrospectively certifies a historical effect. A running
 control is separate from that uncertainty fence. Gateway restart or controller
 disconnection converts uncaptured running results to uncertain records.
 
-The initial finite adapter requires grounded starts, observed collision geometry
-and a gravity-only release path for every planned frame. It refuses unsupported
-terrain rather than freezing a character in the air. A second locomotion control
-must wait for cancellation/completion; look and other ordinary actions can
-continue. These conservative client trajectories are not full water, fluid,
-vehicle, knockback or modded movement physics conformance. Those need independent
-capabilities and native tests. No NeoForge module change is needed for this
-optional Rust capability. Older clients cannot decode the new outcome variants
+Collision geometry is refreshed for this character. The controller waits briefly
+for missing geometry and ends the connection if fresh observations cannot be
+recovered, preserving uncertain action IDs rather than inventing air. A second
+locomotion control waits for cancellation/completion; look and ordinary actions
+continue. Deterministic physics and native fixtures remain separate evidence;
+support for every fluid, vehicle or mod is not implied. Older clients cannot decode the new outcome variants
 for actions created by newer clients. Keep a matching gateway/adapter pair and
 preserve the journal through upgrades; never restore an old journal to replay work.
 

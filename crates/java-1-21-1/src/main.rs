@@ -1,6 +1,7 @@
 use minecraft_sdk_core::*;
 mod chat;
 mod control;
+mod motion;
 mod routes;
 use minecraft_sdk_java_1_21_1::{Wire, encode_signed_varint as vi};
 use minecraft_sdk_wire::{decode_string_prefix, decode_varint_prefix, encode_string as text};
@@ -157,6 +158,8 @@ impl Tables {
     }
 }
 struct Player {
+    physics: motion::Actor,
+    wire_ground: Arc<AtomicBool>,
     route_preview_at: Option<Instant>,
     corrections: Arc<AtomicU64>,
     correcting: Arc<AtomicBool>,
@@ -197,6 +200,12 @@ fn connect(
     discovery: &Value,
 ) -> Result<Player> {
     let run = || -> AnyResult<Player> {
+        if !discovery["native_observation_features"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|v| v == "minecraft:physics_facts"))
+        {
+            return Err("Matching continuous-physics server integration required".into());
+        }
         native.call(
             "register",
             json!({"player_uuid":request.player_uuid,"player_name":request.player_name}),
@@ -284,6 +293,12 @@ fn connect(
         let alive = Arc::new(AtomicBool::new(true));
         let corrections = Arc::new(AtomicU64::new(0));
         let correcting = Arc::new(AtomicBool::new(false));
+        let wire_ground = Arc::new(AtomicBool::new(false));
+        let reader_ground = wire_ground.clone();
+        let impulses: motion::Inbox = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let reader_impulses = impulses.clone();
+        let entity = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let reader_entity = entity.clone();
         let reader_corrections = corrections.clone();
         let reader_correcting = correcting.clone();
         let reader_writer = wire.clone();
@@ -318,6 +333,18 @@ fn connect(
                         .lock()
                         .map_err(|_| "Player writer unavailable")?;
                     match reader_tables.name("play", packet.id) {
+                        "login" => {
+                            reader_entity.store(
+                                i32::from_be_bytes(
+                                    packet
+                                        .payload
+                                        .get(..4)
+                                        .ok_or("Truncated player login")?
+                                        .try_into()?,
+                                ),
+                                Ordering::Release,
+                            );
+                        }
                         "keep_alive" => reader_tables.send(
                             &mut writer,
                             "play",
@@ -357,7 +384,22 @@ fn connect(
                                 .lock()
                                 .map_err(|_| "Player writer unavailable")?;
                             reader_tables.send(&mut writer, "play", "position", &body)?;
+                            reader_ground.store(body.last() == Some(&1), Ordering::Release);
                             reader_correcting.store(false, Ordering::Release);
+                        }
+                        "entity_velocity" => {
+                            if let Some(impulse) = motion::entity_impulse(
+                                &packet.payload,
+                                reader_entity.load(Ordering::Acquire),
+                            )? {
+                                motion::push_impulse(&reader_impulses, impulse)?;
+                            }
+                        }
+                        "explosion" => {
+                            motion::push_impulse(
+                                &reader_impulses,
+                                motion::explosion_impulse(&packet.payload)?,
+                            )?;
                         }
                         "kick_disconnect" | "start_configuration" => {
                             return Err("Player disconnected or requires reconfiguration".into());
@@ -385,7 +427,34 @@ fn connect(
             }
             thread::sleep(Duration::from_millis(100));
         }
+        let initial = native.observe(&request.player_uuid)?;
+        let physics = match motion::Actor::start(
+            native.clone(),
+            request.player_uuid.clone(),
+            initial,
+            motion::Wires {
+                writer: wire.clone(),
+                tables: tables.clone(),
+                alive: alive.clone(),
+                corrections: corrections.clone(),
+                correcting: correcting.clone(),
+                ground: wire_ground.clone(),
+                impulses,
+                entity,
+            },
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                alive.store(false, Ordering::Release);
+                if let Ok(w) = wire.lock() {
+                    let _ = w.connection().shutdown(std::net::Shutdown::Both);
+                }
+                return Err(error);
+            }
+        };
         Ok(Player {
+            physics,
+            wire_ground,
             route_preview_at: None,
             corrections,
             correcting,
@@ -564,7 +633,13 @@ impl Player {
             return Err("Player connection closed".into());
         }
         let mut wire = self.wire.lock().map_err(|_| "Player writer unavailable")?;
-        let result = self.tables.send(&mut wire, "play", name, body);
+        let mut body = body.to_vec();
+        if name == "look"
+            && let Some(last) = body.last_mut()
+        {
+            *last = u8::from(self.wire_ground.load(Ordering::Acquire));
+        }
+        let result = self.tables.send(&mut wire, "play", name, &body);
         if result.is_err() {
             self.alive.store(false, Ordering::Release);
             let _ = wire.connection().shutdown(std::net::Shutdown::Both);
@@ -965,6 +1040,9 @@ fn main() -> AnyResult<()> {
     if !(1..=600).contains(&config.control_max_ticks) {
         return Err("Control tick budget must be 1–600".into());
     }
+    if config.allow_blocking_locomotion {
+        return Err("Continuous physics requires finite controls; legacy blocking locomotion is unsupported".into());
+    }
     if !config.backend.ip().is_loopback() {
         return Err("Backend must be local to the trusted integration".into());
     }
@@ -973,6 +1051,9 @@ fn main() -> AnyResult<()> {
     if discovery["minecraft_version"] != "1.21.1"
         || discovery["platform"] != "neoforge"
         || discovery["online_mode"] != true
+        || !discovery["native_observation_features"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|c| c == "minecraft:physics_facts"))
     {
         return Err("Unsupported native integration".into());
     }
@@ -1083,6 +1164,7 @@ fn dispatch(
                     "minecraft:movement",
                     "minecraft:movement_frames",
                     "minecraft:finite_locomotion",
+                    "minecraft:continuous_physics",
                     "minecraft:mining",
                     "minecraft:placement",
                     "minecraft:block_use",
@@ -1118,7 +1200,7 @@ fn dispatch(
                         .map(String::from),
                 )
                 .collect(),
-                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":1.25,"move_down_blocks":3,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":({
+                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":4,"move_down_blocks":4,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":({
                     let mut schemas=discovery["observation_query_schemas"].as_object().cloned().unwrap_or_default();
                     schemas.insert(routes::CAPABILITY.into(),routes::schema());
                     Value::Object(schemas)
@@ -1150,9 +1232,16 @@ fn dispatch(
                         "Character connection ended; reconnect without replay",
                     ));
                 }
-                let mut observation = native.observe(&request.player_uuid).map_err(|_| {
-                    ApiError::new(ErrorCode::NotReady, "Native observation unavailable")
-                })?;
+                let mut observation = players
+                    .get(&request.bot_id)
+                    .ok_or_else(|| {
+                        ApiError::new(ErrorCode::SessionRequired, "Character disconnected")
+                    })?
+                    .physics
+                    .observe()
+                    .map_err(|_| {
+                        ApiError::new(ErrorCode::NotReady, "Native observation unavailable")
+                    })?;
                 if let Some(player) = players.get(&request.bot_id) {
                     if let Some(job) = &player.control {
                         observation.player["control"] = job.observation();

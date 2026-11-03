@@ -13,6 +13,7 @@ import net.minecraft.world.entity.monster.RangedAttackMob;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.effect.MobEffects;
 import java.util.*;
 
 /** Bounded observations, always collected together on the authoritative server thread. */
@@ -48,6 +49,7 @@ final class NativeObservation {
                 var pos=origin.offset(x,y,z);var state=world.getBlockState(pos);var row=new LinkedHashMap<String,Object>();
                 row.put("position",List.of(pos.getX(),pos.getY(),pos.getZ()));row.put("block",BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());row.put("state",state.toString());row.put("replaceable",state.canBeReplaced());row.put("may_interact",world.mayInteract(player,pos));
                 float progress=state.getDestroyProgress(player,world,pos);row.put("destroy_progress",progress>0?Math.min(1.0f,progress):0f);
+                row.put("friction",state.getBlock().getFriction());row.put("speed_factor",state.getBlock().getSpeedFactor());
                 row.put("collision",state.getCollisionShape(world,pos).toAabbs().stream().map(a->List.of(a.minX,a.minY,a.minZ,a.maxX,a.maxY,a.maxZ)).toList());blocks.add(row);
             }
         }
@@ -72,6 +74,13 @@ final class NativeObservation {
         own.put("velocity",List.of(player.getDeltaMovement().x,player.getDeltaMovement().y,player.getDeltaMovement().z));
         own.put("movement_speed",player.getAttributeValue(Attributes.MOVEMENT_SPEED));own.put("attack_damage",player.getAttributeValue(Attributes.ATTACK_DAMAGE));
         own.put("attack_speed",player.getAttributeValue(Attributes.ATTACK_SPEED));own.put("max_health",player.getMaxHealth());own.put("armor",player.getArmorValue());
+        var physics=new LinkedHashMap<String,Object>();physics.put("format","java767-physics-v1");
+        physics.put("width",player.getBbWidth());physics.put("height",player.getBbHeight());physics.put("gravity",player.getAttributeValue(Attributes.GRAVITY));
+        physics.put("jump_velocity",((dev.minecraftsdk.mixin.LivingPhysicsAccessor)player).sdk$jumpPower());physics.put("step_height",player.maxUpStep());
+        physics.put("water_efficiency",player.getAttributeValue(Attributes.WATER_MOVEMENT_EFFICIENCY));physics.put("no_gravity",player.isNoGravity());
+        physics.put("slow_falling",player.hasEffect(MobEffects.SLOW_FALLING));physics.put("dolphins_grace",player.hasEffect(MobEffects.DOLPHINS_GRACE));
+        physics.put("levitation",player.hasEffect(MobEffects.LEVITATION)?player.getEffect(MobEffects.LEVITATION).getAmplifier():-1);
+        physics.put("fall_flying",player.isFallFlying());physics.put("flying",player.getAbilities().flying);own.put("physics",physics);
         var mining=(dev.minecraftsdk.mixin.GameModeAccessor)player.gameMode;var target=mining.sdk$miningPosition();own.put("mining",Map.of("active",mining.sdk$mining(),"block",List.of(target.getX(),target.getY(),target.getZ())));own.put("accepted_chat",NativeChat.snapshot(player));
         var chat=NativeChat.inbox(player);
         return Map.of("revision",Integer.toString(server.getTickCount()),"player",own,"world",Map.of("game_time",world.getGameTime(),"day_time",world.getDayTime(),"blocks",blocks,"entities",entities,"unknown_columns",unknown,"chat",chat.get("messages"),"chat_epoch",chat.get("epoch"),"chat_dropped",chat.get("dropped"),"sample_clock",sampleClock),"menu",Map.of("menu_id",menu.containerId,"state_id",menu.getStateId(),"type",menu==player.inventoryMenu?"minecraft:inventory":BuiltInRegistries.MENU.getKey(menu.getType()).toString(),"slots",slots,"carried",stack(menu.getCarried(),player)));
