@@ -3,6 +3,7 @@
 pub mod body;
 pub mod containers;
 pub mod conversation;
+mod discovery;
 pub mod feedback;
 pub mod memory;
 pub mod model;
@@ -449,6 +450,9 @@ impl Journal {
             remaining,
         )))
     }
+    fn diagnosis_subject(&self, source: &str, revision: &str, environment: &str) -> Result<String> {
+        Ok(digest(json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.get("experiment_signature")?,"context_contract":self.get("context_contract")?,"discovery_revision":self.get("discovery_revision")?}).to_string().as_bytes()))
+    }
     fn investigation_spent(&self, subject: &str, finished: bool) -> Result<()> {
         self.db.execute("UPDATE investigations SET remaining=CASE WHEN ?2 THEN 0 ELSE max(remaining-1,0) END WHERE subject=?1",params![subject,finished])?;
         let remaining: Option<u32> = self
@@ -806,7 +810,9 @@ impl Brain {
                     )?;
                     let revision = self.journal.get("goal_revision")?.unwrap_or_default();
                     let environment = progress::environment_signature(&self.observed);
-                    let subject=digest(json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.journal.get("experiment_signature")?,"context_contract":self.journal.get("context_contract")?}).to_string().as_bytes());
+                    let subject =
+                        self.journal
+                            .diagnosis_subject(&source, &revision, &environment)?;
                     let Some((state, remaining)) = self.journal.investigation_budget(
                         &subject,
                         self.cfg.investigation_turns,
@@ -831,6 +837,11 @@ impl Brain {
                                     &self.cfg.state,
                                 )? == source
                                 && progress::environment_signature(&self.observed) == environment
+                                && self.journal.diagnosis_subject(
+                                    &source,
+                                    &revision,
+                                    &environment,
+                                )? == subject
                             {
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 self.refresh().await?;
@@ -1013,6 +1024,17 @@ impl Brain {
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
             if let Ok(value) = &result {
+                if self.journal.search_discovery(
+                    &choice,
+                    value,
+                    &requested_revision,
+                    &self.server.instance_id,
+                    self.observed.player["dimension"]
+                        .as_str()
+                        .unwrap_or_default(),
+                )? {
+                    self.journal.event("search_discovery",json!({"goal_revision":requested_revision,"discovery_revision":self.journal.get("discovery_revision")?,"scope":"New accepted SDK search facts can reopen diagnosis; not gameplay progress or success","allowances_changed":false}))?;
+                }
                 executed |=
                     self.journal
                         .experiment(&choice, value, &source_after, &requested_revision)?;
