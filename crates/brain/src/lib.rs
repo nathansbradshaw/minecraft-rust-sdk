@@ -878,6 +878,14 @@ impl Brain {
             };
             next = tokio::time::Instant::now() + Duration::from_secs(self.cfg.model_interval_secs);
             self.refresh().await?;
+            // Allocation applies to the character even if chat replaced the
+            // goal while this inference was pending.
+            let daily_unavailable = match &answer {
+                Err(error) => self
+                    .journal
+                    .remember_daily_reset(develop, error.as_ref(), now())?,
+                Ok(_) => false,
+            };
             if self.goal != requested_goal
                 || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision
             {
@@ -890,10 +898,7 @@ impl Brain {
                     let retry_at = model::retry_at(e.as_ref());
                     self.journal
                         .event("model_error", json!({"error":e.to_string(),"turn":turn,"retry_at_utc":retry_at,"unchanged_failure_polling":false}))?;
-                    if self
-                        .journal
-                        .remember_daily_reset(develop, e.as_ref(), now())?
-                    {
+                    if daily_unavailable {
                         self.journal.event("model_allocation_unavailable",json!({"development":develop,"retry_at_utc":retry_at,"other_model_work_allowed":true,"allowances_changed":false}))?;
                         continue;
                     }
