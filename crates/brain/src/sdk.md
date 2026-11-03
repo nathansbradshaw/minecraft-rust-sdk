@@ -71,6 +71,8 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
 - Use tokio::time for bounded waits; it is enabled in the coding project. Paths,
   model access and SDK endpoints come from deployment, never invented credentials.
 - Optional read-only query schemas are advertised in server.limits.observation_queries.
+  The brain's query tool calls this same typed interface directly. Use it for a
+  discriminating read; prefer a bounded Rust program for a multi-page experiment.
   Call client.read_observation(&ObservationQuery{capability, input}).await?. A
   block_search query accepts a runtime block ID or tag, radius, limit and offset.
   It returns only loaded blocks hit by an unobstructed targeting ray. Follow
