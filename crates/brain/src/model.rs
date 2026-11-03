@@ -48,6 +48,16 @@ pub fn retry_at(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Opti
     error.downcast_ref::<HttpFailure>().and_then(|e| e.retry_at)
 }
 
+/// A daily allocation rejection applies only to the requested model. Queue,
+/// pacing, authentication and schema errors do not authorize model hopping.
+pub(crate) fn daily_reset(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<i64> {
+    error.downcast_ref::<HttpFailure>().and_then(|e| {
+        (e.status == 429 && e.class == "allocation_daily_limit")
+            .then_some(e.retry_at)
+            .flatten()
+    })
+}
+
 /// Container-local coordination for the shared allocated model credentials.
 /// The broker remains authoritative for global jobs and daily budgets.
 #[derive(Clone)]
@@ -306,6 +316,13 @@ mod tests {
             100,
         );
         assert_eq!(retry_at(&daily), Some(200));
+        assert_eq!(daily_reset(&daily), Some(200));
+        let dir = tempfile::tempdir().unwrap();
+        let j = crate::Journal::open(&dir.path().join("limits.sqlite")).unwrap();
+        assert!(j.remember_daily_reset(true, &daily, 100).unwrap());
+        assert!(!j.model_available(true, 100).unwrap());
+        assert!(j.model_available(false, 100).unwrap());
+        assert!(!j.remember_daily_reset(true, &daily, 200).unwrap());
         for (status, class, at) in [
             (429, "allocation_daily_limit", 100),
             (429, "allocation_daily_limit", 86501),
@@ -314,15 +331,19 @@ mod tests {
             (401, "unauthorized", 200),
             (429, "allocation_limit", 200),
         ] {
-            assert_eq!(
-                retry_at(&http_failure(
-                    status,
-                    &json!({"error":class,"retry_at_utc":at}),
-                    100
-                )),
-                None
-            );
+            let failure = http_failure(status, &json!({"error":class,"retry_at_utc":at}), 100);
+            assert_eq!(retry_at(&failure), None);
+            assert_eq!(daily_reset(&failure), None);
+            assert!(!j.remember_daily_reset(false, &failure, 100).unwrap());
         }
+        assert_eq!(
+            daily_reset(&http_failure(
+                429,
+                &json!({"error":"allocation_pacing","retry_at_utc":101}),
+                100
+            )),
+            None
+        );
         assert_eq!(
             retry_at(&http_failure(
                 429,

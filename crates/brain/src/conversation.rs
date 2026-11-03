@@ -48,6 +48,7 @@ impl Handle {
                     let mut retry_at=None;
                     while !stopped.load(Ordering::Acquire) {
                         let observed=body.observe()?;
+                        if !brain.model_available(false,crate::now())? {tokio::time::sleep(Duration::from_millis(250)).await;continue;}
                         if retry_at.is_some_and(|at|crate::now()<at){tokio::time::sleep(Duration::from_millis(250)).await;continue;}
                         retry_at=None;
                         let chat_epoch=observed.world["chat_epoch"].as_str().unwrap_or("connection");
@@ -84,6 +85,7 @@ impl Handle {
                             Ok(r)=>r,
                             Err(e)=>{
                                 retry_at=crate::model::retry_at(e.as_ref());
+                                brain.remember_daily_reset(false,e.as_ref(),crate::now())?;
                                 journal.event("conversation_model_error",json!({"error":e.to_string(),"retry_at_utc":retry_at,"next_action":"Wait for the explicit allocation clock event, otherwise investigate; no unchanged automatic retry."}))?;
                                 if retry_at.is_none(){sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;}
                                 continue;
