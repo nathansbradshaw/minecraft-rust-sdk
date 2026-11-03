@@ -256,30 +256,37 @@ async fn proxy(
             }
         };
         // A queued caller that disappears must never be dispatched afterwards.
-        let guard = tokio::select! {biased; _=input.read_u8()=>return Ok(()),g=acquire=>g};
-        // Readiness registration can lag an already-closed peer when the lock
-        // becomes ready in the same poll. Check the kernel before dispatch.
-        use std::os::fd::AsRawFd;
-        let mut byte = 0u8;
-        let peek = unsafe {
-            libc::recv(
-                input.get_ref().as_ref().as_raw_fd(),
-                (&mut byte as *mut u8).cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if !input.buffer().is_empty() || peek >= 0 {
-            return Ok(());
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
-            return Err("Local action caller disconnected".into());
-        }
-        let result = client.act(&request.request).await;
-        drop(guard);
-        match result {
-            Ok(r) => LocalActionResponse::Receipt(r),
-            Err(e) => LocalActionResponse::Error(e),
+        let admission = tokio::select! {biased; _=input.read_u8()=>return Ok(()),g=tokio::time::timeout(Duration::from_secs(3), acquire)=>g};
+        if let Ok(guard) = admission {
+            // Readiness registration can lag an already-closed peer when the lock
+            // becomes ready in the same poll. Check the kernel before dispatch.
+            use std::os::fd::AsRawFd;
+            let mut byte = 0u8;
+            let peek = unsafe {
+                libc::recv(
+                    input.get_ref().as_ref().as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if !input.buffer().is_empty() || peek >= 0 {
+                return Ok(());
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+                return Err("Local action caller disconnected".into());
+            }
+            let result = client.act(&request.request).await;
+            drop(guard);
+            match result {
+                Ok(r) => LocalActionResponse::Receipt(r),
+                Err(e) => LocalActionResponse::Error(e),
+            }
+        } else {
+            LocalActionResponse::Error(ApiError::new(
+                ErrorCode::Conflict,
+                "Body admission deadline exceeded before gateway dispatch; no mutation was submitted. Inspect current observation and body reason before another intention.",
+            ))
         }
     };
     if let Ok(mut trace) = shared.feedback.lock() {

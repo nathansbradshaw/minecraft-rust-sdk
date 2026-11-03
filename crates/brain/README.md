@@ -152,6 +152,16 @@ inside the existing coding image. Reuse its per-bot Cargo target and reviewed
 vendor configuration; do not download another toolchain or dependency bundle.
 
 The default `body` configuration is `{ "enabled": true, "period_ms": 150 }`.
+Evasion candidates include observed collision-top centres and jump trajectories
+to level or one-block-lower landings, allowing retreat from narrow ledges across
+gaps. Unknown terrain, hazards and collisions remain excluded; the server still
+admits and verifies actual finite movement. Local gameplay admission waits at
+most three seconds for the body; expiration returns an explicit unsubmitted
+Conflict, with no later dispatch. Actual dispatched requests retain ordinary
+uncertainty and reconciliation semantics. The read-only
+`body-probe inspect-observation PRIVATE_OBSERVATION.json` diagnoses a copied
+observation without connecting or performing gameplay. Its predicted route is
+not evidence of successful movement.
 It requires finite locomotion, public survival facts and pending-action inspection.
 The current body also requires `minecraft:ranged_observation`: visible entities
 within the installed observation radius include ranged-attack classification and
