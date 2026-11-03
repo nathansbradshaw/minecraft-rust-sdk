@@ -86,7 +86,11 @@ collisions and momentum continue outside coding-agent containers and independent
 of model requests or gameplay actions. Native observations supply dimensions,
 effective jump strength, gravity, surface friction and effects. Server relocation
 invalidates old trajectories; native velocity/explosion packets preserve external
-momentum. Unsupported flight physics fails explicitly. Legacy blocking `move`,
+momentum without automatically releasing a held finite movement input. Target
+verification, expiry, explicit cancellation and relocation/death fences still
+apply. Movement receipts retain bounded coalesced `server_momentum` diagnostics;
+these do not attribute damage or certify target completion. Unsupported flight
+physics fails explicitly. Legacy blocking `move`,
 `motion_frame` and `jump`, and `allow_blocking_locomotion=true`, are unsupported
 with this controller. Use `start_move`, including its jump option.
 

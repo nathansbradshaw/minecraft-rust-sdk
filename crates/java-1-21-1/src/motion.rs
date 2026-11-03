@@ -222,6 +222,13 @@ struct Drive {
     release_at: usize,
     epoch: u64,
     entity: i64,
+    momentum_updates: u64,
+    momentum_samples: Vec<Value>,
+}
+impl Drive {
+    fn momentum_evidence(&self) -> Value {
+        json!({"applied_updates":self.momentum_updates,"samples":self.momentum_samples,"omitted_samples":self.momentum_updates.saturating_sub(self.momentum_samples.len() as u64),"scope":"Coalesced server velocity updates applied by this physical writer; not damage attribution or target-completion evidence"})
+    }
 }
 struct Engine {
     body: Body,
@@ -387,8 +394,8 @@ impl Actor {
                         .drain(..)
                         .collect();
                     if !impulses.is_empty() {
-                        for impulse in impulses {
-                            match impulse {
+                        for impulse in &impulses {
+                            match *impulse {
                                 Impulse::Set(v) => e.body.velocity = v,
                                 Impulse::Add(v) => {
                                     for (old, n) in e.body.velocity.iter_mut().zip(v) {
@@ -398,7 +405,24 @@ impl Actor {
                             }
                         }
                         if let Some(d) = &mut e.drive {
-                            release(d, Outcome::Cancelled);
+                            // Native momentum changes velocity, not the held
+                            // input. A normal player can keep steering through
+                            // knockback. The same finite ID, expiry and explicit
+                            // cancellation/relocation fences remain in force.
+                            d.momentum_updates =
+                                d.momentum_updates.saturating_add(impulses.len() as u64);
+                            for impulse in &impulses {
+                                if d.momentum_samples.len() < 8 {
+                                    let (operation, velocity) = match impulse {
+                                        Impulse::Set(v) => ("set", v),
+                                        Impulse::Add(v) => ("add", v),
+                                    };
+                                    d.momentum_samples.push(json!({"frame":d.frames.len(),"operation":operation,"velocity":velocity,"input_held":d.released.is_none()}));
+                                }
+                            }
+                            if let Ok(mut receipt) = d.state.lock() {
+                                receipt.evidence["server_momentum"] = d.momentum_evidence();
+                            }
                         }
                     }
                     if let Some(mut d) = e.drive.take() {
@@ -464,7 +488,7 @@ impl Actor {
                                         receipt.outcome = final_outcome;
                                         receipt.error=(!verified).then(||ApiError::new(ErrorCode::Conflict,"Released control did not reach its observed target"));
                                         let first = receipt.evidence["first_effect"].clone();
-                                        receipt.evidence = json!({"before":compact(&d.action.action,&d.before),"after":compact(&d.action.action,&snapshot.o),"target":d.target,"target_tolerance_blocks":MOVEMENT_TARGET_TOLERANCE,"native_effect_verified":verified,"input_released":true,"frames_sent":d.frames.len(),"elapsed_ms":d.started.elapsed().as_millis(),"first_effect":first,"release_scope":"Native pose matches a submitted released-input frame; passive gravity and momentum continue"});
+                                        receipt.evidence = json!({"before":compact(&d.action.action,&d.before),"after":compact(&d.action.action,&snapshot.o),"target":d.target,"target_tolerance_blocks":MOVEMENT_TARGET_TOLERANCE,"native_effect_verified":verified,"input_released":true,"frames_sent":d.frames.len(),"elapsed_ms":d.started.elapsed().as_millis(),"first_effect":first,"server_momentum":d.momentum_evidence(),"release_scope":"Native pose matches a submitted released-input frame; passive gravity and momentum continue"});
                                     }
                                 } else if released_at.elapsed() > Duration::from_secs(2) {
                                     finish_interrupted(
@@ -706,6 +730,8 @@ impl Actor {
             release_frame_at: None,
             frames: Vec::new(),
             release_at: 0,
+            momentum_updates: 0,
+            momentum_samples: Vec::new(),
             epoch,
             entity: before.player["entity_id"].as_i64().ok_or_else(|| {
                 ApiError::new(ErrorCode::NotReady, "Native entity binding missing")
@@ -881,6 +907,7 @@ mod tests {
                 .unwrap(),
         };
         let writer = Arc::new(Mutex::new(Wire::new(sender)));
+        let impulses = Arc::new(Mutex::new(VecDeque::new()));
         let actor = Actor::start(
             native,
             "fixture".into(),
@@ -892,7 +919,7 @@ mod tests {
                 corrections: corrections.clone(),
                 correcting: correcting.clone(),
                 ground: Arc::new(AtomicBool::new(true)),
-                impulses: Arc::new(Mutex::new(VecDeque::new())),
+                impulses: impulses.clone(),
                 entity: Arc::new(AtomicI32::new(7)),
             },
         )
@@ -960,6 +987,7 @@ mod tests {
         for (id, target, jump) in [
             ("fixture-arrive-walk", [2.5, 1., 1.5], false),
             ("fixture-arrive-jump", [0.5, 1., 0.5], true),
+            ("fixture-cancel-momentum", [2.5, 1., 1.5], false),
         ] {
             let request = ActionRequest {
                 action_id: id.into(),
@@ -980,20 +1008,39 @@ mod tests {
                 evidence: json!({}),
                 error: None,
             }));
+            let cancel = Arc::new(AtomicBool::new(false));
             actor
                 .start_control(
                     actor.observe().unwrap(),
                     &request,
                     0,
                     state.clone(),
-                    Arc::new(AtomicBool::new(false)),
+                    cancel.clone(),
                 )
                 .unwrap();
+            if matches!(id, "fixture-arrive-walk" | "fixture-cancel-momentum") {
+                wait_until(|| {
+                    state.lock().unwrap().evidence["progress"]["frames_sent"]
+                        .as_u64()
+                        .is_some_and(|n| n >= 2)
+                });
+                push_impulse(&impulses, Impulse::Set([0.12, 0.30, 0.])).unwrap();
+                if id == "fixture-cancel-momentum" {
+                    wait_until(|| {
+                        state.lock().unwrap().evidence["server_momentum"]["applied_updates"] == 1
+                    });
+                    cancel.store(true, Ordering::Release);
+                }
+            }
             wait_until(|| state.lock().unwrap().outcome.terminal());
             let receipt = state.lock().unwrap();
             assert_eq!(
                 receipt.outcome,
-                Outcome::Observed,
+                if id == "fixture-cancel-momentum" {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::Observed
+                },
                 "{id}: {}",
                 receipt.evidence
             );
@@ -1002,12 +1049,30 @@ mod tests {
                     .as_f64()
                     .unwrap()
             });
-            assert!(
-                movement_target_reached(actual, target),
-                "Released native arrival must satisfy the public navigator's contract"
-            );
+            if receipt.outcome == Outcome::Observed {
+                assert!(
+                    movement_target_reached(actual, target),
+                    "Released native arrival must satisfy the public navigator's contract"
+                );
+            } else {
+                assert!(
+                    actual[1] > 1.1,
+                    "Explicit cancellation must not erase native airborne momentum"
+                );
+            }
             assert_eq!(receipt.evidence["target"], json!(target));
             assert_eq!(receipt.evidence["input_released"], true);
+            if matches!(id, "fixture-arrive-walk" | "fixture-cancel-momentum") {
+                assert_eq!(receipt.evidence["server_momentum"]["applied_updates"], 1);
+                assert_eq!(
+                    receipt.evidence["server_momentum"]["samples"][0]["velocity"],
+                    json!([0.12, 0.30, 0.])
+                );
+                assert_eq!(
+                    receipt.evidence["server_momentum"]["samples"][0]["input_held"],
+                    true
+                );
+            }
         }
         let request = ActionRequest {
             action_id: "fixture-correct".into(),
