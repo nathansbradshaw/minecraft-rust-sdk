@@ -105,7 +105,7 @@ pub const TOOLS: [&str; 14] = [
     "complete",
 ];
 pub fn schema() -> Value {
-    json!({"type":"object","properties":{"tool":{"type":"string","enum":TOOLS},"input":{"type":"string","maxLength":10000},"path":{"type":"string","maxLength":256},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
+    json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, compilation, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual tool input: Rust source for write, command for terminal, binary name for run, serialized typed action for sdk."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
 pub struct Model {
     http: reqwest::Client,

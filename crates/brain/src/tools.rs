@@ -220,7 +220,10 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
     match choice.tool.as_str() {
         "develop" => {
             brain.journal.set("development_request", &choice.input)?;
-            Ok(json!({"next_reasoning_model":"gpt-6.1-sol","request":choice.input}))
+            let available = brain.journal.available_model(true, crate::now())?;
+            Ok(
+                json!({"next_reasoning_model":available.map(|develop|if develop{"gpt-6.1-sol"}else{"gpt-6-luna"}),"preferred_reasoning_model":"gpt-6.1-sol","request":choice.input,"model_availability":brain.journal.model_availability(crate::now())?}),
+            )
         }
         "observe" => {
             brain.refresh().await?;
