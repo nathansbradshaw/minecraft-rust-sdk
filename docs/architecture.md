@@ -94,6 +94,15 @@ physics fails explicitly. Legacy blocking `move`,
 `motion_frame` and `jump`, and `allow_blocking_locomotion=true`, are unsupported
 with this controller. Use `start_move`, including its jump option.
 
+The waypoint preview integrates the same acceleration, braking, jumping,
+friction, gravity and collision equations as the continuous physical writer,
+starting from reported position and momentum in the observed scene. It can
+assess feasible airborne steering. An unreachable constant-speed jump arc no
+longer admits a movement that the held-input controller cannot execute. Preview
+remains a prediction: later world changes, momentum updates or cancellation can
+change its outcome. The changed scene key invalidates old failed route edges
+without removing their history.
+
 Rust alpha.5 additionally advertises `minecraft:finite_locomotion`. `start_move`
 accepts a waypoint, `jump` and positive `max_ticks` (fifty milliseconds per tick).
 The input lease begins with its first submitted physical frame, so a one-tick

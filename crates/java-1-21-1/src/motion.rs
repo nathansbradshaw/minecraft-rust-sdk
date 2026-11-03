@@ -195,6 +195,123 @@ fn parameters(o: &Observation) -> AnyResult<Parameters> {
         ..Parameters::default()
     })
 }
+fn observed_body(o: &Observation) -> AnyResult<Body> {
+    let mut velocity = [0.; 3];
+    for (i, v) in velocity.iter_mut().enumerate() {
+        *v = o.player["velocity"][i]
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.);
+    }
+    Ok(Body {
+        position: position(o)?,
+        velocity,
+        on_ground: o.player["on_ground"] == true,
+    })
+}
+fn arrived(body: &Body, target: [f64; 3], needs_jump: bool, medium: Medium) -> bool {
+    (!needs_jump || medium != Medium::Air)
+        && distance(body.position, target) < 0.08
+        && body.velocity[0].hypot(body.velocity[2]) < 0.025
+        && (body.on_ground || medium != Medium::Air)
+}
+fn steering(
+    body: &Body,
+    target: [f64; 3],
+    needs_jump: &mut bool,
+    o: &Observation,
+    p: Parameters,
+) -> AnyResult<([f64; 3], bool)> {
+    let delta = [
+        target[0] - body.position[0],
+        0.,
+        target[2] - body.position[2],
+    ];
+    let len = delta[0].hypot(delta[2]);
+    let speed = number(&o.player, "movement_speed", 0., 4.)?;
+    let slow = if o.player["sneaking"] == true {
+        0.3
+    } else if o.player["using_item"] == true {
+        0.2
+    } else {
+        1.
+    };
+    let accel = if p.medium == Medium::Air {
+        if body.on_ground {
+            speed * 0.21600002 / p.friction.max(0.01).powi(3)
+        } else if p.sprinting {
+            0.026
+        } else {
+            0.02
+        }
+    } else {
+        0.02
+    };
+    let desired = (speed * 2.1585 * slow).min(len * 0.5);
+    let mut change = [
+        if len > 1e-9 {
+            delta[0] / len * desired - body.velocity[0]
+        } else {
+            -body.velocity[0]
+        },
+        0.,
+        if len > 1e-9 {
+            delta[2] / len * desired - body.velocity[2]
+        } else {
+            -body.velocity[2]
+        },
+    ];
+    let amount = change[0].hypot(change[2]);
+    let factor = if amount > accel * slow {
+        accel * slow / amount
+    } else {
+        1.
+    };
+    for v in &mut change {
+        *v *= factor;
+    }
+    let mut jump = *needs_jump && (p.medium != Medium::Air || body.on_ground);
+    if jump && p.medium == Medium::Air {
+        *needs_jump = false;
+    }
+    if p.medium != Medium::Air && target[1] > body.position[1] + 0.1 {
+        jump = true;
+    }
+    Ok((change, jump))
+}
+/// Admission/query prediction uses exactly the held-input equations executed by
+/// the physical writer, including initial momentum and grounded/air controls.
+pub(super) fn preview(
+    o: &Observation,
+    target: [f64; 3],
+    jump: bool,
+) -> AnyResult<Vec<([f64; 3], bool)>> {
+    let scene = Scene::new(o)?;
+    let params = parameters(o)?;
+    let mut body = observed_body(o)?;
+    let mut needs_jump = jump;
+    let mut frames = Vec::new();
+    for _ in 0..100 {
+        if arrived(&body, target, needs_jump, params.medium) {
+            return Ok(frames);
+        }
+        let (friction, speed_factor) = scene.surface(&body, params.width);
+        let p = Parameters {
+            friction,
+            speed_factor,
+            ..params
+        };
+        let (acceleration, jump) = steering(&body, target, &mut needs_jump, o, p)?;
+        let mut next = body;
+        next.tick(acceleration, jump, p, &scene.boxes);
+        if !scene.covers(body.position, next.position, p) {
+            return Err("Input prediction leaves observed collision geometry".into());
+        }
+        body = next;
+        frames.push((body.position, body.on_ground));
+    }
+    Err("No bounded held-input trajectory reaches the requested waypoint".into())
+}
 struct Snapshot {
     at: Instant,
     requested_at: Instant,
@@ -261,7 +378,6 @@ impl Actor {
         parameters(&initial)?;
         let epoch = w.corrections.load(Ordering::Acquire);
         let scene = Scene::new(&initial)?;
-        let initial_position = position(&initial)?;
         w.entity.store(
             initial.player["entity_id"]
                 .as_i64()
@@ -269,18 +385,7 @@ impl Actor {
                 .ok_or("Native entity ID missing")?,
             Ordering::Release,
         );
-        let mut velocity = [0.; 3];
-        for (i, v) in velocity.iter_mut().enumerate() {
-            *v = initial.player["velocity"][i]
-                .as_f64()
-                .filter(|v| v.is_finite())
-                .unwrap_or(0.);
-        }
-        let body = Body {
-            position: initial_position,
-            velocity,
-            on_ground: initial.player["on_ground"] == true,
-        };
+        let body = observed_body(&initial)?;
         let cache = Arc::new(Cache {
             latest: Mutex::new(Some(Arc::new(Snapshot {
                 at: Instant::now(),
@@ -458,11 +563,7 @@ impl Actor {
                             if d.input_started.is_some_and(|at| at.elapsed() >= d.expiry) {
                                 release(&mut d, Outcome::Expired);
                             }
-                            if d.released.is_none()
-                                && (!d.jump || p.medium != Medium::Air)
-                                && distance(e.body.position, d.target) < 0.08
-                                && e.body.velocity[0].hypot(e.body.velocity[2]) < 0.025
-                                && (e.body.on_ground || p.medium != Medium::Air)
+                            if d.released.is_none() && arrived(&e.body, d.target, d.jump, p.medium)
                             {
                                 release(&mut d, Outcome::Observed);
                             }
@@ -515,65 +616,8 @@ impl Actor {
                     if let Some(d) = &mut e.drive
                         && d.released.is_none()
                     {
-                        let delta = [
-                            d.target[0] - body.position[0],
-                            0.,
-                            d.target[2] - body.position[2],
-                        ];
-                        let len = (delta[0] * delta[0] + delta[2] * delta[2]).sqrt();
-                        let speed = snapshot.o.player["movement_speed"]
-                            .as_f64()
-                            .filter(|n| n.is_finite() && *n >= 0. && *n <= 4.)
-                            .ok_or("Native movement speed missing")?;
-                        let slow = if snapshot.o.player["sneaking"] == true {
-                            0.3
-                        } else if snapshot.o.player["using_item"] == true {
-                            0.2
-                        } else {
-                            1.
-                        };
-                        let accel = if p.medium == Medium::Air {
-                            if body.on_ground {
-                                speed * 0.21600002 / friction.max(0.01).powi(3)
-                            } else if p.sprinting {
-                                0.026
-                            } else {
-                                0.02
-                            }
-                        } else {
-                            0.02
-                        };
-                        let desired = (speed * 2.1585 * slow).min(len * 0.5);
-                        let mut change = [
-                            if len > 1e-9 {
-                                delta[0] / len * desired - body.velocity[0]
-                            } else {
-                                -body.velocity[0]
-                            },
-                            0.,
-                            if len > 1e-9 {
-                                delta[2] / len * desired - body.velocity[2]
-                            } else {
-                                -body.velocity[2]
-                            },
-                        ];
-                        let amount = (change[0] * change[0] + change[2] * change[2]).sqrt();
-                        let factor = if amount > accel * slow {
-                            accel * slow / amount
-                        } else {
-                            1.
-                        };
-                        for v in &mut change {
-                            *v *= factor;
-                        }
-                        acceleration = change;
-                        jump = d.jump && (p.medium != Medium::Air || body.on_ground);
-                        if jump && p.medium == Medium::Air {
-                            d.jump = false;
-                        }
-                        if p.medium != Medium::Air && d.target[1] > body.position[1] + 0.1 {
-                            jump = true;
-                        }
+                        (acceleration, jump) =
+                            steering(&body, d.target, &mut d.jump, &snapshot.o, p)?;
                     }
                     let mut next = e.body;
                     next.tick(acceleration, jump, p, &snapshot.scene.boxes);
@@ -717,6 +761,16 @@ impl Actor {
                 "Target exceeds the currently observed local waypoint range",
             ));
         }
+        let mut predicted = before.clone();
+        predicted.player["position"] = json!(e.body.position);
+        predicted.player["velocity"] = json!(e.body.velocity);
+        predicted.player["on_ground"] = json!(e.body.on_ground);
+        preview(&predicted, target, *jump).map_err(|error| {
+            ApiError::new(
+                ErrorCode::UnsupportedCapability,
+                format!("No supported held-input trajectory: {error}"),
+            )
+        })?;
         e.drive = Some(Drive {
             action: request.clone(),
             target,
@@ -783,6 +837,59 @@ fn finish_interrupted(d: Drive, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn input_prediction_fixture() -> Observation {
+        let mut blocks = Vec::new();
+        for x in -4..=4 {
+            for y in -3..=4 {
+                for z in -4..=4 {
+                    blocks.push(json!({"position":[x,y,z],"friction":0.6,"speed_factor":1.,"collision":if y==0 || y == -3 {json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+                }
+            }
+        }
+        Observation {
+            revision: "fixture".into(),
+            menu: Value::Null,
+            player: json!({"uuid":"fixture","dimension":"minecraft:overworld","position":[0.5,1.,0.5],"velocity":[0.,0.,0.],"health":20.,"movement_speed":0.1,"on_ground":true,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
+            world: json!({"blocks":blocks}),
+        }
+    }
+    fn diagonal_gap_fixture() -> Observation {
+        let mut o = input_prediction_fixture();
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            if row["position"][0] == -1
+                && row["position"][1] == 0
+                && row["position"][2]
+                    .as_i64()
+                    .is_some_and(|z| (-1..=2).contains(&z))
+            {
+                row["collision"] = json!([]);
+            }
+        }
+        o.player["entity_id"] = json!(7);
+        o
+    }
+    #[test]
+    fn input_preview_rejects_the_native_diagonal_gap_that_constant_speed_admitted() {
+        let o = diagonal_gap_fixture();
+        assert!(
+            control::preview(&o, [-1.5, 1., 1.5], true).is_err(),
+            "A reachable constant-speed arc is not evidence that held-input acceleration can reach its landing"
+        );
+    }
+    #[test]
+    fn input_preview_can_steer_from_observed_airborne_momentum() {
+        let mut o = input_prediction_fixture();
+        o.player["position"] = json!([0.5, 1.3, 0.5]);
+        o.player["velocity"] = json!([0.12, 0.3, 0.]);
+        o.player["on_ground"] = json!(false);
+        let frames = control::preview(&o, [2.5, 1., 1.5], false).unwrap();
+        assert!(
+            frames[0].0[1] > 1.3,
+            "Native upward momentum is not an immediate forced descent"
+        );
+        let (last, ground) = frames.last().unwrap();
+        assert!(*ground && distance(*last, [2.5, 1., 1.5]) < 0.08);
+    }
     use std::net::TcpListener;
 
     fn wait_until(test: impl Fn() -> bool) {
@@ -925,6 +1032,43 @@ mod tests {
         )
         .unwrap();
         wait_until(|| packets.load(Ordering::Acquire) >= 3);
+        let unreachable = ActionRequest {
+            action_id: "fixture-reject-before-input".into(),
+            action: Action::StartMove {
+                target: Position {
+                    x: -1.5,
+                    y: 1.,
+                    z: 1.5,
+                },
+                jump: true,
+                max_ticks: 100,
+            },
+        };
+        let rejected_state = Arc::new(Mutex::new(Receipt {
+            action_id: unreachable.action_id.clone(),
+            outcome: Outcome::Running,
+            adapter_version: VERSION.into(),
+            evidence: json!({}),
+            error: None,
+        }));
+        assert_eq!(
+            actor
+                .start_control(
+                    diagonal_gap_fixture(),
+                    &unreachable,
+                    0,
+                    rejected_state.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::UnsupportedCapability,
+        );
+        assert!(
+            actor.engine.lock().unwrap().drive.is_none(),
+            "Rejected admission cannot install input"
+        );
+        assert_eq!(rejected_state.lock().unwrap().evidence, json!({}));
         let request = ActionRequest {
             action_id: "fixture-expire".into(),
             action: Action::StartMove {
