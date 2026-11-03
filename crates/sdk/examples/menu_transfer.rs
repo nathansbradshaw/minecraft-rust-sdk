@@ -2,6 +2,7 @@
 //! Operator-run acceptance example; refuses to overwrite an existing stack.
 use minecraft_sdk::*;
 use serde_json::Value;
+use std::time::Duration;
 type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn stack(o: &Observation, slot: i16) -> AnyResult<Value> {
     let row = o.menu["slots"]
@@ -50,18 +51,21 @@ async fn main() -> AnyResult<()> {
             return Err("Menu changed; inspect before continuing".into());
         }
         let receipt = client
-            .act(&ActionRequest {
-                action_id: format!("menu-transfer-{nonce}-{step}"),
-                action: Action::ClickSlot {
-                    menu_id: current.menu["menu_id"].as_i64().ok_or("Menu missing")? as i32,
-                    state_id: current.menu["state_id"]
-                        .as_i64()
-                        .ok_or("Revision missing")? as i32,
-                    slot,
-                    button: 0,
-                    mode: 0,
+            .perform(
+                &ActionRequest {
+                    action_id: format!("menu-transfer-{nonce}-{step}"),
+                    action: Action::ClickSlot {
+                        menu_id: current.menu["menu_id"].as_i64().ok_or("Menu missing")? as i32,
+                        state_id: current.menu["state_id"]
+                            .as_i64()
+                            .ok_or("Revision missing")? as i32,
+                        slot,
+                        button: 0,
+                        mode: 0,
+                    },
                 },
-            })
+                Duration::from_secs(10),
+            )
             .await?;
         println!("{} {:?}", receipt.action_id, receipt.outcome);
         if receipt.outcome != Outcome::Observed {
