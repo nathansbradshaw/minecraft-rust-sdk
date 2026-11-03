@@ -4,7 +4,7 @@ use serde_json::json;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() == 3 && args[0] == "watch" {
+    if args.len() == 3 && matches!(args[0].as_str(), "watch" | "idle") {
         let url = reqwest::Url::parse(&args[1])?;
         let samples: usize = args[2].parse()?;
         if url.scheme() != "http"
@@ -47,7 +47,17 @@ async fn main() -> Result<()> {
             if busy > 2 {
                 return Err("Observed upstream concurrency exceeded two".into());
             }
+            if args[0] == "idle" && busy == 0 {
+                println!(
+                    "{}",
+                    json!({"event":"upstream_idle","tools_executed":false,"model_calls":0})
+                );
+                return Ok(());
+            }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        if args[0] == "idle" {
+            return Err("No idle inference boundary within the bounded observation window".into());
         }
         println!(
             "{}",
