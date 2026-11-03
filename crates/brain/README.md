@@ -47,7 +47,12 @@ minecraft-sdk-brain run /workspace/brain/config.json
 The private mode-600 JSON config supplies `profile`, `model_key`, `model_endpoint`,
 `workspace`, `state`, `goal`, optional `cargo_target`, `max_turns` (default 64),
 `tool_timeout_secs` (240), `model_interval_secs` (31), and `exit_on_complete`
-(false). Paths and endpoint are deployment configuration, never compiled server
+(false). An optional `instructions` string (default empty, at most 2,048 UTF-8
+bytes) supplies standing client behavior preferences, such as preserving other
+players' builds. It stays separate from replaceable player goals and appears
+intact in planning and conversation context. It grants no server or host
+privileges and imposes no mandatory SDK behavior policy.
+Paths and endpoint are deployment configuration, never compiled server
 addresses. Use the existing per-bot Cargo cache/target where compatible; do not
 create duplicate caches for each command. Model credentials must be a separately
 allocated per-bot key accepted by a compatible HTTPS inference proxy. SDK public
@@ -59,8 +64,9 @@ must include legacy admissions whose model identity is unknown; these are charge
 conservatively against each model ceiling. Do not infer remaining allowance from
 identified Sol/Luna rows alone or reset a ledger to continue an evaluation.
 Explicit `allocation_daily_limit` and `allocation_pacing` responses may supply a
-bounded `retry_at_utc`. The brain waits for that clock event while its body and
-other model lane remain available. Conversation retains unacknowledged input for
+bounded `retry_at_utc`. Daily exhaustion is recorded per model across restarts;
+the planner can use the other available allocated model. When both are exhausted,
+it waits for a reset while the body remains active. Conversation retains unacknowledged input for
 that retry. Authentication, schema, queue, provider and clock-rollback failures
 require investigation rather than unchanged automatic requests.
 
@@ -68,6 +74,9 @@ require investigation rather than unchanged automatic requests.
 allocated inference capability without connecting a character or executing a
 returned tool. Record its actual admission and outcome; it proves inference,
 not gameplay intelligence. The key stays in its private local file.
+Append a private mode-600 context file to replay a saved bounded context with the
+same prompt and schema. Returned commands remain data and are not executed by
+this diagnostic. Disclose changed contexts and prompts in comparisons.
 The operator can run `model-probe watch http://LOOPBACK:PORT/health SAMPLES`
 outside the bot containers to sample the independent inference service's `busy`
 counter. It accepts1–240 samples, checks at250ms intervals and fails above two
