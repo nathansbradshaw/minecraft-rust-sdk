@@ -1,5 +1,112 @@
 use super::*;
 #[tokio::test]
+async fn delayed_interactions_return_final_feedback_without_leasing_the_survival_gate() {
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", http.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture-key".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let shared = Arc::new(Shared {
+        mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
+        feedback: Mutex::new(crate::feedback::Trace::default()),
+        emergency: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        latest: Mutex::new(None),
+        reason: Mutex::new(String::new()),
+        failed: tokio::sync::Notify::new(),
+    });
+    let gate = shared.clone();
+    let upstream = tokio::spawn(async move {
+        let mut methods = Vec::new();
+        for phase in 0..2 {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                header.push(byte[0]);
+                assert!(header.len() < 8192);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let first = header.lines().next().unwrap().to_owned();
+            methods.push(first.clone());
+            let size = header
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(size < 8192);
+            let mut body = vec![0; size];
+            socket.read_exact(&mut body).await.unwrap();
+            if phase == 0 {
+                assert!(first.starts_with("POST /v1/bots/own/actions "));
+                assert_eq!(
+                    serde_json::from_slice::<ActionRequest>(&body)
+                        .unwrap()
+                        .action_id,
+                    "delayed-program"
+                );
+            } else {
+                assert!(first.starts_with("GET /v1/bots/own/actions/delayed-program "));
+                assert!(
+                    gate.mutation.try_lock().is_ok(),
+                    "Waiting for a game effect must not block survival preemption"
+                );
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let body=json!({"action_id":"delayed-program","outcome":if phase==0{"running"}else{"observed"},"adapter_version":"fixture","evidence":{"native_effect_verified":phase==1},"error":null}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+        methods
+    });
+    let (mut caller, server) = tokio::net::UnixStream::pair().unwrap();
+    let state = shared.clone();
+    let task = tokio::spawn(async move { proxy(server, client, state).await });
+    let request = LocalActionRequest {
+        version: LOCAL_CONTROL_VERSION,
+        request: ActionRequest {
+            action_id: "delayed-program".into(),
+            action: Action::UseItem { hand: Hand::Main },
+        },
+    };
+    let mut bytes = serde_json::to_vec(&request).unwrap();
+    bytes.push(b'\n');
+    caller.write_all(&bytes).await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), caller.read_to_end(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    let response: LocalActionResponse = serde_json::from_slice(&reply).unwrap();
+    assert!(
+        matches!(response,LocalActionResponse::Receipt(r) if r.outcome==Outcome::Observed && r.evidence["native_effect_verified"]==true),
+        "An initial running dispatch is not the result of a completed experiment"
+    );
+    task.await.unwrap().unwrap();
+    let methods = upstream.await.unwrap();
+    assert_eq!(methods.len(), 2);
+    let trace = shared.feedback.lock().unwrap().since(0);
+    assert_eq!(trace["requests"][0]["response"]["outcome"], "observed");
+    assert_eq!(
+        trace["requests"][0]["response"]["native_effect_verified"],
+        true
+    );
+}
+#[tokio::test]
 async fn real_local_proxy_returns_the_receipt_and_retains_only_compact_diagnostics() {
     let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/", http.local_addr().unwrap());

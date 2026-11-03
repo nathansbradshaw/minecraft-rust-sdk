@@ -14,6 +14,14 @@ that session do not replenish it. The next routine decision returns to Luna;
 `develop` can explicitly request further coding work. Provider admission budgets
 and body/conversation execution remain independent of this scheduling hint.
 
+The local action proxy waits up to ten seconds for nonmovement interaction
+effects after releasing the survival mutation gate. Child programs and experiment
+feedback receive the resulting native receipt rather than mistaking dispatch for
+completion. Finite movement and cancellation remain prompt and inspectable;
+longer effects can still return `Running`. `interaction-probe` exercises this
+boundary inside the container without model calls. It is a declared integration
+diagnostic and does not establish autonomous gameplay or Survival competence.
+
 The `observe` tool accepts an empty input for a compact overview, or a JSON query
 such as `{"view":"menu","limit":16}` or
 `{"view":"entities","match_id":"minecraft:item"}`. Views `menu`, `inventory`,

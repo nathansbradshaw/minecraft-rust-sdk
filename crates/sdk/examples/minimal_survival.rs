@@ -16,7 +16,10 @@ impl Probe {
             action_id: format!("{}-{}", self.prefix, self.next),
             action,
         };
-        let receipt = self.client.act(&request).await?;
+        let receipt = self
+            .client
+            .perform(&request, Duration::from_secs(10))
+            .await?;
         println!("{} {:?}", receipt.action_id, receipt.outcome);
         if receipt.outcome != Outcome::Observed {
             return Err(format!(

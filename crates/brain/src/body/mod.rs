@@ -276,8 +276,24 @@ async fn proxy(
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
                 return Err("Local action caller disconnected".into());
             }
-            let result = client.act(&request.request).await;
+            let mut result = client.act(&request.request).await;
             drop(guard);
+            if let Ok(receipt) = &result
+                && receipt.outcome == Outcome::Running
+                && !matches!(
+                    request.request.action,
+                    Action::StartMove { .. }
+                        | Action::CancelControl { .. }
+                        | Action::CancelUseItem { .. }
+                )
+            {
+                // Keep body preemption and conversation live while the game's
+                // interaction develops. Dispatch only once; waiting reads the
+                // same durable ID and preserves cancellation/uncertainty.
+                result = client
+                    .wait_for_action(&request.request.action_id, Duration::from_secs(10))
+                    .await;
+            }
             match result {
                 Ok(r) => LocalActionResponse::Receipt(r),
                 Err(e) => LocalActionResponse::Error(e),
