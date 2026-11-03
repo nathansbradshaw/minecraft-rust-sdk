@@ -156,6 +156,9 @@ pub fn focused(observation: &Observation, input: &str) -> Result<Value> {
         "menu":{"menu_id":observation.menu["menu_id"],"state_id":observation.menu["state_id"],"type":observation.menu["type"],"carried":fields(&observation.menu["carried"], &["item","count"])},
         "page":{"offset":query.offset,"returned":entries.len(),"total_in_snapshot":rows.len(),"next_offset":(next<rows.len()).then_some(next),"complete":next==rows.len(),"binding":"Each page is live, not an atomic multi-page snapshot. Match stable entity IDs or slot numbers; restart menu paging if menu/state ID changes. Complete describes this snapshot suffix only; omitted records are unknown."}});
     result[scope][field] = json!(entries);
+    if query.view == "menu" {
+        result["menu"]["summary"] = json!(crate::containers::menu_summary(&observation.menu));
+    }
     Ok(result)
 }
 

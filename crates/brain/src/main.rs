@@ -11,6 +11,31 @@ async fn main() {
 }
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "container-memory" {
+        let cfg: Config =
+            serde_json::from_slice(&private_read(std::path::Path::new(&args[1]), 16384)?)?;
+        let profile: minecraft_sdk::Profile =
+            serde_json::from_slice(&private_read(&cfg.profile, 16384)?)?;
+        let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
+        let imported = journal
+            .import_container_history(&profile.instance_id, &profile.credential.player_uuid)?;
+        let context: serde_json::Value = journal
+            .get("last_model_context")?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default();
+        let observation = minecraft_sdk::Observation {
+            revision: "historical-context".into(),
+            player: serde_json::json!({"uuid":profile.credential.player_uuid,"dimension":context["observation"]["player"]["dimension"]}),
+            world: context["observation"]["world"].clone(),
+            menu: serde_json::Value::Null,
+        };
+        println!(
+            "{}",
+            serde_json::json!({"imported":imported,"containers":journal.recalled_containers(&profile.instance_id,&observation)?,"scope":"historical local memory; visibility from last saved context, not a current observation","native_connections_opened":0,"models_called":0})
+        );
+        return Ok(());
+    }
     if args.len() == 2 && args[0] == "memory-index" {
         let state = std::path::Path::new(&args[1]);
         let path = state.join("brain.sqlite");

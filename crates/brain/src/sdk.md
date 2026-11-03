@@ -18,6 +18,16 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   structure and original inventory/menu slot identifiers; omitted cells are
   unknown. Historical journal views may have an older compact format: consult
   the current SDK types and a fresh runtime observation when writing programs.
+- Compact and focused menu views add menu.summary from the complete received
+  SDK slot snapshot. It counts all non-player slots and their occupied slots,
+  with up to sixteen item totals; omitted_item_types reports other types. Null
+  means unknown, never empty. A full SDK Observation still exposes menu.slots.
+  inspected_containers in model context contains scoped historical inspections,
+  with stable entity UUIDs or clicked block positions, receipt hashes and sample
+  times. Transient menu/entity IDs are not saved as reusable handles. Contents
+  may change; use new observations when evidence warrants another inspection.
+  `minecraft-sdk-brain container-memory PRIVATE_CONFIG.json` indexes existing
+  receipts and reads historical memory without connecting or calling a model.
 - Action::StartMove { target: Position{x,y,z}, jump: bool, max_ticks: u16 } is
   finite, ordinary movement. Action::CancelControl { action_id:String } cancels
   that control. Legacy Move, Jump and MotionFrame are disabled in protected

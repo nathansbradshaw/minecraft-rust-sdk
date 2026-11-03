@@ -12,6 +12,8 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS memory_search_update AFTER UPDATE OF text ON memory BEGIN DELETE FROM memory_search WHERE rowid=old.id; INSERT INTO memory_search(rowid,text) VALUES(new.id,new.text); END;
         INSERT INTO memory_search(rowid,text) SELECT id,text FROM memory WHERE id NOT IN (SELECT rowid FROM memory_search);
         CREATE TABLE IF NOT EXISTS observed_places(key TEXT PRIMARY KEY, memory_id INTEGER NOT NULL, signature TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS container_inspections(instance TEXT NOT NULL,actor TEXT NOT NULL,dimension TEXT NOT NULL,origin_key TEXT NOT NULL,action_id TEXT NOT NULL,game_time INTEGER NOT NULL,at INTEGER NOT NULL,snapshot TEXT NOT NULL,PRIMARY KEY(instance,actor,action_id));
+        CREATE INDEX IF NOT EXISTS container_inspections_scope ON container_inspections(instance,actor,dimension,game_time DESC);
         COMMIT;")?;
     Ok(())
 }

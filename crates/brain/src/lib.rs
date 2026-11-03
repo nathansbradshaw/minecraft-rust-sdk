@@ -1,6 +1,7 @@
 //! Container-local coding-agent harness. Trusted gameplay authority stays in SDK
 //! gateway/server components. Model completion claims never certify game effects.
 pub mod body;
+pub mod containers;
 pub mod conversation;
 pub mod feedback;
 pub mod memory;
@@ -544,7 +545,7 @@ impl Brain {
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
         journal.context_contract(&digest(
             concat!(
-                "sdk-shaped-observation-v1\nfocused-observation-v1\nretrievable-memory-v1\n",
+                "sdk-shaped-observation-v1\nfocused-observation-v1\nretrievable-memory-v1\ncontainer-inspection-memory-v1\n",
                 include_str!("sdk.md")
             )
             .as_bytes(),
@@ -564,6 +565,11 @@ impl Brain {
         let mut profile: Profile = serde_json::from_slice(&private_read(&cfg.profile, 16384)?)?;
         let mut client = Client::with_profile(&profile)?.without_local_arbiter();
         let info = client.verify_instance(&profile.instance_id).await?;
+        let imported = journal
+            .import_container_history(&profile.instance_id, &profile.credential.player_uuid)?;
+        if imported > 0 {
+            journal.event("container_history_indexed",json!({"inspections":imported,"native_actions_replayed":false,"authority":"historical local SDK receipts only"}))?;
+        }
         if let Err(e) = client.observe().await {
             if e.code == ErrorCode::SessionRequired {
                 profile.session = None;
@@ -699,8 +705,8 @@ impl Brain {
         let mut receipt = self
             .client
             .act(&ActionRequest {
-                action_id: id,
-                action,
+                action_id: id.clone(),
+                action: action.clone(),
             })
             .await?;
         drop(_guard);
@@ -711,6 +717,19 @@ impl Brain {
                 .await?;
         }
         self.journal.resolve_pending(&receipt)?;
+        if let Some(snapshot) = containers::inspection(
+            &ActionRequest {
+                action_id: id,
+                action,
+            },
+            &receipt,
+        ) {
+            self.journal.remember_container(
+                &self.server.instance_id,
+                self.observed.player["uuid"].as_str().unwrap_or_default(),
+                &snapshot,
+            )?;
+        }
         self.journal
             .event("action_receipt", serde_json::to_value(&receipt)?)?;
         self.observed = self.client.observe().await?;
@@ -720,6 +739,11 @@ impl Brain {
         let receipt = self.client.action_status(id).await?;
         ensure(receipt.action_id == id, "Status receipt action ID mismatch")?;
         self.journal.resolve_pending(&receipt)?;
+        self.journal.remember_container_receipt(
+            &self.server.instance_id,
+            self.observed.player["uuid"].as_str().unwrap_or_default(),
+            &receipt,
+        )?;
         self.journal
             .event("action_status", serde_json::to_value(&receipt)?)?;
         Ok(receipt)
@@ -852,6 +876,9 @@ impl Brain {
                 .unwrap_or(json!([]));
             let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
+            context["inspected_containers"] = self
+                .journal
+                .recalled_containers(&self.server.instance_id, &self.observed)?;
             context["model_availability"] = self.journal.model_availability(now())?;
             context["last_experiment"] = self
                 .journal
@@ -1090,7 +1117,7 @@ pub fn projection(o: &Observation) -> Value {
             .then_with(|| distance(a).total_cmp(&distance(b)))
     });
     let entities: Vec<_> = entities.into_iter().take(24).map(views::entity).collect();
-    json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"world":{"blocks":blocks,"entities":entities,"chat":o.world["chat"].as_array().map(|c|c.iter().skip(c.len().saturating_sub(24)).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"]},"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"]}})
+    json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"world":{"blocks":blocks,"entities":entities,"chat":o.world["chat"].as_array().map(|c|c.iter().skip(c.len().saturating_sub(24)).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"]},"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"],"summary":containers::menu_summary(&o.menu)}})
 }
 /// Compact large strings/arrays without losing the structure of errors or player
 /// facts. Array tails contain newer journal feedback and are retained first.
@@ -1109,6 +1136,7 @@ fn fit_context(context: &mut Value) -> Result<()> {
     for (field, budget) in [
         ("server", 2500),
         ("memory", 5000),
+        ("inspected_containers", 5000),
         ("recent", 3000),
         ("observation", 6000),
         ("development_request", 1000),
@@ -1127,6 +1155,7 @@ fn fit_context(context: &mut Value) -> Result<()> {
         ("completed_tool_activity", 512),
         ("observation", 3000),
         ("memory", 2500),
+        ("inspected_containers", 2000),
         ("last_tool_result", if focused { 7000 } else { 5000 }),
         ("server", 1500),
         ("working_notes", 1000),
@@ -1168,7 +1197,7 @@ fn shrink_value(value: &mut Value) {
                     for row in a {
                         shrink_value(row);
                     }
-                } else if matches!(key.as_str(), "blocks" | "entities")
+                } else if matches!(key.as_str(), "blocks" | "entities" | "inspected_containers")
                     && let Some(a) = v.as_array_mut()
                 {
                     // These snapshots prioritize nearest blocks and visible

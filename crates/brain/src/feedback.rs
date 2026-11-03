@@ -47,12 +47,15 @@ impl Trace {
     }
     pub fn record(&mut self, request: &ActionRequest, response: &LocalActionResponse) {
         self.sequence = self.sequence.saturating_add(1);
+        let inspection = match response {
+            LocalActionResponse::Receipt(r) => crate::containers::inspection(request, r),
+            _ => None,
+        };
         let response = match response {
             LocalActionResponse::Receipt(r) => receipt_summary(r),
             LocalActionResponse::Error(e) => json!({"action_id":request.action_id,"error":e}),
         };
-        self.records
-            .push_back(json!({"sequence":self.sequence,"request":request,"response":response}));
+        self.records.push_back(json!({"sequence":self.sequence,"request":request,"response":response,"container_inspection":inspection}));
         while self.records.len() > 64 {
             self.records.pop_front();
         }
