@@ -11,6 +11,52 @@ async fn main() {
 }
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "memory-index" {
+        let state = std::path::Path::new(&args[1]);
+        let path = state.join("brain.sqlite");
+        if !path.is_file() {
+            return Err("Existing brain state required".into());
+        }
+        let count = Journal::open(&path)?.import_program_history(state)?;
+        println!(
+            "{}",
+            serde_json::json!({"indexed_historical_files":count,"models_called":0,"native_connections_opened":0,"success_granted":false})
+        );
+        return Ok(());
+    }
+    if args.len() == 3 && args[0] == "memory-search" {
+        let state = std::path::Path::new(&args[1]);
+        let path = state.join("brain.sqlite");
+        if !path.is_file() {
+            return Err("Existing brain state required".into());
+        }
+        println!(
+            "{}",
+            Journal::open(&path)?.recall(args[2].to_str().ok_or("UTF-8 query required")?)?
+        );
+        return Ok(());
+    }
+    if args.len() == 3 && args[0] == "skill-inspect" {
+        println!(
+            "{}",
+            minecraft_sdk_brain::versions::inspect(
+                std::path::Path::new(&args[1]),
+                args[2].to_str().ok_or("UTF-8 version required")?
+            )?
+        );
+        return Ok(());
+    }
+    if args.len() == 4 && args[0] == "skill-restore" {
+        println!(
+            "{}",
+            minecraft_sdk_brain::versions::restore(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                args[3].to_str().ok_or("UTF-8 version required")?
+            )?
+        );
+        return Ok(());
+    }
     if args.len() == 2 && args[0] == "context" {
         let path = std::path::Path::new(&args[1]).join("brain.sqlite");
         if !path.is_file() {

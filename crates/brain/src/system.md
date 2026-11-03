@@ -68,6 +68,18 @@ Tools and input:
   Prefer this for Rust experiments; multiple source binaries otherwise make a
   bare cargo run ambiguous. This tool always records an experiment.
 - remember: JSON {"kind":"fact|report|hypothesis|episode|skill","text":"..."}.
+  Your notes remain agent-authored, even if named fact. Search matches related
+  goal words and labelled historical observations; it does not require an exact
+  phrase. Historical locations and claims require fresh observation. Never reuse
+  stored entity/menu/session bindings as if they were current.
+  Each Rust experiment retains content-addressed source and its outcome. Search
+  relevant programs before rewriting helpers. A candidate is usable immediately;
+  source existence and exit0 do not prove task success or skill reliability.
+  Inspect with terminal `minecraft-sdk-brain skill-inspect "$MC_SDK_STATE" VERSION`.
+  Restore with `minecraft-sdk-brain skill-restore "$MC_SDK_STATE" . VERSION`;
+  this preserves current source first and never executes code. Inspect current
+  dependencies, compile, observe and use fresh intention IDs for new work. Old
+  uncertain mutations must be inspected/reconciled without replay.
   Label player reports and hypotheses accurately. For a skill, include source path
   and evidence references; initial success is experimental rather than mastery.
 - goal: a new parameterized gameplay objective, with the reason in summary.

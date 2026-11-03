@@ -3,10 +3,12 @@
 pub mod body;
 pub mod conversation;
 pub mod feedback;
+pub mod memory;
 pub mod model;
 pub mod output;
 pub mod progress;
 pub mod tools;
+pub mod versions;
 pub mod views;
 use minecraft_sdk::{ActionRequest, Client, ErrorCode, Observation, Outcome, Profile};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -119,6 +121,7 @@ impl Journal {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         db.busy_timeout(Duration::from_secs(3))?;
         db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA max_page_count=16384;CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL);CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL);CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS investigations(subject TEXT PRIMARY KEY,remaining INTEGER NOT NULL);")?;
+        memory::initialize(&db)?;
         Ok(Self { db })
     }
     pub fn event(&self, kind: &str, data: Value) -> Result<i64> {
@@ -283,27 +286,6 @@ impl Journal {
             self.set("pending_action", "")?;
         }
         Ok(())
-    }
-    pub fn remember(&self, kind: &str, text: &str) -> Result<()> {
-        ensure(
-            ["fact", "report", "hypothesis", "episode", "skill"].contains(&kind),
-            "Memory kind required",
-        )?;
-        ensure(text.len() <= 16384, "Memory exceeds budget")?;
-        self.db.execute(
-            "INSERT INTO memory(at,kind,text) VALUES(?1,?2,?3)",
-            params![now(), kind, text],
-        )?;
-        Ok(())
-    }
-    pub fn recall(&self, query: &str) -> Result<Value> {
-        let mut q=self.db.prepare("SELECT id,at,kind,text FROM memory WHERE instr(lower(text),lower(?1))>0 ORDER BY id DESC LIMIT 12")?;
-        let mut rows = q.query([query])?;
-        let mut values = Vec::new();
-        while let Some(r) = rows.next()? {
-            values.push(json!({"id":r.get::<_,i64>(0)?,"at":r.get::<_,i64>(1)?,"kind":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?}));
-        }
-        Ok(json!(values))
     }
     pub fn history(&self, query: &str) -> Result<Value> {
         // Include the receipt immediately following a matching action intent,
@@ -559,11 +541,18 @@ impl Brain {
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
         journal.context_contract(&digest(
             concat!(
-                "sdk-shaped-observation-v1\nfocused-observation-v1\n",
+                "sdk-shaped-observation-v1\nfocused-observation-v1\nretrievable-memory-v1\n",
                 include_str!("sdk.md")
             )
             .as_bytes(),
         ))?;
+        let imported = journal.import_program_history(&cfg.state)?;
+        if imported > 0 {
+            journal.event(
+                "historical_programs_indexed",
+                json!({"files":imported,"status":"retained candidates only; no success granted"}),
+            )?;
+        }
         let mut random = [0; 16];
         use std::io::Read;
         fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
@@ -653,6 +642,8 @@ impl Brain {
         } else {
             self.client.observe().await?
         };
+        self.journal
+            .remember_observation(&self.server.instance_id, &self.observed)?;
         if let Some(goal) = self.journal.get("goal")? {
             self.goal = goal;
         }
@@ -906,7 +897,31 @@ impl Brain {
                 &self.cfg.workspace,
                 &self.cfg.state,
             )?;
+            let program_version = if choice.tool == "run"
+                || (choice.tool == "terminal" && choice.experiment)
+            {
+                match versions::snapshot(&self.cfg.workspace, &self.cfg.state) {
+                    Ok(version) => version,
+                    Err(error) => {
+                        self.journal.event("skill_snapshot_error",json!({"error":error.to_string(),"execution":"still allowed; no source version claimed"}))?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let result = tools::execute(self, &choice).await;
+            if let (Some(version), Ok(value)) = (&program_version, &result)
+                && let Err(error) = self.journal.remember_program(
+                    &self.cfg.state,
+                    version,
+                    &requested_goal,
+                    &choice,
+                    value,
+                )
+            {
+                self.journal.event("skill_memory_error",json!({"error":error.to_string(),"version":version,"execution":"result retained independently"}))?;
+            }
             let completed = completing
                 && result.is_ok()
                 && self
@@ -1050,7 +1065,7 @@ fn fit_context(context: &mut Value) -> Result<()> {
     let focused = context["last_tool_result"]["result"]["view"].is_string();
     for (field, budget) in [
         ("server", 2500),
-        ("memory", 1000),
+        ("memory", 5000),
         ("recent", 3000),
         ("observation", 6000),
         ("development_request", 1000),
@@ -1068,7 +1083,7 @@ fn fit_context(context: &mut Value) -> Result<()> {
         ("recent", 1000),
         ("completed_tool_activity", 512),
         ("observation", 3000),
-        ("memory", 512),
+        ("memory", 2500),
         ("last_tool_result", if focused { 7000 } else { 5000 }),
         ("server", 1500),
         ("working_notes", 1000),
