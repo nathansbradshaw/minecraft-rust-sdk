@@ -88,6 +88,10 @@ and defer new program actions while evading. Continue coding/chatting; inspect
 fresh state and resume afterwards. Legacy blocking move/jump/motion_frame are
 rejected in protected coding workspaces. Pending-action inspection and explicit
 reconciliation remain available; interrupted mutations are never auto-replayed.
+A local admission Conflict explicitly saying no mutation was submitted means
+the body did not forward that request to the gateway. It is not an uncertain
+game effect. Inspect the body reason and fresh observations rather than looking
+up or reconciling an action that was never submitted; do not poll unchanged danger.
 
 For Rust programs, SDK exports Client, Profile, Action, ActionRequest and Outcome.
 Load Profile from the MC_SDK_PROFILE environment path, create Client::with_profile,

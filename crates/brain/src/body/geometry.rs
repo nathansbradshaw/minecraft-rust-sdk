@@ -310,61 +310,79 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
     let mut best_score = current + 0.4;
+    // Narrow ledges rarely line up with a fixed angle and stride. Include
+    // observed collision-top centres as landings, without inventing support.
+    let mut candidates = Vec::new();
+    for b in &obstacles {
+        let p = [(b[0] + b[3]) / 2., b[4], (b[2] + b[5]) / 2.];
+        let horizontal = ((p[0] - start[0]).powi(2) + (p[2] - start[2]).powi(2)).sqrt();
+        if (0.35..=3.2).contains(&horizontal) && (-1.001..=1.001).contains(&(p[1] - start[1])) {
+            candidates.push(p);
+        }
+    }
     for n in 0..16 {
         let a = f64::from(n) * std::f64::consts::PI / 8.;
         for length in [2.8, 1.8, 0.9] {
             for dy in [0., 1., -1.] {
-                let p = [
+                candidates.push([
                     start[0] + a.cos() * length,
                     start[1] + dy,
                     start[2] + a.sin() * length,
-                ];
-                if blocked.contains(&target_key(p)) {
-                    continue;
-                }
-                if !supported(&cells, p, &obstacles) || !clear(&cells, p, &obstacles) {
-                    continue;
-                }
-                let jump = dy > 0.1;
-                let route = if dy < 0. {
-                    descending_route(&cells, start, p, &obstacles)
-                } else {
-                    (0..=20).all(|i| {
-                        let t = f64::from(i) / 20.;
-                        let mut q = [
-                            start[0] + (p[0] - start[0]) * t,
-                            start[1] + dy * t,
-                            start[2] + (p[2] - start[2]) * t,
-                        ];
-                        if jump {
-                            q[1] += 1.25 * (std::f64::consts::PI * t).sin();
-                        }
-                        clear(&cells, q, &obstacles) && (jump || supported(&cells, q, &obstacles))
-                    })
-                };
-                if !route {
-                    continue;
-                }
-                let value = score(p) - length * 0.1;
-                if value > best_score {
-                    best_score = value;
-                    best = Some(Escape {
-                        target: Position {
-                            x: p[0],
-                            y: p[1],
-                            z: p[2],
-                        },
-                        jump,
-                        reason: if projectile_danger {
-                            "evade incoming projectile"
-                        } else if burning {
-                            "leave burning terrain"
-                        } else {
-                            "increase threat distance and seek cover"
-                        }
-                        .into(),
-                    });
-                }
+                ]);
+            }
+        }
+    }
+    for p in candidates {
+        let dy = p[1] - start[1];
+        let length = ((p[0] - start[0]).powi(2) + (p[2] - start[2]).powi(2)).sqrt();
+        for jump in [false, true] {
+            if (dy > 0.1 && !jump) || (jump && o.player["on_ground"] == false) {
+                continue;
+            }
+            if blocked.contains(&target_key(p)) {
+                continue;
+            }
+            if !supported(&cells, p, &obstacles) || !clear(&cells, p, &obstacles) {
+                continue;
+            }
+            let route = if dy < 0. && !jump {
+                descending_route(&cells, start, p, &obstacles)
+            } else {
+                (0..=20).all(|i| {
+                    let t = f64::from(i) / 20.;
+                    let mut q = [
+                        start[0] + (p[0] - start[0]) * t,
+                        start[1] + dy * t,
+                        start[2] + (p[2] - start[2]) * t,
+                    ];
+                    if jump {
+                        q[1] += 1.25 * (std::f64::consts::PI * t).sin();
+                    }
+                    clear(&cells, q, &obstacles) && (jump || supported(&cells, q, &obstacles))
+                })
+            };
+            if !route {
+                continue;
+            }
+            let value = score(p) - length * 0.1 - if jump { 0.2 } else { 0. };
+            if value > best_score {
+                best_score = value;
+                best = Some(Escape {
+                    target: Position {
+                        x: p[0],
+                        y: p[1],
+                        z: p[2],
+                    },
+                    jump,
+                    reason: if projectile_danger {
+                        "evade incoming projectile"
+                    } else if burning {
+                        "leave burning terrain"
+                    } else {
+                        "increase threat distance and seek cover"
+                    }
+                    .into(),
+                });
             }
         }
     }
@@ -389,6 +407,50 @@ mod tests {
             world: json!({"blocks":blocks,"entities":[{"visible":true,"hostile":true,"position":[2.5,1.,0.5]}]}),
             menu: Value::Null,
         }
+    }
+    #[test]
+    fn a_narrow_lower_landing_across_a_gap_uses_an_observed_jump_target() {
+        let mut o = world();
+        o.player = json!({"position":[0.375629,2.,0.701009],"on_ground":true});
+        o.world["entities"][0]["position"] = json!([3.7, 1., -2.4]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = b["position"].clone();
+            b["block"] = json!("minecraft:air");
+            b["collision"] = json!([]);
+            if p == json!([0, 0, 0]) || p == json!([0, 1, 0]) {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            } else if p == json!([-1, 0, 2]) {
+                b["block"] = json!("mod:narrow_landing");
+                b["collision"] = json!([[0.2, 0., 0.2, 0.8, 1., 0.8]]);
+            }
+        }
+        let escape = evade(&o).expect("A lower landing requires jumping across the observed gap");
+        assert!(escape.jump);
+        assert_eq!(
+            [escape.target.x, escape.target.y, escape.target.z],
+            [-0.5, 1., 2.5]
+        );
+        let mut lava = o.clone();
+        for b in lava.world["blocks"].as_array_mut().unwrap() {
+            if b["position"] == json!([-1, 0, 2]) {
+                b["block"] = json!("minecraft:lava");
+            }
+        }
+        assert!(
+            evade(&lava).is_none(),
+            "A known hazard cannot become a landing"
+        );
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][1] == 4 {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        assert!(
+            evade(&o).is_none(),
+            "The jump arc must respect an observed low ceiling"
+        );
     }
     #[test]
     fn escape_increases_distance_without_assuming_unknown_terrain_is_air() {

@@ -8,8 +8,19 @@ use std::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "inspect-observation" {
+        let bytes = private_read(Path::new(&args[1]), 1024 * 1024)?;
+        let observed: minecraft_sdk::Observation = serde_json::from_slice(&bytes)?;
+        let geometry = minecraft_sdk_brain::body::geometry::evade(&observed)
+            .map(|route| json!({"target":route.target,"jump":route.jump,"reason":route.reason}));
+        println!(
+            "{}",
+            json!({"event":"body_observation_diagnostic","scope":"offline copied observation; no connection or gameplay mutation","observation_sha256":minecraft_sdk_brain::digest(&bytes),"revision":observed.revision,"position":observed.player["position"],"health":observed.player["health"],"threatened":minecraft_sdk_brain::body::geometry::threatened(&observed),"incoming_projectile":minecraft_sdk_brain::body::geometry::incoming(&observed),"escape":geometry})
+        );
+        return Ok(());
+    }
     if args.len() != 3 || !matches!(args[1].as_str(), "blocked" | "compile") {
-        return Err("body-probe PRIVATE_CONFIG.json blocked|compile SECONDS".into());
+        return Err("body-probe PRIVATE_CONFIG.json blocked|compile SECONDS | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
     }
     let seconds: u64 = args[2].parse()?;
     if !(1..=600).contains(&seconds) {

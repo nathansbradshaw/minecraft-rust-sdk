@@ -167,4 +167,36 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
         "abandoned intention must never reach the gateway"
     );
     assert!(shared.mutation.try_lock().is_ok());
+
+    shared.emergency.store(true, Ordering::Release);
+    let (mut caller, server) = tokio::net::UnixStream::pair().unwrap();
+    let c = client.clone();
+    let state = shared.clone();
+    let waiting = tokio::spawn(async move { proxy(server, c, state).await });
+    caller
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(4), caller.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let response: LocalActionResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        matches!(response,LocalActionResponse::Error(e) if e.code==ErrorCode::Conflict && e.message.contains("no mutation was submitted"))
+    );
+    waiting.await.unwrap().unwrap();
+    shared.emergency.store(false, Ordering::Release);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), http.accept())
+            .await
+            .is_err(),
+        "Expired admission must not dispatch later when danger clears"
+    );
+    let trace = shared.feedback.lock().unwrap().since(0);
+    assert_eq!(
+        trace["requests"][0]["response"]["error"]["code"],
+        "conflict"
+    );
 }
