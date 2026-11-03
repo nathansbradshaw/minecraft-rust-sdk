@@ -59,7 +59,8 @@ impl Handle {
                         let incoming:Vec<_>=messages.into_iter().filter(|m|m["sender_uuid"].as_str()!=Some(&own)).collect();
                         if incoming.is_empty(){sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;continue;}
                         for message in &incoming {journal.event("chat_received",message.clone())?;}
-                        let mut context=json!({"messages":incoming,"goal":brain.get("goal")?.unwrap_or_else(||cfg.goal.clone()),"player":observed.player,"body":body.view()});
+                        let requested_revision=brain.get("goal_revision")?.unwrap_or_default();
+                        let mut context=json!({"messages":incoming,"goal":brain.get("goal")?.unwrap_or_else(||cfg.goal.clone()),"goal_revision":requested_revision,"player":observed.player,"body":body.view()});
                         crate::bound_value(&mut context["messages"],12000);
                         crate::bound_value(&mut context["player"],6000);
                         let request=async {
@@ -88,12 +89,19 @@ impl Handle {
                                 continue;
                             }
                         };
-                        sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;
                         journal.event("conversation_choice",json!({"reply":reply,"usage":usage}))?;
-                        if !reply.goal.trim().is_empty() {
-                            brain.select_goal(&reply.goal,"player_goal_selected",json!({"goal":reply.goal,"reason":reply.reason,"chat_sequence":sequence}),Some(&context["messages"].to_string()))?;
+                        let selected=brain.conversation_goal(&reply,&requested_revision,&context["messages"])?;
+                        let current_revision=brain.get("goal_revision")?.unwrap_or_default();
+                        if retry_changed_goal(selected,&reply,&requested_revision,&current_revision) {
+                            journal.event("conversation_goal_superseded",json!({"requested_revision":requested_revision,"current_revision":current_revision,"retry_on_changed_revision":true,"acknowledgement_sent":false,"messages_retained":true}))?;
+                            continue;
+                        }
+                        sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;
+                        if selected {
                             brain.set("develop_next","false")?;
                             brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Rust program for composed work. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
+                        } else {
+                            journal.event("conversation_goal_retained",json!({"requested_revision":requested_revision,"current_revision":brain.get("goal_revision")?,"proposed_action":reply.goal_action,"goal":reply.goal,"chat_sequence":sequence}))?;
                         }
                         if !reply.message.is_empty() {
                             let action=Action::Chat{message:reply.message};action.validate()?;
@@ -124,5 +132,40 @@ impl Handle {
             .await??;
         }
         Ok(())
+    }
+}
+
+fn retry_changed_goal(
+    selected: bool,
+    reply: &crate::model::Conversation,
+    requested: &str,
+    current: &str,
+) -> bool {
+    !selected
+        && reply.goal_action == crate::model::GoalAction::Replace
+        && !reply.goal.trim().is_empty()
+        && requested != current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Conversation, GoalAction};
+    #[test]
+    fn only_a_changed_revision_retries_an_unaccepted_new_task() {
+        let mut reply = Conversation {
+            message: "I will collect it".into(),
+            goal_action: GoalAction::Replace,
+            goal: "collect wood".into(),
+            reason: "player request".into(),
+        };
+        assert!(retry_changed_goal(false, &reply, "old", "new"));
+        assert!(!retry_changed_goal(false, &reply, "same", "same"));
+        assert!(!retry_changed_goal(true, &reply, "old", "new"));
+        reply.goal_action = GoalAction::Continue;
+        assert!(!retry_changed_goal(false, &reply, "old", "new"));
+        reply.goal_action = GoalAction::Replace;
+        reply.goal.clear();
+        assert!(!retry_changed_goal(false, &reply, "old", "new"));
     }
 }

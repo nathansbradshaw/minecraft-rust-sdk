@@ -141,10 +141,48 @@ impl Journal {
         data: Value,
         player_request: Option<&str>,
     ) -> Result<i64> {
+        self.select_goal_checked(goal, kind, data, player_request, None)?
+            .ok_or_else(|| "Unconditional goal selection failed".into())
+    }
+    fn select_goal_checked(
+        &self,
+        goal: &str,
+        kind: &str,
+        data: Value,
+        player_request: Option<&str>,
+        expected_revision: Option<&str>,
+    ) -> Result<Option<i64>> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        if let Some(expected) = expected_revision {
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key='goal_revision'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if current.as_deref().unwrap_or_default() != expected {
+                return Ok(None);
+            }
+            let current_goal: Option<String> = tx
+                .query_row("SELECT value FROM meta WHERE key='goal'", [], |r| r.get(0))
+                .optional()?;
+            let completed: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key='completed_revision'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            // A repeated description of active work is continuation. A new
+            // request for the same completed objective still creates a task.
+            if current_goal.as_deref() == Some(goal) && completed.as_deref() != Some(expected) {
+                return Ok(None);
+            }
+        }
         tx.execute(
             "INSERT INTO events(at,kind,data) VALUES(?1,?2,?3)",
             params![now(), kind, data.to_string()],
@@ -164,7 +202,26 @@ impl Journal {
         }
         tx.commit()?;
         println!("{}", json!({"event":kind,"sequence":id,"data":data}));
-        Ok(id)
+        Ok(Some(id))
+    }
+    pub fn conversation_goal(
+        &self,
+        reply: &model::Conversation,
+        expected_revision: &str,
+        messages: &Value,
+    ) -> Result<bool> {
+        if reply.goal_action == model::GoalAction::Continue || reply.goal.trim().is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .select_goal_checked(
+                &reply.goal,
+                "player_goal_selected",
+                json!({"goal":reply.goal,"reason":reply.reason,"messages":messages}),
+                Some(&messages.to_string()),
+                Some(expected_revision),
+            )?
+            .is_some())
     }
     fn complete_goal(&self, goal: &str, revision: &str) -> Result<bool> {
         let tx = rusqlite::Transaction::new_unchecked(
@@ -829,6 +886,126 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn conversation(action: model::GoalAction, goal: &str) -> model::Conversation {
+        model::Conversation {
+            message: String::new(),
+            goal_action: action,
+            goal: goal.into(),
+            reason: "fixture".into(),
+        }
+    }
+    #[test]
+    fn conversation_continuation_preserves_active_work_and_completed_state() {
+        let t = tempfile::tempdir().unwrap();
+        let j = Journal::open(&t.path().join("brain.sqlite")).unwrap();
+        let revision = j
+            .select_goal(
+                "collect wood",
+                "fixture",
+                json!({}),
+                Some("original player request"),
+            )
+            .unwrap()
+            .to_string();
+        j.set("develop_next", "true").unwrap();
+        j.set("inspection_streak", "7").unwrap();
+        j.set("development_request", "inspect saved compiler error")
+            .unwrap();
+        let messages = json!([{"kind":"system","message":"peer joined the game"}]);
+        // Defensive handling also covers a model filling goal while saying continue.
+        for action in [model::GoalAction::Continue, model::GoalAction::Replace] {
+            assert!(
+                !j.conversation_goal(&conversation(action, "collect wood"), &revision, &messages)
+                    .unwrap()
+            );
+            assert_eq!(
+                j.get("goal_revision").unwrap().as_deref(),
+                Some(revision.as_str())
+            );
+            assert_eq!(j.get("inspection_streak").unwrap().as_deref(), Some("7"));
+            assert_eq!(j.get("develop_next").unwrap().as_deref(), Some("true"));
+            assert_eq!(
+                j.get("development_request").unwrap().as_deref(),
+                Some("inspect saved compiler error")
+            );
+            assert_eq!(
+                j.get("player_request").unwrap().as_deref(),
+                Some("original player request")
+            );
+        }
+        assert!(j.complete_goal("collect wood", &revision).unwrap());
+        assert!(
+            !j.conversation_goal(
+                &conversation(model::GoalAction::Continue, "collect wood"),
+                &revision,
+                &messages
+            )
+            .unwrap()
+        );
+        assert!(j.goal_completed("collect wood").unwrap());
+        let request = json!([{"kind":"disguised","message":"please collect another log"}]);
+        assert!(
+            j.conversation_goal(
+                &conversation(model::GoalAction::Replace, "collect wood"),
+                &revision,
+                &request
+            )
+            .unwrap()
+        );
+        assert!(!j.goal_completed("collect wood").unwrap());
+        assert_ne!(
+            j.get("goal_revision").unwrap().as_deref(),
+            Some(revision.as_str())
+        );
+        assert_eq!(j.get("player_request").unwrap(), Some(request.to_string()));
+    }
+    #[test]
+    fn delayed_conversation_cannot_replace_newer_work_from_another_connection() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("brain.sqlite");
+        let conversation_db = Journal::open(&path).unwrap();
+        let old = conversation_db
+            .select_goal("collect wood", "fixture", json!({}), None)
+            .unwrap()
+            .to_string();
+        let planner = Journal::open(&path).unwrap();
+        let newer = planner
+            .select_goal("find food", "fixture", json!({}), Some("newer request"))
+            .unwrap()
+            .to_string();
+        assert!(
+            !conversation_db
+                .conversation_goal(
+                    &conversation(model::GoalAction::Replace, "build shelter"),
+                    &old,
+                    &json!([])
+                )
+                .unwrap()
+        );
+        assert_eq!(planner.get("goal").unwrap().as_deref(), Some("find food"));
+        assert_eq!(
+            planner.get("goal_revision").unwrap().as_deref(),
+            Some(newer.as_str())
+        );
+        assert_eq!(
+            planner.get("player_request").unwrap().as_deref(),
+            Some("newer request")
+        );
+    }
+    #[test]
+    fn conversation_requires_an_explicit_valid_goal_action() {
+        let mut reply = json!({"message":"","goal":"collect wood","reason":"fixture"});
+        assert!(serde_json::from_value::<model::Conversation>(reply.clone()).is_err());
+        reply["goal_action"] = json!("continue");
+        assert_eq!(
+            serde_json::from_value::<model::Conversation>(reply.clone())
+                .unwrap()
+                .goal_action,
+            model::GoalAction::Continue
+        );
+        reply["goal_action"] = json!("execute_host_command");
+        assert!(serde_json::from_value::<model::Conversation>(reply).is_err());
+    }
     #[test]
     fn completed_task_survives_restart_but_repeated_or_superseding_requests_are_new_work() {
         let t = tempfile::tempdir().unwrap();
