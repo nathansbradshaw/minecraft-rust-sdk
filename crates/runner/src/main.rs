@@ -59,22 +59,12 @@ async fn proxy(config: ProxyConfig) -> Result<()> {
         let config = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = tokio::time::timeout(Duration::from_secs(600), tunnel(stream, &config)).await;
+            let _ = tunnel(stream, &config).await;
         });
     }
 }
 async fn tunnel(mut client: TcpStream, config: &ProxyConfig) -> Result<()> {
-    let mut header = Vec::new();
-    loop {
-        let byte = tokio::time::timeout(Duration::from_secs(5), client.read_u8()).await??;
-        header.push(byte);
-        if header.len() > 8192 {
-            return Err("Proxy header too large".into());
-        }
-        if header.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
+    let header = connect_header(&mut client, Duration::from_secs(5)).await?;
     let text = std::str::from_utf8(&header)?;
     let line = text.lines().next().ok_or("Proxy request missing")?;
     let parts: Vec<_> = line.split(' ').collect();
@@ -117,11 +107,98 @@ async fn tunnel(mut client: TcpStream, config: &ProxyConfig) -> Result<()> {
     }
     let mut remote =
         tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addresses[0])).await??;
-    client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-    tokio::io::copy_bidirectional(&mut client, &mut remote).await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+    )
+    .await??;
+    forward(&mut client, &mut remote, Duration::from_secs(600)).await?;
     Ok(())
+}
+async fn connect_header<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    budget: Duration,
+) -> Result<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut header = Vec::new();
+    loop {
+        header.push(tokio::time::timeout_at(deadline, reader.read_u8()).await??);
+        if header.len() > 8192 {
+            return Err("Proxy header too large".into());
+        }
+        if header.ends_with(b"\r\n\r\n") {
+            return Ok(header);
+        }
+    }
+}
+struct ActiveIo<T> {
+    io: T,
+    activity: tokio::sync::watch::Sender<tokio::time::Instant>,
+}
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ActiveIo<T> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut this.io).poll_read(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            this.activity.send_replace(tokio::time::Instant::now());
+        }
+        result
+    }
+}
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActiveIo<T> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.io).poll_write(cx, buf);
+        if matches!(result,std::task::Poll::Ready(Ok(n)) if n>0) {
+            this.activity.send_replace(tokio::time::Instant::now());
+        }
+        result
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+async fn forward<A, B>(a: &mut A, b: &mut B, idle: Duration) -> Result<()>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (activity, mut changed) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let mut a = ActiveIo {
+        io: a,
+        activity: activity.clone(),
+    };
+    let mut b = ActiveIo { io: b, activity };
+    let transfer = tokio::io::copy_bidirectional(&mut a, &mut b);
+    tokio::pin!(transfer);
+    loop {
+        let deadline = *changed.borrow_and_update() + idle;
+        tokio::select! {
+            result=&mut transfer=>{result?;return Ok(());},
+            result=changed.changed()=>{result?;},
+            _=tokio::time::sleep_until(deadline)=>{
+                if changed.borrow().elapsed()>=idle {return Err("Proxy tunnel idle deadline exceeded".into());}
+            },
+        }
+    }
 }
 fn run(program: &str, args: &[&str]) -> Result<()> {
     if !Command::new(program).args(args).status()?.success() {
@@ -617,6 +694,62 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn active_one_way_and_bidirectional_streams_outlive_the_idle_interval() {
+        for bidirectional in [false, true] {
+            let (mut sender, mut a) = tokio::io::duplex(64);
+            let (mut b, mut receiver) = tokio::io::duplex(64);
+            let transfer =
+                tokio::spawn(
+                    async move { forward(&mut a, &mut b, Duration::from_millis(100)).await },
+                );
+            for n in 0..8u8 {
+                sender.write_all(&[n]).await.unwrap();
+                assert_eq!(receiver.read_u8().await.unwrap(), n);
+                if bidirectional {
+                    receiver.write_all(&[n + 10]).await.unwrap();
+                    assert_eq!(sender.read_u8().await.unwrap(), n + 10);
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            sender.shutdown().await.unwrap();
+            receiver.shutdown().await.unwrap();
+            transfer.await.unwrap().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn truly_idle_stream_still_expires() {
+        let (_sender, mut a) = tokio::io::duplex(64);
+        let (mut b, _receiver) = tokio::io::duplex(64);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                forward(&mut a, &mut b, Duration::from_millis(30))
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn incomplete_connect_header_has_an_absolute_deadline() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let sending = tokio::spawn(async move {
+            for _ in 0..8 {
+                if writer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        assert!(
+            connect_header(&mut reader, Duration::from_millis(50))
+                .await
+                .is_err()
+        );
+        drop(reader);
+        sending.await.unwrap();
+    }
     #[test]
     fn deny_local_lan_metadata_and_ipv6_transitions() {
         for s in [

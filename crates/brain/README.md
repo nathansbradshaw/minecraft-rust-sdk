@@ -91,6 +91,11 @@ the planner can use the other available allocated model. When both are exhausted
 it waits for a reset while the body remains active. Conversation retains unacknowledged input for
 that retry. Authentication, schema, queue, provider and clock-rollback failures
 require investigation rather than unchanged automatic requests.
+An inference socket failure or incomplete transport body permits exactly one
+retry of the same data request. No gameplay mutation is replayed. A lost response
+may already have consumed an admission; the broker ledger remains authoritative.
+Usage records include attempt count and separate prompt/context hashes. HTTP
+refusals and model JSON/schema errors do not receive this transport retry.
 
 `model-probe HTTPS_ENDPOINT ALLOCATED_KEY routine|develop LABEL` checks an
 allocated inference capability without connecting a character or executing a

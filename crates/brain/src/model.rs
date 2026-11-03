@@ -10,6 +10,21 @@ struct HttpFailure {
     class: String,
     retry_at: Option<i64>,
 }
+#[derive(Debug)]
+struct TransportFailure {
+    attempts: u8,
+    kind: &'static str,
+}
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model_transport_failed: {} after {} attempts",
+            self.kind, self.attempts
+        )
+    }
+}
+impl std::error::Error for TransportFailure {}
 impl std::fmt::Display for HttpFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "model_http_{}: {}", self.status, self.class)
@@ -232,7 +247,54 @@ impl Model {
         )?;
         let body = json!({"model":model,"stream":false,"purpose":purpose,"options":{"num_predict":tokens},"format":format,"messages":[{"role":"system","content":prompt},{"role":"user","content":context}]});
         let started = std::time::Instant::now();
-        let mut response = self.http.post(&self.endpoint).json(&body).send().await?;
+        let (envelope, response_bytes, attempts) = self.request_transport(&body).await?;
+        ensure(envelope["done"] == true, "Incomplete model response")?;
+        let content = envelope["message"]["content"]
+            .as_str()
+            .ok_or("Model content missing")?;
+        Ok((
+            content.to_owned(),
+            json!({"model":model,"purpose":purpose,"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":crate::digest(context.as_bytes()),"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
+        ))
+    }
+    async fn request_transport(&self, body: &Value) -> Result<(Value, usize, u8)> {
+        for attempt in 1..=2u8 {
+            match self.request_once(body).await {
+                Ok((value, bytes)) => return Ok((value, bytes, attempt)),
+                Err(error) => {
+                    let Some(transport) = error.downcast_ref::<reqwest::Error>() else {
+                        return Err(error);
+                    };
+                    let kind = if transport.is_timeout() {
+                        "timeout"
+                    } else if transport.is_connect() {
+                        "connection"
+                    } else if transport.is_request() || transport.is_body() || transport.is_decode()
+                    {
+                        "connection_or_body"
+                    } else {
+                        return Err(error);
+                    };
+                    if attempt == 2 {
+                        return Err(Box::new(TransportFailure {
+                            attempts: attempt,
+                            kind,
+                        }));
+                    }
+                    // Inference returns data only. No SDK mutation is retried.
+                    // A lost response may already have consumed an admission.
+                    eprintln!(
+                        "{}",
+                        json!({"event":"model_transport_retry","attempt":attempt,"max_attempts":2,"kind":kind,"allowances_changed":false,"gameplay_replayed":false,"previous_admission":"unknown"})
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        unreachable!()
+    }
+    async fn request_once(&self, body: &Value) -> Result<(Value, usize)> {
+        let mut response = self.http.post(&self.endpoint).json(body).send().await?;
         let status = response.status().as_u16();
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
@@ -246,14 +308,7 @@ impl Model {
         if status != 200 {
             return Err(Box::new(http_failure(status, &envelope, crate::now())));
         }
-        ensure(envelope["done"] == true, "Incomplete model response")?;
-        let content = envelope["message"]["content"]
-            .as_str()
-            .ok_or("Model content missing")?;
-        Ok((
-            content.to_owned(),
-            json!({"model":model,"purpose":purpose,"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":bytes.len(),"prompt_sha256":crate::digest(prompt.as_bytes()),"host_tools_executed":false}),
-        ))
+        Ok((envelope, bytes.len()))
     }
 }
 fn response_envelope(status: u16, bytes: &[u8]) -> Result<Value> {
@@ -292,6 +347,118 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {
+        use tokio::io::AsyncReadExt;
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(socket.read_u8().await.unwrap());
+            assert!(header.len() < 8192);
+        }
+        let header = String::from_utf8(header).unwrap();
+        let size = header
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        assert!(size <= 65536);
+        let mut body = vec![0; size];
+        socket.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+    #[tokio::test]
+    async fn inference_socket_and_partial_body_failures_retry_data_once() {
+        use tokio::io::AsyncWriteExt;
+        for partial in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+            let upstream = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    requests.push(read_request(&mut socket).await);
+                    if attempt == 0 {
+                        if partial {
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\n{\"done\":true,").await.unwrap();
+                        }
+                        continue;
+                    }
+                    let choice = json!({"tool":"sdk","input":"{\"kind\":\"look\",\"yaw\":0.0,\"pitch\":0.0}","path":"","summary":"Look","notes":"","experiment":false});
+                    let reply =
+                        json!({"done":true,"message":{"content":choice.to_string()}}).to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+                }
+                requests
+            });
+            let model = Model {
+                http: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap(),
+                endpoint,
+            };
+            let (choice, usage) = model
+                .choose_for(&json!({"goal":"same requested task"}), false, false)
+                .await
+                .unwrap();
+            assert_eq!(choice.tool, "sdk");
+            assert_eq!(usage["transport_attempts"], 2);
+            assert_eq!(usage["host_tools_executed"], false);
+            let requests = upstream.await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0], requests[1],
+                "A transport retry cannot change context, purpose or model"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn two_dropped_requests_stop_and_http_quota_refusal_does_not_retry() {
+        use tokio::io::AsyncWriteExt;
+        for refused in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+            let reset = crate::now() + 60;
+            let upstream = tokio::spawn(async move {
+                let mut count = 0;
+                for _ in 0..if refused { 1 } else { 2 } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read_request(&mut socket).await;
+                    count += 1;
+                    if refused {
+                        let reply = json!({"error":"allocation_daily_limit","retry_at_utc":reset})
+                            .to_string();
+                        socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+                    }
+                }
+                count
+            });
+            let model = Model {
+                http: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap(),
+                endpoint,
+            };
+            let error = model
+                .choose_for(&json!({"goal":"bounded"}), false, false)
+                .await
+                .unwrap_err();
+            if refused {
+                assert_eq!(daily_reset(error.as_ref()), Some(reset));
+            } else {
+                assert_eq!(
+                    error.downcast_ref::<TransportFailure>().unwrap().attempts,
+                    2
+                );
+            }
+            assert_eq!(upstream.await.unwrap(), if refused { 1 } else { 2 });
+        }
+    }
     #[tokio::test]
     async fn development_fallback_keeps_luna_allocation_and_development_purpose() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
