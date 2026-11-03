@@ -196,6 +196,16 @@ Model context preserves numeric position/velocity/collision vectors and the
 nearest geometry/threats when compacting large observations. A short SDK reference
 and factual `notes` persist API knowledge between calls; the original player
 request accompanies the shorter goal so task constraints are retained.
+Compact observations use the same `revision`, `player`, `world` and `menu`
+structure as SDK observations, including `world.blocks[].position`; compaction
+does not rename fact fields. The context labels its omitted data and retains
+original inventory/menu slot IDs and chronological recent chat. Read fresh full
+SDK observations for complete local geometry or menu slots. Earlier journal
+views remain intact and may have older compact field names.
+
+A changed observation/documentation contract reopens a stalled inspection once,
+without replacing its goal, clearing pending action IDs or changing inference
+allowances. Restarting with the same contract does not reset that cost guard.
 
 `max_inspections_without_execution` defaults to eight (deployment range 1–64).
 The first unchanged inspection of a new goal counts toward that ceiling.

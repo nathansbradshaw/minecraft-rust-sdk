@@ -133,6 +133,15 @@ impl Journal {
         self.db.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
         Ok(())
     }
+    fn context_contract(&self, contract: &str) -> Result<bool> {
+        if self.get("context_contract")?.as_deref() == Some(contract) {
+            return Ok(false);
+        }
+        self.set("inspection_streak", "0")?;
+        self.set("context_contract", contract)?;
+        self.event("context_contract_changed",json!({"contract_sha256":contract,"inspection_investigation_reopened":true,"goal_and_model_allowance_changed":false}))?;
+        Ok(true)
+    }
     /// One durable revision per accepted task, including repeated goal text.
     pub fn select_goal(
         &self,
@@ -445,6 +454,9 @@ impl Brain {
             "Another brain owns this state directory",
         )?;
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
+        journal.context_contract(&digest(
+            concat!("sdk-shaped-observation-v1\n", include_str!("sdk.md")).as_bytes(),
+        ))?;
         let mut random = [0; 16];
         use std::io::Read;
         fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
@@ -667,7 +679,7 @@ impl Brain {
                 .get("activity")?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
-            let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
+            let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","inventory":"occupied slots only, original slot numbers","menus":"slot contents require a fresh full SDK observation"},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             // Preserve the latest error and player state under pressure; never
             // silently delete all feedback to make a world snapshot fit.
             bound_value(&mut context["memory"], 1000);
@@ -808,7 +820,7 @@ pub fn projection(o: &Observation) -> Value {
             .sum()
     };
     blocks.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
-    let blocks:Vec<_>=blocks.into_iter().filter(|b|b["block"]!="minecraft:air").take(80).map(|b|json!({"p":b["position"],"block":b["block"],"replaceable":b["replaceable"],"destroy_progress":b["destroy_progress"],"may_interact":b["may_interact"]})).collect();
+    let blocks:Vec<_>=blocks.into_iter().filter(|b|b["block"]!="minecraft:air").take(80).map(|b|json!({"position":b["position"],"block":b["block"],"replaceable":b["replaceable"],"destroy_progress":b["destroy_progress"],"may_interact":b["may_interact"]})).collect();
     let inventory: Vec<_> = player["inventory"]
         .as_array()
         .into_iter()
@@ -817,7 +829,7 @@ pub fn projection(o: &Observation) -> Value {
         .map(|r| json!({"slot":r["slot"],"item":r["item"],"count":r["count"],"food":r["food"]}))
         .collect();
     let entities: Vec<_> = o.world["entities"].as_array().into_iter().flatten().take(24).map(|e| json!({"uuid":e["uuid"],"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"velocity":e["velocity"],"visible":e["visible"],"hostile":e["hostile"],"ranged_attack":e["ranged_attack"],"main_hand":e["main_hand"],"off_hand":e["off_hand"],"projectile":e["projectile"],"creeper":e["creeper"],"health":e["health"],"item":e["item"],"name":e["name"]})).collect();
-    json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"blocks":blocks,"entities":entities,"chat":o.world["chat"].as_array().map(|c|c.iter().rev().take(24).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"],"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"]}})
+    json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"world":{"blocks":blocks,"entities":entities,"chat":o.world["chat"].as_array().map(|c|c.iter().skip(c.len().saturating_sub(24)).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"]},"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"]}})
 }
 /// Compact large strings/arrays without losing the structure of errors or player
 /// facts. Array tails contain newer journal feedback and are retained first.
@@ -1121,7 +1133,7 @@ mod tests {
     #[test]
     fn compact_context_keeps_complete_coordinates_and_nearby_threats() {
         let blocks: Vec<_> = (0..128)
-            .map(|n| json!({"p":[n,64,0],"block":"fixture:block","description":"x".repeat(100)}))
+            .map(|n| json!({"position":[n,64,0],"block":"fixture:block","description":"x".repeat(100)}))
             .collect();
         let entities: Vec<_> = (0..64)
             .map(|n| json!({"entity_id":n,"position":[n,64,1],"hostile":n==0}))
@@ -1129,17 +1141,72 @@ mod tests {
         let inventory: Vec<_> = (0..6)
             .map(|slot| json!({"slot":slot,"item":"fixture:item","count":slot+1}))
             .collect();
-        let mut context = json!({"player":{"position":[12.25,64.0,-9.5],"velocity":[0.1,0.0,0.2],"health":17.0,"inventory":inventory},"blocks":blocks,"entities":entities,"collision":[0.,0.,0.,1.,1.,1.]});
+        let mut context = json!({"player":{"position":[12.25,64.0,-9.5],"velocity":[0.1,0.0,0.2],"health":17.0,"inventory":inventory},"world":{"blocks":blocks,"entities":entities},"collision":[0.,0.,0.,1.,1.,1.]});
         bound_value(&mut context, 2000);
         assert!(context.to_string().len() <= 2000);
         assert_eq!(context["player"]["position"], json!([12.25, 64.0, -9.5]));
         assert_eq!(context["player"]["velocity"], json!([0.1, 0.0, 0.2]));
         assert_eq!(context["collision"], json!([0., 0., 0., 1., 1., 1.]));
-        assert_eq!(context["blocks"][0]["p"], json!([0, 64, 0]));
-        assert_eq!(context["entities"][0]["entity_id"], 0);
-        assert_eq!(context["entities"][0]["hostile"], true);
+        assert_eq!(context["world"]["blocks"][0]["position"], json!([0, 64, 0]));
+        assert_eq!(context["world"]["entities"][0]["entity_id"], 0);
+        assert_eq!(context["world"]["entities"][0]["hostile"], true);
         assert_eq!(context["player"]["inventory"].as_array().unwrap().len(), 6);
         assert_eq!(context["player"]["inventory"][0]["count"], 1);
+    }
+    #[test]
+    fn compact_observation_uses_actual_sdk_paths_and_preserves_runtime_bindings() {
+        let full = Observation {
+            revision: "runtime-revision".into(),
+            player: json!({"position":[12.25,64.0,-9.5],"inventory":[{"slot":7,"item":"custom:material","count":2},{"slot":8,"item":"minecraft:air","count":0}]}),
+            world: json!({"blocks":[{"position":[12,64,-9],"block":"custom:resource","may_interact":true},{"position":[13,64,-9],"block":"minecraft:air"}],"entities":[{"entity_id":812,"position":[13.5,64.0,-8.5],"type":"custom:creature"}],"chat":(0..30).map(|n|json!({"sequence":n})).collect::<Vec<_>>()}),
+            menu: json!({"menu_id":11,"state_id":19,"type":"custom:menu","carried":{"item":"custom:material","count":1}}),
+        };
+        let compact = projection(&full);
+        let parsed: Observation = serde_json::from_value(compact.clone()).unwrap();
+        assert_eq!(
+            parsed.world["blocks"][0]["position"],
+            full.world["blocks"][0]["position"]
+        );
+        assert_eq!(parsed.world["blocks"][0]["block"], "custom:resource");
+        assert!(parsed.world["blocks"][0].get("p").is_none());
+        assert!(compact.get("blocks").is_none());
+        assert_eq!(parsed.world["entities"][0]["entity_id"], 812);
+        assert_eq!(parsed.player["position"], full.player["position"]);
+        assert_eq!(parsed.player["inventory"][0]["slot"], 7);
+        assert_eq!(parsed.menu["menu_id"], 11);
+        assert_eq!(parsed.menu["state_id"], 19);
+        assert_eq!(parsed.world["chat"][0]["sequence"], 6);
+        assert_eq!(parsed.world["chat"][23]["sequence"], 29);
+    }
+    #[test]
+    fn only_a_changed_context_contract_reopens_stalled_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(&dir.path().join("brain.sqlite")).unwrap();
+        j.select_goal(
+            "collect material",
+            "fixture",
+            json!({}),
+            Some("original request"),
+        )
+        .unwrap();
+        j.set("develop_next", "true").unwrap();
+        j.set("pending_action", "never-replay").unwrap();
+        assert!(j.context_contract("contract-one").unwrap());
+        j.set("inspection_streak", "8").unwrap();
+        assert!(!j.context_contract("contract-one").unwrap());
+        assert_eq!(j.get("inspection_streak").unwrap().as_deref(), Some("8"));
+        assert!(j.context_contract("contract-two").unwrap());
+        assert_eq!(j.get("inspection_streak").unwrap().as_deref(), Some("0"));
+        assert_eq!(j.get("goal").unwrap().as_deref(), Some("collect material"));
+        assert_eq!(
+            j.get("player_request").unwrap().as_deref(),
+            Some("original request")
+        );
+        assert_eq!(
+            j.get("pending_action").unwrap().as_deref(),
+            Some("never-replay")
+        );
+        assert_eq!(j.get("develop_next").unwrap().as_deref(), Some("true"));
     }
     #[test]
     fn large_observations_cannot_erase_rejection_feedback() {

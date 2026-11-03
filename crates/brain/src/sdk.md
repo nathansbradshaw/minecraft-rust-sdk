@@ -12,6 +12,12 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
 - Observation.player and .world are serde_json::Value; .revision is String.
   player.position is exactly [x,y,z]. A compact context is a sample; a program can
   inspect client.observe().await? for full local facts and collision geometry.
+  Both use world.blocks[].position for block coordinates, world.entities for
+  entities, and menu.slots for full observed menus. Never invent abbreviated
+  field aliases. Current compact views retain the SDK's revision/player/world/menu
+  structure and original inventory/menu slot identifiers; omitted cells are
+  unknown. Historical journal views may have an older compact format: consult
+  the current SDK types and a fresh runtime observation when writing programs.
 - Action::StartMove { target: Position{x,y,z}, jump: bool, max_ticks: u16 } is
   finite, ordinary movement. Action::CancelControl { action_id:String } cancels
   that control. Legacy Move, Jump and MotionFrame are disabled in protected
