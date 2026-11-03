@@ -118,6 +118,10 @@ fn same_lane(before: &Observation, after: &Observation) -> bool {
     later
         && before.player["uuid"].is_string()
         && before.player["uuid"] == after.player["uuid"]
+        // Character UUID survives respawn; its player entity does not. Losing
+        // inventory on death is not evidence that an old item use succeeded.
+        && before.player["entity_id"].as_i64().is_some()
+        && before.player["entity_id"] == after.player["entity_id"]
         && before.player["dimension"].is_string()
         && before.player["dimension"] == after.player["dimension"]
         && before.world["sample_clock"]["epoch"].is_string()
@@ -525,13 +529,36 @@ mod tests {
     fn observation() -> Observation {
         Observation {
             revision: "1".into(),
-            player: json!({"uuid":"own","dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
+            player: json!({"uuid":"own","entity_id":17,"dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
             world: json!({"game_time":1,"sample_clock":{"epoch":"clock","nanos":"1"},"entities":[{"entity_id":7,"uuid":"target","health":20.}]}),
             menu: json!({"menu_id":0}),
         }
     }
     fn damage() -> Value {
         json!({"sequence":2,"actor_uuid":"own","dimension":"minecraft:overworld","kind":"attack_damage","target_uuid":"target","target_entity_id":7,"damage":2.})
+    }
+    #[test]
+    fn food_loss_during_respawn_is_not_item_use_evidence() {
+        let before = observation();
+        let mut after = before.clone();
+        after.world["sample_clock"]["nanos"] = json!("2");
+        after.player["inventory"][0] = json!({"slot":0,"item":"minecraft:air","count":0});
+        after.player["food"] = json!(20);
+        let action = Action::UseItem { hand: Hand::Main };
+        assert!(
+            proof(&action, &before, &after).is_some(),
+            "ordinary same-life held-stack change remains observable"
+        );
+        after.player["entity_id"] = json!(18);
+        assert!(
+            proof(&action, &before, &after).is_none(),
+            "death inventory loss cannot certify an old item-use intention"
+        );
+        after.player["entity_id"] = Value::Null;
+        assert!(
+            proof(&action, &before, &after).is_none(),
+            "unknown life binding is not same-life evidence"
+        );
     }
     #[test]
     fn damage_requires_a_new_attributed_effect_not_another_attackers_health_change() {
