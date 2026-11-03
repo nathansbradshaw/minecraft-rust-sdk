@@ -118,10 +118,24 @@ fn same_lane(before: &Observation, after: &Observation) -> bool {
     later
         && before.player["uuid"].is_string()
         && before.player["uuid"] == after.player["uuid"]
+        // Character UUID survives respawn; its player entity does not. Losing
+        // inventory on death is not evidence that an old item use succeeded.
+        && before.player["entity_id"].as_i64().is_some()
+        && before.player["entity_id"] == after.player["entity_id"]
         && before.player["dimension"].is_string()
         && before.player["dimension"] == after.player["dimension"]
         && before.world["sample_clock"]["epoch"].is_string()
         && before.world["sample_clock"]["epoch"] == after.world["sample_clock"]["epoch"]
+}
+fn main_hand_changed(action: &Action, before: &Observation, after: &Observation) -> bool {
+    matches!(
+        action,
+        Action::UseItem { hand: Hand::Main }
+            | Action::StartUseItem {
+                hand: Hand::Main,
+                ..
+            }
+    ) && before.player["selected"] != after.player["selected"]
 }
 fn proof(action: &Action, before: &Observation, after: &Observation) -> Option<Value> {
     if !same_lane(before, after) {
@@ -132,6 +146,7 @@ fn proof(action: &Action, before: &Observation, after: &Observation) -> Option<V
         Action::UseItem { hand } | Action::StartUseItem { hand, .. } => {
             if after.player["using_item"] != false { return None; }
             if let Some(event)=new_event(action,before,after) { return Some(event.clone()); }
+            if main_hand_changed(action,before,after) {return None;}
             let b=held_stack(before,hand)?;let a=held_stack(after,hand)?;
             let decreased=b["count"].as_u64()?.checked_sub(a["count"].as_u64()?).is_some_and(|n|n>0);
             if b["count"].as_u64()? > 0 && (b["item"]!=a["item"] || decreased) {
@@ -461,6 +476,19 @@ impl Context {
                     );
                     return;
                 }
+                if main_hand_changed(&self.request.action, &self.before, &after) {
+                    if !released && release_sent.is_none() {
+                        let _ = self.release();
+                    }
+                    self.finish(
+                        Outcome::Uncertain,
+                        Some(&after),
+                        None,
+                        released,
+                        "held_slot_changed_before_effect_verification",
+                    );
+                    return;
+                }
                 if release_sent.is_some() && released {
                     self.finish(
                         if cancelled {
@@ -525,13 +553,51 @@ mod tests {
     fn observation() -> Observation {
         Observation {
             revision: "1".into(),
-            player: json!({"uuid":"own","dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
+            player: json!({"uuid":"own","entity_id":17,"dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
             world: json!({"game_time":1,"sample_clock":{"epoch":"clock","nanos":"1"},"entities":[{"entity_id":7,"uuid":"target","health":20.}]}),
             menu: json!({"menu_id":0}),
         }
     }
     fn damage() -> Value {
         json!({"sequence":2,"actor_uuid":"own","dimension":"minecraft:overworld","kind":"attack_damage","target_uuid":"target","target_entity_id":7,"damage":2.})
+    }
+    #[test]
+    fn food_loss_during_respawn_is_not_item_use_evidence() {
+        let before = observation();
+        let mut after = before.clone();
+        after.world["sample_clock"]["nanos"] = json!("2");
+        after.player["inventory"][0] = json!({"slot":0,"item":"minecraft:air","count":0});
+        after.player["food"] = json!(20);
+        let action = Action::UseItem { hand: Hand::Main };
+        assert!(
+            proof(&action, &before, &after).is_some(),
+            "ordinary same-life held-stack change remains observable"
+        );
+        after.player["entity_id"] = json!(18);
+        assert!(
+            proof(&action, &before, &after).is_none(),
+            "death inventory loss cannot certify an old item-use intention"
+        );
+        after.player["entity_id"] = Value::Null;
+        assert!(
+            proof(&action, &before, &after).is_none(),
+            "unknown life binding is not same-life evidence"
+        );
+    }
+    #[test]
+    fn selecting_another_slot_is_not_item_use_but_attributed_completion_still_counts() {
+        let before = observation();
+        let mut after = before.clone();
+        after.world["sample_clock"]["nanos"] = json!("2");
+        after.player["selected"] = json!(1);
+        after.player["inventory"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"slot":1,"item":"minecraft:iron_sword","count":1}));
+        let action = Action::UseItem { hand: Hand::Main };
+        assert!(proof(&action, &before, &after).is_none());
+        after.player["native_action_effects"]["events"] = json!([{"sequence":2,"actor_uuid":"own","dimension":"minecraft:overworld","kind":"item_use_finished","item":"minecraft:apple","hand":"MAIN_HAND"}]);
+        assert!(proof(&action, &before, &after).is_some());
     }
     #[test]
     fn damage_requires_a_new_attributed_effect_not_another_attackers_health_change() {
