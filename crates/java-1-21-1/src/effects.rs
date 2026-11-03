@@ -127,6 +127,16 @@ fn same_lane(before: &Observation, after: &Observation) -> bool {
         && before.world["sample_clock"]["epoch"].is_string()
         && before.world["sample_clock"]["epoch"] == after.world["sample_clock"]["epoch"]
 }
+fn main_hand_changed(action: &Action, before: &Observation, after: &Observation) -> bool {
+    matches!(
+        action,
+        Action::UseItem { hand: Hand::Main }
+            | Action::StartUseItem {
+                hand: Hand::Main,
+                ..
+            }
+    ) && before.player["selected"] != after.player["selected"]
+}
 fn proof(action: &Action, before: &Observation, after: &Observation) -> Option<Value> {
     if !same_lane(before, after) {
         return None;
@@ -136,6 +146,7 @@ fn proof(action: &Action, before: &Observation, after: &Observation) -> Option<V
         Action::UseItem { hand } | Action::StartUseItem { hand, .. } => {
             if after.player["using_item"] != false { return None; }
             if let Some(event)=new_event(action,before,after) { return Some(event.clone()); }
+            if main_hand_changed(action,before,after) {return None;}
             let b=held_stack(before,hand)?;let a=held_stack(after,hand)?;
             let decreased=b["count"].as_u64()?.checked_sub(a["count"].as_u64()?).is_some_and(|n|n>0);
             if b["count"].as_u64()? > 0 && (b["item"]!=a["item"] || decreased) {
@@ -465,6 +476,19 @@ impl Context {
                     );
                     return;
                 }
+                if main_hand_changed(&self.request.action, &self.before, &after) {
+                    if !released && release_sent.is_none() {
+                        let _ = self.release();
+                    }
+                    self.finish(
+                        Outcome::Uncertain,
+                        Some(&after),
+                        None,
+                        released,
+                        "held_slot_changed_before_effect_verification",
+                    );
+                    return;
+                }
                 if release_sent.is_some() && released {
                     self.finish(
                         if cancelled {
@@ -559,6 +583,21 @@ mod tests {
             proof(&action, &before, &after).is_none(),
             "unknown life binding is not same-life evidence"
         );
+    }
+    #[test]
+    fn selecting_another_slot_is_not_item_use_but_attributed_completion_still_counts() {
+        let before = observation();
+        let mut after = before.clone();
+        after.world["sample_clock"]["nanos"] = json!("2");
+        after.player["selected"] = json!(1);
+        after.player["inventory"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"slot":1,"item":"minecraft:iron_sword","count":1}));
+        let action = Action::UseItem { hand: Hand::Main };
+        assert!(proof(&action, &before, &after).is_none());
+        after.player["native_action_effects"]["events"] = json!([{"sequence":2,"actor_uuid":"own","dimension":"minecraft:overworld","kind":"item_use_finished","item":"minecraft:apple","hand":"MAIN_HAND"}]);
+        assert!(proof(&action, &before, &after).is_some());
     }
     #[test]
     fn damage_requires_a_new_attributed_effect_not_another_attackers_health_change() {
