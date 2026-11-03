@@ -7,6 +7,7 @@ pub mod model;
 pub mod output;
 pub mod progress;
 pub mod tools;
+pub mod views;
 use minecraft_sdk::{ActionRequest, Client, ErrorCode, Observation, Outcome, Profile};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -557,7 +558,11 @@ impl Brain {
         )?;
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
         journal.context_contract(&digest(
-            concat!("sdk-shaped-observation-v1\n", include_str!("sdk.md")).as_bytes(),
+            concat!(
+                "sdk-shaped-observation-v1\nfocused-observation-v1\n",
+                include_str!("sdk.md")
+            )
+            .as_bytes(),
         ))?;
         let mut random = [0; 16];
         use std::io::Read;
@@ -831,7 +836,7 @@ impl Brain {
                 .get("activity")?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
-            let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","inventory":"occupied slots only, original slot numbers","menus":"slot contents require a fresh full SDK observation"},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
+            let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
             context["last_experiment"] = self
                 .journal
@@ -997,7 +1002,36 @@ pub fn projection(o: &Observation) -> Value {
         .filter(|r| r["count"].as_u64().is_some_and(|c| c > 0))
         .map(|r| json!({"slot":r["slot"],"item":r["item"],"count":r["count"],"food":r["food"]}))
         .collect();
-    let entities: Vec<_> = o.world["entities"].as_array().into_iter().flatten().take(24).map(|e| json!({"uuid":e["uuid"],"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"velocity":e["velocity"],"visible":e["visible"],"hostile":e["hostile"],"ranged_attack":e["ranged_attack"],"main_hand":e["main_hand"],"off_hand":e["off_hand"],"projectile":e["projectile"],"creeper":e["creeper"],"health":e["health"],"item":e["item"],"name":e["name"]})).collect();
+    let mut entities: Vec<_> = o.world["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    let priority = |e: &Value| {
+        if e["hostile"] == true {
+            0
+        } else if e["type"] == "minecraft:item" {
+            1
+        } else if e["projectile"] == true
+            && e["velocity"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|x| x.as_f64().is_some_and(|x| x.abs() > 0.1)))
+        {
+            2
+        } else if e["player"] == true || e["type"] == "minecraft:player" {
+            3
+        } else if e["projectile"] == true {
+            5
+        } else {
+            4
+        }
+    };
+    entities.sort_by(|a, b| {
+        priority(a)
+            .cmp(&priority(b))
+            .then_with(|| distance(a).total_cmp(&distance(b)))
+    });
+    let entities: Vec<_> = entities.into_iter().take(24).map(views::entity).collect();
     json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"world":{"blocks":blocks,"entities":entities,"chat":o.world["chat"].as_array().map(|c|c.iter().skip(c.len().saturating_sub(24)).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"]},"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"]}})
 }
 /// Compact large strings/arrays without losing the structure of errors or player
@@ -1011,6 +1045,9 @@ fn bound_value(value: &mut Value, budget: usize) {
     }
 }
 fn fit_context(context: &mut Value) -> Result<()> {
+    // Focused views have already been paged under a byte ceiling. Truncating
+    // their records again would invalidate returned counts and slot bindings.
+    let focused = context["last_tool_result"]["result"]["view"].is_string();
     for (field, budget) in [
         ("server", 2500),
         ("memory", 1000),
@@ -1032,7 +1069,7 @@ fn fit_context(context: &mut Value) -> Result<()> {
         ("completed_tool_activity", 512),
         ("observation", 3000),
         ("memory", 512),
-        ("last_tool_result", 5000),
+        ("last_tool_result", if focused { 7000 } else { 5000 }),
         ("server", 1500),
         ("working_notes", 1000),
     ] {
