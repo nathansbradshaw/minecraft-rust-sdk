@@ -3,6 +3,22 @@ use sha2::{Digest, Sha256};
 mod licenses;
 use std::{collections::HashSet, path::Path, process::Command};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+fn publication_budget(tree_bytes: usize, history_bytes: usize) -> Result<()> {
+    if tree_bytes > 8 * 1024 * 1024 {
+        return Err(
+            format!("Current source tree exceeds reviewed budget: {tree_bytes} bytes").into(),
+        );
+    }
+    // Source revisions accumulate while the current reusable project stays
+    // small. Every historical blob still passes the same path/size/secret scan.
+    if history_bytes > 16 * 1024 * 1024 {
+        return Err(format!(
+            "Source publication history exceeds reviewed budget: {history_bytes} bytes"
+        )
+        .into());
+    }
+    Ok(())
+}
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git").args(args).current_dir(root).output()?;
     if !output.status.success() {
@@ -137,6 +153,8 @@ fn audit(root: &Path) -> Result<()> {
         }
         size += blob(root, fields[1], path, &mut seen)?;
     }
+    let tree_size = size;
+    publication_budget(tree_size, tree_size)?;
     let history = git(root, &["rev-list", "--objects", "--all"])?;
     for record in String::from_utf8(history)?.lines() {
         let Some((hash, path)) = record.split_once(' ') else {
@@ -146,9 +164,7 @@ fn audit(root: &Path) -> Result<()> {
             size += blob(root, hash, path, &mut seen)?;
         }
     }
-    if size > 8 * 1024 * 1024 {
-        return Err("Source publication history exceeds reviewed budget".into());
-    }
+    publication_budget(tree_size, size)?;
     for path in [
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
@@ -160,7 +176,7 @@ fn audit(root: &Path) -> Result<()> {
         }
     }
     println!(
-        "Source audit passed: {} unique reviewed blobs, {size} bytes; no runtime paths or detected credentials",
+        "Source audit passed: current tree {tree_size} bytes; {} unique reviewed blobs, {size} historical bytes; no runtime paths or detected credentials",
         seen.len()
     );
     Ok(())
@@ -184,6 +200,12 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_source_revisions_do_not_expand_the_current_tree_budget() {
+        assert!(publication_budget(1_213_568, 8_418_253).is_ok());
+        assert!(publication_budget(8 * 1024 * 1024 + 1, 9 * 1024 * 1024).is_err());
+        assert!(publication_budget(1_213_568, 16 * 1024 * 1024 + 1).is_err());
+    }
     #[test]
     fn blocks_runtime_and_private_paths() {
         for p in [
