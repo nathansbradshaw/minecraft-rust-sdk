@@ -170,16 +170,11 @@ impl Model {
         Ok((choice, usage))
     }
     pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {
+        let path = std::env::var_os("MC_SDK_CONVERSATION_PROMPT");
+        let prompt = conversation_prompt(path.as_deref().map(Path::new))?;
         let format = json!({"type":"object","properties":{"message":{"type":"string","maxLength":256},"goal_action":{"type":"string","enum":["continue","replace"]},"goal":{"type":"string","maxLength":2048},"reason":{"type":"string","maxLength":512}},"required":["message","goal_action","goal","reason"],"additionalProperties":false});
         let (content, usage) = self
-            .request(
-                context,
-                "gpt-6-luna",
-                "plan",
-                format,
-                include_str!("conversation.md"),
-                1024,
-            )
+            .request(context, "gpt-6-luna", "plan", format, &prompt, 1024)
             .await?;
         let reply: Conversation = serde_json::from_str(&content)?;
         ensure(
@@ -230,13 +225,54 @@ impl Model {
             .ok_or("Model content missing")?;
         Ok((
             content.to_owned(),
-            json!({"model":model,"elapsed_ms":started.elapsed().as_millis(),"response_bytes":bytes.len(),"host_tools_executed":false}),
+            json!({"model":model,"elapsed_ms":started.elapsed().as_millis(),"response_bytes":bytes.len(),"prompt_sha256":crate::digest(prompt.as_bytes()),"host_tools_executed":false}),
         ))
     }
+}
+fn conversation_prompt(path: Option<&Path>) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(path) = path else {
+        return Ok(include_str!("conversation.md").into());
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    ensure(
+        file.metadata()?.is_file(),
+        "Conversation prompt must be a regular file",
+    )?;
+    let mut prompt = String::new();
+    file.take(16385).read_to_string(&mut prompt)?;
+    ensure(
+        !prompt.trim().is_empty() && prompt.len() <= 16384,
+        "Conversation prompt must contain at most 16384 UTF-8 bytes",
+    )?;
+    Ok(prompt)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversation_prompt_can_change_atomically_without_reloading_the_player() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.md");
+        std::fs::write(&path, "first prompt").unwrap();
+        let before = conversation_prompt(Some(&path)).unwrap();
+        let next = dir.path().join("next.md");
+        std::fs::write(&next, "new prompt with UTF-8: east →").unwrap();
+        std::fs::rename(next, &path).unwrap();
+        let after = conversation_prompt(Some(&path)).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(after, "new prompt with UTF-8: east →");
+        std::fs::write(&path, vec![b'x'; 16385]).unwrap();
+        assert!(conversation_prompt(Some(&path)).is_err());
+        std::fs::write(&path, "  ").unwrap();
+        assert!(conversation_prompt(Some(&path)).is_err());
+        assert!(conversation_prompt(Some(dir.path())).is_err());
+        assert!(conversation_prompt(None).unwrap().contains("goal_action"));
+    }
     #[test]
     fn only_bounded_explicit_allocation_clock_events_allow_retry() {
         let daily = http_failure(

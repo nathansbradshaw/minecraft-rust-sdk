@@ -160,6 +160,18 @@ a delayed reply cannot overwrite a newer task. All delivered chat still reaches
 conversation context, including join/leave notices and ordinary player requests.
 If a new-task proposal became stale, its input remains pending for reconsideration
 against the changed revision; an unaccepted proposal sends no acknowledgement.
+Acknowledging a gameplay request in chat does not execute it: accepting new work
+must hand a concrete goal to the engine. To iterate conversation instructions
+without replacing a connected controller, set `MC_SDK_CONVERSATION_PROMPT` to a
+container-local UTF-8 file. It is read on each conversation request, with a
+16 KiB limit and explicit read/validation errors. Without it the compiled prompt
+is used. Usage records include the actual prompt hash. Editing this client text
+cannot change SDK authority, host access or inference allocation.
+
+`model-probe ENDPOINT ALLOCATED_KEY conversation LABEL PRIVATE_CONTEXT.json`
+replays a bounded conversation context through the actual allocated Luna service
+without a game connection or tool execution. Its output is reasoning evidence;
+verify the installed controller and real gameplay separately.
 It uses Luna only when new chat arrives and runs independently of Sol and terminal
 work. `await_chat_goal: true` waits for a player-supplied goal and waits again after
 completion, instead of spending inference on an unchanged idle condition. Its
