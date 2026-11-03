@@ -904,7 +904,7 @@ impl Brain {
                     Some(lanes) => Some(lanes.acquire(develop).await?),
                     None => None,
                 };
-                model.choose(&context, develop).await
+                model.choose_for(&context, develop, preferred).await
             };
             tokio::pin!(future);
             let answer = loop {

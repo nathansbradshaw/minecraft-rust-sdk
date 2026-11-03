@@ -214,6 +214,15 @@ retaining their global inference and daily budgets. `await_chat_goal` supports a
 player-driven pilot without idle inference polling. Model errors are retained;
 unchanged rejected requests are not automatically resubmitted.
 
+Model allocation and work purpose are independent. If Sol's daily allocation is
+unavailable, a development turn sent to allocated Luna retains `purpose:develop`.
+The restricted reference inference service uses medium reasoning for development
+and Sol, and low reasoning for routine Luna turns. This grants no tools, host
+execution or extra calls. Replies retain numeric provider token counters when
+available and the reported effort; missing counters remain unknown. The
+`model-probe investigate` mode tests Luna development with saved context without
+executing any returned gameplay or workspace tool.
+
 Gate completion requires independently recorded gameplay and merged-source
 bindings. These interfaces, diagnostics and a successful compiler build alone do
 not establish intelligent gameplay, endurance or competitive performance.
