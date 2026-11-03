@@ -196,6 +196,11 @@ than 0.2 blocks of displacement over 14 advancing game ticks are cancelled and
 excluded from the next local route selection. Observation lag, a new entity life,
 dimension or native clock epoch resets this progress window. These mechanics
 require hazard-scene evidence; passing transport tests is not a Survival claim.
+An active body dodge retains the incoming projectile identities it responded to.
+Repeated samples of those projectiles do not by themselves cancel that dodge;
+a new incoming identity, movement toward a nearby threat or native evidence of a
+stuck route can trigger replanning. Diagnostic samples retain these identities
+and the cancellation reason so motion and reaction can be checked separately.
 
 Generated SDK programs inherit `MC_SDK_ARBITER`, a private same-UID Unix socket.
 It accepts bounded typed actions and no credentials/actor override. Urgent body

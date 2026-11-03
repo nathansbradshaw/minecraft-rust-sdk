@@ -352,6 +352,7 @@ async fn controller(
     let mut last_attack = Instant::now() - Duration::from_secs(2);
     let mut safe_since = Instant::now();
     let mut owned_control = String::new();
+    let mut owned_projectiles = Vec::new();
     let mut cycles = 0u64;
     let mut rejected_routes = Vec::new();
     let mut conditions = String::new();
@@ -413,7 +414,11 @@ async fn controller(
         }
         let active = &observed.player["control"];
         let stuck = progress.stuck(&observed, &owned_control);
-        let incoming = geometry::incoming(&observed);
+        let incoming_projectiles = geometry::incoming_projectiles(&observed);
+        let incoming = !incoming_projectiles.is_empty();
+        let new_projectile = incoming_projectiles
+            .iter()
+            .any(|id| !owned_projectiles.contains(id));
         let burning = observed.player["fire_ticks"]
             .as_i64()
             .is_some_and(|n| n > 0);
@@ -424,7 +429,7 @@ async fn controller(
         };
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
         if cycles.is_multiple_of(10) || observed.player["health"] != previous_health {
-            j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming}))?;
+            j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming,"incoming_projectile_ids":incoming_projectiles}))?;
             previous_health = observed.player["health"].clone();
         }
         let danger = dead
@@ -483,7 +488,7 @@ async fn controller(
             });
             if active["outcome"] == "running"
                 && (active["action_id"].as_str() != Some(&owned_control)
-                    || incoming
+                    || new_projectile
                     || toward_threat
                     || stuck)
             {
@@ -507,7 +512,7 @@ async fn controller(
                     .await?;
                     j.event(
                         "body_preempted_program",
-                        json!({"action_id":id,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis()}),
+                        json!({"action_id":id,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"new_projectile":new_projectile,"incoming_projectile_ids":incoming_projectiles,"previous_dodge_projectile_ids":owned_projectiles,"toward_threat":toward_threat,"stuck":stuck}),
                     )?;
                 }
             } else {
@@ -540,6 +545,7 @@ async fn controller(
                         let dispatched_id = r.action_id.clone();
                         if r.outcome == Outcome::Running {
                             owned_control = dispatched_id.clone();
+                            owned_projectiles = incoming_projectiles.clone();
                         } else {
                             rejected_routes.push(key);
                             j.event("body_route_failure",json!({"target":key,"outcome":r.outcome,"error":r.error,"next_action":"try a different observed route; investigate if none works"}))?;
