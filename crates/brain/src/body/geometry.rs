@@ -166,8 +166,13 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
         !obstacles.iter().any(|b| intersects(p, b))
     };
     let mut candidates = Vec::new();
+    let mut shores = Vec::new();
     for b in &obstacles {
-        candidates.push([(b[0] + b[3]) / 2., b[4], (b[2] + b[5]) / 2.]);
+        let p = [(b[0] + b[3]) / 2., b[4], (b[2] + b[5]) / 2.];
+        candidates.push(p);
+        if supported(&cells, p, &obstacles) && clear(&cells, p, &obstacles) {
+            shores.push(p);
+        }
     }
     for rise in [0.5, 1., 1.5, 2.] {
         candidates.push([start[0], start[1] + rise, start[2]]);
@@ -183,6 +188,13 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
         }
     }
     let low_air = o.player["air"].as_i64().is_some_and(|n| n < 100);
+    let shore_distance = |p: [f64; 3]| {
+        shores
+            .iter()
+            .map(|q| (p[0] - q[0]).hypot(p[2] - q[2]))
+            .fold(8., f64::min)
+    };
+    let start_shore_distance = shore_distance(start);
     let mut best: Option<(f64, Escape)> = None;
     for p in candidates {
         let horizontal = (p[0] - start[0]).hypot(p[2] - start[2]);
@@ -191,11 +203,14 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
             || !(-0.05..=2.01).contains(&rise)
             || (horizontal < 0.1 && rise < 0.1)
             || blocked.contains(&target_key(p))
-            || !(0..=24).all(|i| {
-                let t = f64::from(i) / 24.;
-                passable(std::array::from_fn(|axis| {
-                    start[axis] + (p[axis] - start[axis]) * t
-                }))
+            || ![0., 0.6].into_iter().any(|arc| {
+                (0..=24).all(|i| {
+                    let t = f64::from(i) / 24.;
+                    let mut q =
+                        std::array::from_fn(|axis| start[axis] + (p[axis] - start[axis]) * t);
+                    q[1] += arc * (std::f64::consts::PI * t).sin();
+                    passable(q)
+                })
             })
         {
             continue;
@@ -217,6 +232,7 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
         } + if dry { 50. } else { 0. }
             + rise * 2.
             - horizontal
+            + (start_shore_distance - shore_distance(p)) * 4.
             - if breathable { rise * 3. } else { 0. };
         if best.as_ref().is_none_or(|(s, _)| score > *s) {
             best = Some((
@@ -630,6 +646,22 @@ mod tests {
         assert!(route.reason.contains("dry support"));
         o.player["in_water"] = json!(false);
         assert!(evade(&o).is_none());
+    }
+    #[test]
+    fn a_bank_beyond_one_control_pulls_the_surfacing_waypoint_toward_shore() {
+        let mut o = pool();
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][0] == 4 && (1..=2).contains(&b["position"][1].as_i64().unwrap()) {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let route = evade(&o).unwrap();
+        assert!(
+            route.target.x > 1.,
+            "Surfacing must also progress toward the observed shore"
+        );
+        assert!(route.target.y + 1.62 >= 3.);
     }
     #[test]
     fn a_narrow_lower_landing_across_a_gap_uses_an_observed_jump_target() {
