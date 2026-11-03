@@ -75,8 +75,10 @@ pub struct Choice {
     pub summary: String,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub experiment: bool,
 }
-pub const TOOLS: [&str; 13] = [
+pub const TOOLS: [&str; 14] = [
     "develop",
     "observe",
     "sdk",
@@ -87,12 +89,13 @@ pub const TOOLS: [&str; 13] = [
     "list",
     "search",
     "terminal",
+    "run",
     "remember",
     "goal",
     "complete",
 ];
 pub fn schema() -> Value {
-    json!({"type":"object","properties":{"tool":{"type":"string","enum":TOOLS},"input":{"type":"string","maxLength":10000},"path":{"type":"string","maxLength":256},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048}},"required":["tool","input","path","summary","notes"],"additionalProperties":false})
+    json!({"type":"object","properties":{"tool":{"type":"string","enum":TOOLS},"input":{"type":"string","maxLength":10000},"path":{"type":"string","maxLength":256},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
 pub struct Model {
     http: reqwest::Client,

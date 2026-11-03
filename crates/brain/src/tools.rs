@@ -58,6 +58,23 @@ fn local_shell(command: &str) -> tokio::process::Command {
     c.args(["-c", command]);
     c
 }
+fn run_command(bin: &str) -> Result<String> {
+    ensure(
+        !bin.is_empty()
+            && bin.len() <= 128
+            && bin
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            && bin
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Use an exact Cargo binary name (letters, digits, underscore or hyphen; no leading option)",
+    )?;
+    Ok(format!(
+        "cargo run --offline --bin {bin} --message-format=json"
+    ))
+}
 struct ProcessGroup(u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
@@ -113,6 +130,16 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
         });
     }
     c.process_group(0);
+    let initial_inventory = brain.observed.player["inventory"].clone();
+    let cursor = if let Some(body) = &brain.body {
+        body.shared
+            .feedback
+            .lock()
+            .map_err(|_| "Local action diagnostic trace unavailable")?
+            .cursor()
+    } else {
+        0
+    };
     let mut child = c.spawn()?;
     let pid = child.id().ok_or("Process ID unavailable")?;
     let group = ProcessGroup(pid);
@@ -121,7 +148,6 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     let out = tokio::spawn(bounded_output(stdout));
     let err = tokio::spawn(bounded_output(stderr));
     let started = std::time::Instant::now();
-    let initial_inventory = brain.observed.player["inventory"].clone();
     let deadline = tokio::time::sleep(Duration::from_secs(brain.cfg.tool_timeout_secs));
     tokio::pin!(deadline);
     let mut timed_out = false;
@@ -146,8 +172,35 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
     };
     let captured = output_files.get("error").is_none();
     brain.refresh().await?;
+    let mut feedback = if let Some(body) = &brain.body {
+        body.shared
+            .feedback
+            .lock()
+            .map(|trace| trace.since(cursor))
+            .unwrap_or_else(|_| json!({"error":"Local action diagnostic trace unavailable"}))
+    } else {
+        json!({"scope":"local arbiter disabled; no completeness claim","requests":[]})
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    for row in feedback["requests"].as_array_mut().into_iter().flatten() {
+        if matches!(
+            row["response"]["outcome"].as_str(),
+            Some("running" | "prepared" | "dispatched" | "uncertain")
+        ) && let Some(id) = row["request"]["action_id"].as_str()
+        {
+            match tokio::time::timeout_at(deadline, brain.client.action_status(id)).await {
+                Ok(Ok(receipt)) => row["response"] = crate::feedback::receipt_summary(&receipt),
+                Ok(Err(error)) => row["status_refresh_error"] = json!(error),
+                Err(_) => {
+                    row["status_refresh_error"] =
+                        json!("Status refresh budget reached; inspect preserved IDs, never replay");
+                    break;
+                }
+            }
+        }
+    }
     Ok(
-        json!({"exit_code":status.code(),"success":status.success()&&!timed_out&&captured,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"output_truncated":stdout.len()>2000||stderr.len()>2000,"output_files":output_files,"stdout":crate::output::preview(&stdout),"stderr":crate::output::preview(&stderr)}),
+        json!({"exit_code":status.code(),"success":status.success()&&!timed_out&&captured,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"inventory_delta":crate::feedback::inventory_delta(&initial_inventory,&brain.observed.player["inventory"]),"local_action_feedback":feedback,"compiler_diagnostics":crate::feedback::compiler_diagnostics(&stdout),"output_truncated":stdout.len()>2000||stderr.len()>2000,"output_files":output_files,"stdout":crate::output::preview(&stdout),"stderr":crate::output::preview(&stderr)}),
     )
 }
 pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
@@ -204,6 +257,13 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
             json!({"memory":brain.journal.recall(&choice.input)?,"history":brain.journal.history(&choice.input)?}),
         ),
         "terminal" => terminal(brain, &choice.input).await,
+        "run" => {
+            let command = run_command(&choice.input)?;
+            let mut result = terminal(brain, &command).await?;
+            result["command"] = json!(command);
+            result["experiment"] = json!(true);
+            Ok(result)
+        }
         "remember" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -245,6 +305,23 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn run_selects_one_binary_without_allowing_shell_injection() {
+        assert_eq!(
+            run_command("candidate_2").unwrap(),
+            "cargo run --offline --bin candidate_2 --message-format=json"
+        );
+        for bad in [
+            "",
+            "--all",
+            "bad; touch /tmp/escape",
+            "$(id)",
+            "a b",
+            "../other",
+        ] {
+            assert!(run_command(bad).is_err(), "{bad}");
+        }
+    }
     #[test]
     fn accidental_write_escape_is_refused() {
         let t = tempfile::tempdir().unwrap();

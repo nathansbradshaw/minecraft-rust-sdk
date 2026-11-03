@@ -1,7 +1,48 @@
 //! Cost-control hints, never authority for gameplay success or skill reliability.
 use crate::{Result, ensure};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
+
+/// Excludes receipt IDs, timing and output text: rerunning the same failed
+/// mutation under another ID is not a new experiment or evidence of progress.
+pub fn experiment_signature(source: &str, result: &Value) -> String {
+    let actions:Vec<_>=result["local_action_feedback"]["requests"].as_array().into_iter().flatten().map(|row|json!({"action":row["request"]["action"],"outcome":row["response"]["outcome"],"error_code":row["response"]["error"]["code"],"verified":row["response"]["native_effect_verified"]})).collect();
+    crate::digest(json!({"source":source,"exit_code":result["exit_code"],"success":result["success"],"timed_out":result["timed_out"],"error":result["error"],"compiler_errors":result["compiler_diagnostics"]["errors"],"actions":actions,"inventory_delta":result["inventory_delta"]}).to_string().as_bytes())
+}
+/// Changes to clocks, delivered chat or moving entity coordinates do not reset
+/// diagnosis. Changed terrain, owned inventory, position or needs can matter.
+pub fn environment_signature(observed: &crate::Observation) -> String {
+    let p = &observed.player;
+    let position: Vec<_> = p["position"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|n| n.as_f64().map(f64::floor))
+        .collect();
+    let blocks: Vec<_> = observed.world["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| json!({"position":b["position"],"block":b["block"],"state":b["state"]}))
+        .collect();
+    crate::digest(json!({"dimension":p["dimension"],"position":position,"health":p["health"],"food":p["food"],"inventory":p["inventory"],"blocks":blocks,"menu":observed.menu}).to_string().as_bytes())
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum Investigation {
+    Start,
+    Continue,
+    Exhausted,
+}
+pub fn investigation(subject: &str, previous: &str, remaining: u32) -> Investigation {
+    if subject != previous {
+        Investigation::Start
+    } else if remaining > 0 {
+        Investigation::Continue
+    } else {
+        Investigation::Exhausted
+    }
+}
 
 pub fn workspace_fingerprint(root: &Path) -> Result<String> {
     fingerprint(root, None)
@@ -79,6 +120,31 @@ pub fn next_inspection_count(previous: u32, same_goal: bool, executed: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_receipt_ids_and_wall_clocks_do_not_masquerade_as_new_information() {
+        let mut result = json!({"success":true,"exit_code":0,"local_action_feedback":{"requests":[{"request":{"action_id":"first","action":{"kind":"dig","block":{"x":1,"y":2,"z":3},"face":1,"stage":"start"}},"response":{"action_id":"first","outcome":"uncertain","native_effect_verified":false}}]}});
+        let first = experiment_signature("same source", &result);
+        result["local_action_feedback"]["requests"][0]["request"]["action_id"] = json!("new-id");
+        result["local_action_feedback"]["requests"][0]["response"]["action_id"] = json!("new-id");
+        result["elapsed_ms"] = json!(10000);
+        result["stdout"] = json!("a changed game clock");
+        assert_eq!(first, experiment_signature("same source", &result));
+        result["local_action_feedback"]["requests"][0]["response"]["outcome"] = json!("observed");
+        assert_ne!(first, experiment_signature("same source", &result));
+        assert_ne!(first, experiment_signature("repaired source", &result));
+    }
+    #[test]
+    fn diagnostic_budget_is_per_changed_subject_not_per_restart() {
+        assert_eq!(investigation("new", "", 0), Investigation::Start);
+        for left in (1..=4).rev() {
+            assert_eq!(investigation("new", "new", left), Investigation::Continue);
+        }
+        assert_eq!(investigation("new", "new", 0), Investigation::Exhausted);
+        assert_eq!(
+            investigation("changed source or facts", "new", 0),
+            Investigation::Start
+        );
+    }
     #[test]
     fn saved_feedback_in_nested_state_is_not_a_source_edit() {
         let dir = tempfile::tempdir().unwrap();

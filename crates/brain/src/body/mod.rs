@@ -41,6 +41,7 @@ impl Default for Config {
 pub struct Shared {
     pub mutation: Arc<tokio::sync::Mutex<()>>,
     pub model_lanes: crate::model::Lanes,
+    pub feedback: Mutex<crate::feedback::Trace>,
     emergency: AtomicBool,
     running: AtomicBool,
     latest: Mutex<Option<(Instant, Arc<Observation>)>>,
@@ -111,6 +112,7 @@ impl Handle {
         listener.set_nonblocking(true)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let shared = Arc::new(Shared {
+            feedback: Mutex::new(crate::feedback::Trace::default()),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
             model_lanes: crate::model::Lanes::default(),
             emergency: AtomicBool::new(false),
@@ -280,6 +282,9 @@ async fn proxy(
             Err(e) => LocalActionResponse::Error(e),
         }
     };
+    if let Ok(mut trace) = shared.feedback.lock() {
+        trace.record(&request.request, &response);
+    }
     let mut bytes = serde_json::to_vec(&response)?;
     ensure(bytes.len() <= 1_048_576, "Local response too large")?;
     bytes.push(b'\n');

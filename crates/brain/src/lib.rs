@@ -2,6 +2,7 @@
 //! gateway/server components. Model completion claims never certify game effects.
 pub mod body;
 pub mod conversation;
+pub mod feedback;
 pub mod model;
 pub mod output;
 pub mod progress;
@@ -67,12 +68,17 @@ fn default_interval() -> u64 {
 fn default_inspections() -> u32 {
     8
 }
+fn default_investigation_turns() -> u32 {
+    4
+}
 fn default_terminal_output_budget() -> u32 {
     32
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "default_investigation_turns")]
+    pub investigation_turns: u32,
     #[serde(default = "default_terminal_output_budget")]
     pub terminal_output_budget_mib: u32,
     #[serde(default = "default_inspections")]
@@ -111,7 +117,7 @@ impl Journal {
         let db = Connection::open(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         db.busy_timeout(Duration::from_secs(3))?;
-        db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA max_page_count=16384;CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL);CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL);CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+        db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA max_page_count=16384;CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL);CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL);CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS investigations(subject TEXT PRIMARY KEY,remaining INTEGER NOT NULL);")?;
         Ok(Self { db })
     }
     pub fn event(&self, kind: &str, data: Value) -> Result<i64> {
@@ -138,6 +144,8 @@ impl Journal {
             return Ok(false);
         }
         self.set("inspection_streak", "0")?;
+        self.set("investigation_remaining", "0")?;
+        self.set("needs_investigation", "false")?;
         self.set("context_contract", contract)?;
         self.event("context_contract_changed",json!({"contract_sha256":contract,"inspection_investigation_reopened":true,"goal_and_model_allowance_changed":false}))?;
         Ok(true)
@@ -203,6 +211,8 @@ impl Journal {
             ("completed_goal", ""),
             ("completed_revision", ""),
             ("inspection_streak", "0"),
+            ("investigation_remaining", "0"),
+            ("needs_investigation", "false"),
         ] {
             tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
         }
@@ -353,7 +363,9 @@ impl Journal {
         Ok(json!(out))
     }
     fn activity(&self, choice: &model::Choice, result: &Value) -> Result<()> {
-        if !["sdk", "write", "terminal"].contains(&choice.tool.as_str()) || tool_failed(result) {
+        if !["sdk", "write", "terminal", "run"].contains(&choice.tool.as_str())
+            || tool_failed(result)
+        {
             return Ok(());
         }
         let mut records: Vec<Value> = self
@@ -370,6 +382,92 @@ impl Journal {
             records.drain(..records.len() - 12);
         }
         self.set("activity", &serde_json::to_string(&records)?)
+    }
+    fn experiment(
+        &self,
+        choice: &model::Choice,
+        result: &Value,
+        source: &str,
+        goal_revision: &str,
+    ) -> Result<bool> {
+        if !["terminal", "run"].contains(&choice.tool.as_str())
+            || (choice.tool != "run"
+                && !choice.experiment
+                && result["local_action_feedback"]["requests"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty))
+        {
+            return Ok(false);
+        }
+        let signature = progress::experiment_signature(source, result);
+        let novel = self.get("experiment_signature")?.as_deref() != Some(signature.as_str());
+        let mut saved = json!({"command":choice.input,"summary":choice.summary,"source_sha256":source,"goal_revision":goal_revision,"signature":signature,"result":result,"authority":"container diagnostics, not benchmark/native certification"});
+        compact_history(&mut saved);
+        bound_value(&mut saved, 8192);
+        self.set("last_experiment", &saved.to_string())?;
+        self.set("experiment_signature", &signature)?;
+        Ok(novel)
+    }
+    fn investigation_budget(
+        &self,
+        subject: &str,
+        budget: u32,
+        expected_revision: &str,
+    ) -> Result<Option<(progress::Investigation, u32)>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key='goal_revision'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current.as_deref().unwrap_or_default() != expected_revision {
+            return Ok(None);
+        }
+        let known: Option<u32> = tx
+            .query_row(
+                "SELECT remaining FROM investigations WHERE subject=?1",
+                [subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let remaining = known.unwrap_or(budget).min(budget);
+        tx.execute("INSERT INTO investigations(subject,remaining) VALUES(?1,?2) ON CONFLICT(subject) DO UPDATE SET remaining=excluded.remaining",params![subject,remaining])?;
+        for (key, value) in [
+            ("investigation_subject", subject.to_owned()),
+            ("investigation_remaining", remaining.to_string()),
+            ("develop_next", "true".to_owned()),
+        ] {
+            tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+        }
+        tx.commit()?;
+        Ok(Some((
+            progress::investigation(
+                subject,
+                if known.is_some() { subject } else { "" },
+                remaining,
+            ),
+            remaining,
+        )))
+    }
+    fn investigation_spent(&self, subject: &str, finished: bool) -> Result<()> {
+        self.db.execute("UPDATE investigations SET remaining=CASE WHEN ?2 THEN 0 ELSE max(remaining-1,0) END WHERE subject=?1",params![subject,finished])?;
+        let remaining: Option<u32> = self
+            .db
+            .query_row(
+                "SELECT remaining FROM investigations WHERE subject=?1",
+                [subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        self.set(
+            "investigation_remaining",
+            &remaining.unwrap_or_default().to_string(),
+        )
     }
 }
 fn compact_history(value: &mut Value) {
@@ -429,6 +527,10 @@ impl Brain {
         ensure(
             (1..=64).contains(&cfg.max_inspections_without_execution),
             "Invalid inspection budget",
+        )?;
+        ensure(
+            (1..=8).contains(&cfg.investigation_turns),
+            "Invalid investigation budget",
         )?;
         ensure(
             (8..=256).contains(&cfg.terminal_output_budget_mib),
@@ -644,26 +746,76 @@ impl Brain {
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or_default();
             let inspected_goal = self.journal.get("inspection_goal")?.unwrap_or_default();
-            if inspected_goal == self.goal
-                && inspected >= self.cfg.max_inspections_without_execution
+            let mut investigation = Value::Null;
+            let mut investigation_left = 0;
+            let mut investigation_subject = String::new();
+            let mut investigation_revision = String::new();
+            if (inspected_goal == self.goal
+                && inspected >= self.cfg.max_inspections_without_execution)
+                || self.journal.get("needs_investigation")?.as_deref() == Some("true")
+                || self
+                    .journal
+                    .get("investigation_remaining")?
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or_default()
+                    > 0
             {
-                let source = progress::workspace_fingerprint_excluding_state(
-                    &self.cfg.workspace,
-                    &self.cfg.state,
-                )?;
-                let stalled_revision = self.journal.get("goal_revision")?.unwrap_or_default();
-                self.journal.event("execution_stalled",json!({"inspection_calls":inspected,"goal":self.goal,"source_sha256":source,"thinking_lane":"paused pending changed source or goal","body_and_chat":"remain active","next_action":"Investigate the recorded context/tool boundary; no unchanged model polling"}))?;
-                while self.goal == inspected_goal
-                    && self.journal.get("goal_revision")?.unwrap_or_default() == stalled_revision
-                    && progress::workspace_fingerprint_excluding_state(
+                loop {
+                    let source = progress::workspace_fingerprint_excluding_state(
                         &self.cfg.workspace,
                         &self.cfg.state,
-                    )? == source
-                {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    self.refresh().await?;
+                    )?;
+                    let revision = self.journal.get("goal_revision")?.unwrap_or_default();
+                    let environment = progress::environment_signature(&self.observed);
+                    let subject=digest(json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.journal.get("experiment_signature")?,"context_contract":self.journal.get("context_contract")?}).to_string().as_bytes());
+                    let Some((state, remaining)) = self.journal.investigation_budget(
+                        &subject,
+                        self.cfg.investigation_turns,
+                        &revision,
+                    )?
+                    else {
+                        self.refresh().await?;
+                        inspected = 0;
+                        break;
+                    };
+                    match state {
+                        progress::Investigation::Start => {
+                            investigation_left = remaining;
+                            self.journal.event("investigation_started",json!({"subject":subject,"turn_budget":investigation_left,"goal":self.goal,"source_sha256":source,"body_and_chat":"remain active","allowance_changed":false}))?;
+                        }
+                        progress::Investigation::Continue => investigation_left = remaining,
+                        progress::Investigation::Exhausted => {
+                            self.journal.event("investigation_exhausted",json!({"subject":subject,"goal":self.goal,"last_experiment":self.journal.get("last_experiment")?,"next_action":"Concrete defect: inspect the recorded diagnosis and missing boundary. No unchanged model polling; changed source, meaningful native facts or another task can reopen this subject.","body_and_chat":"remain active"}))?;
+                            while self.journal.get("goal_revision")?.unwrap_or_default() == revision
+                                && progress::workspace_fingerprint_excluding_state(
+                                    &self.cfg.workspace,
+                                    &self.cfg.state,
+                                )? == source
+                                && progress::environment_signature(&self.observed) == environment
+                            {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                self.refresh().await?;
+                            }
+                            if self.journal.get("goal_revision")?.unwrap_or_default() != revision {
+                                inspected = 0;
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    investigation_subject = subject.clone();
+                    investigation_revision = revision.clone();
+                    investigation = json!({"mode":"investigation","remaining_turns":investigation_left,"subject":subject,"task":"Identify the earliest failing boundary from last_experiment and current facts. Gather a discriminating observation, repair code or run a changed bounded experiment. Do not reconstruct unchanged output repeatedly. State a concrete missing interface if client code cannot resolve it."});
+                    break;
                 }
-                self.journal.set("inspection_streak", "0")?;
+            }
+            self.refresh().await?;
+            if !investigation_revision.is_empty()
+                && self.journal.get("goal_revision")?.unwrap_or_default() != investigation_revision
+            {
+                investigation = Value::Null;
+                investigation_left = 0;
+                investigation_subject.clear();
                 inspected = 0;
             }
             while self.cfg.await_chat_goal
@@ -680,20 +832,13 @@ impl Brain {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(json!([]));
             let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","inventory":"occupied slots only, original slot numbers","menus":"slot contents require a fresh full SDK observation"},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
-            // Preserve the latest error and player state under pressure; never
-            // silently delete all feedback to make a world snapshot fit.
-            bound_value(&mut context["memory"], 1000);
-            bound_value(&mut context["recent"], 3000);
-            bound_value(&mut context["observation"], 6000);
-            bound_value(&mut context["development_request"], 1000);
-            bound_value(&mut context["completed_tool_activity"], 1500);
-            bound_value(&mut context["last_tool_result"], 9000);
-            bound_value(&mut context["working_notes"], 2000);
-            bound_value(&mut context["player_request"], 2000);
-            ensure(
-                serde_json::to_vec(&context)?.len() <= 32768,
-                "Context budget exceeded",
-            )?;
+            context["investigation"] = investigation;
+            context["last_experiment"] = self
+                .journal
+                .get("last_experiment")?
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or(Value::Null);
+            fit_context(&mut context)?;
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
             let develop = self.journal.get("develop_next")?.as_deref() == Some("true");
@@ -746,7 +891,7 @@ impl Brain {
             if !choice.notes.is_empty() {
                 self.journal.set("working_notes", &choice.notes)?;
             }
-            if ["develop", "write", "terminal"].contains(&choice.tool.as_str()) {
+            if ["develop", "write", "terminal", "run"].contains(&choice.tool.as_str()) {
                 self.journal.set("develop_next", "true")?;
             } else if choice.tool == "complete" {
                 self.journal.set("develop_next", "false")?;
@@ -769,9 +914,29 @@ impl Brain {
                 &self.cfg.workspace,
                 &self.cfg.state,
             )?;
-            let executed = result
+            let goal_changed = self.goal != requested_goal
+                || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision;
+            let mut executed = result
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
+            if let Ok(value) = &result {
+                executed |=
+                    self.journal
+                        .experiment(&choice, value, &source_after, &requested_revision)?;
+            } else if choice.tool == "run" || (choice.tool == "terminal" && choice.experiment) {
+                self.journal.experiment(&choice,&json!({"error":result.as_ref().err().map(ToString::to_string),"command_execution_uncertain":"Inspect existing action IDs before retrying"}),&source_after,&requested_revision)?;
+            }
+            if executed || goal_changed {
+                if !investigation_subject.is_empty() {
+                    self.journal
+                        .investigation_spent(&investigation_subject, true)?;
+                }
+                self.journal.set("investigation_remaining", "0")?;
+                self.journal.set("needs_investigation", "false")?;
+            } else if investigation_left > 0 {
+                self.journal
+                    .investigation_spent(&investigation_subject, false)?;
+            }
             let inspected =
                 progress::next_inspection_count(inspected, inspected_goal == self.goal, executed);
             self.journal
@@ -780,7 +945,8 @@ impl Brain {
             match result {
                 Ok(value) => {
                     self.journal.activity(&choice, &value)?;
-                    if tool_failed(&value) {
+                    if tool_failed(&value) && !goal_changed {
+                        self.journal.set("needs_investigation", "true")?;
                         self.journal.set("develop_next", "true")?;
                         self.journal.set("development_request", "Investigate the last tool failure using its error and current observation. Do not repeat an unchanged rejected action; repair its precondition or the program first.")?;
                     }
@@ -788,6 +954,9 @@ impl Brain {
                         .event("tool_result", json!({"tool":choice.tool,"result":value}))?;
                 }
                 Err(e) => {
+                    if !goal_changed {
+                        self.journal.set("needs_investigation", "true")?;
+                    }
                     self.journal.event(
                         "tool_result",
                         json!({"tool":choice.tool,"error":e.to_string()}),
@@ -841,6 +1010,42 @@ fn bound_value(value: &mut Value, budget: usize) {
         shrink_value(value);
     }
 }
+fn fit_context(context: &mut Value) -> Result<()> {
+    for (field, budget) in [
+        ("server", 2500),
+        ("memory", 1000),
+        ("recent", 3000),
+        ("observation", 6000),
+        ("development_request", 1000),
+        ("completed_tool_activity", 1500),
+        ("last_tool_result", 9000),
+        ("last_experiment", 4096),
+        ("working_notes", 2000),
+        ("player_request", 2000),
+    ] {
+        bound_value(&mut context[field], budget);
+    }
+    // Preserve the experiment/error channel under pressure. Older history,
+    // redundant world detail and long source previews have complete file paths.
+    for (field, budget) in [
+        ("recent", 1000),
+        ("completed_tool_activity", 512),
+        ("observation", 3000),
+        ("memory", 512),
+        ("last_tool_result", 5000),
+        ("server", 1500),
+        ("working_notes", 1000),
+    ] {
+        if serde_json::to_vec(context)?.len() <= 32768 {
+            break;
+        }
+        bound_value(&mut context[field], budget);
+    }
+    ensure(
+        serde_json::to_vec(context)?.len() <= 32768,
+        "Context budget exceeded",
+    )
+}
 fn shrink_value(value: &mut Value) {
     match value {
         Value::String(s) if s.len() > 512 => {
@@ -889,15 +1094,137 @@ fn shrink_value(value: &mut Value) {
 }
 fn tool_failed(v: &Value) -> bool {
     v["success"] == false
+        || v["local_action_feedback"]
+            .get("error")
+            .is_some_and(|e| !e.is_null())
         || v.get("error").is_some_and(|e| !e.is_null())
         || matches!(
             v["receipt"]["outcome"].as_str(),
             Some("rejected" | "uncertain" | "failed" | "expired")
         )
+        || matches!(
+            v["outcome"].as_str(),
+            Some("rejected" | "uncertain" | "failed" | "expired")
+        )
+        || v["local_action_feedback"]["requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| {
+                row["response"].get("error").is_some_and(|e| !e.is_null())
+                    || matches!(
+                        row["response"]["outcome"].as_str(),
+                        Some("rejected" | "uncertain" | "failed" | "expired")
+                    )
+            })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inspections_cannot_replace_the_last_experiment_or_reset_a_repeated_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(&dir.path().join("brain.sqlite")).unwrap();
+        let mut choice = model::Choice {
+            tool: "terminal".into(),
+            input: "cargo run --bin candidate".into(),
+            path: String::new(),
+            summary: "run candidate".into(),
+            notes: String::new(),
+            experiment: true,
+        };
+        let failure = json!({"success":true,"exit_code":0,"local_action_feedback":{"requests":[{"request":{"action_id":"old-id","action":{"kind":"look","yaw":1,"pitch":0}},"response":{"outcome":"rejected","error":{"code":"permission_denied","message":"fixture denied"}}}]},"output_files":{"stderr":{"path":"retained.log"}}});
+        assert!(tool_failed(&failure));
+        assert!(
+            j.experiment(&choice, &failure, "source-one", "goal-one")
+                .unwrap()
+        );
+        let saved = j.get("last_experiment").unwrap();
+        choice.experiment = false;
+        choice.input = "cat main.rs".into();
+        assert!(
+            !j.experiment(
+                &choice,
+                &json!({"success":true,"exit_code":0}),
+                "source-one",
+                "goal-one"
+            )
+            .unwrap()
+        );
+        assert_eq!(saved, j.get("last_experiment").unwrap());
+        choice.experiment = true;
+        let mut repeated = failure.clone();
+        repeated["local_action_feedback"]["requests"][0]["request"]["action_id"] =
+            json!("different-id");
+        assert!(
+            !j.experiment(&choice, &repeated, "source-one", "goal-one")
+                .unwrap()
+        );
+        assert!(
+            j.experiment(&choice, &repeated, "repaired-source", "goal-one")
+                .unwrap()
+        );
+    }
+    #[test]
+    fn exhausted_investigation_survives_restart_reverting_source_and_budget_increase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.sqlite");
+        let revision;
+        {
+            let j = Journal::open(&path).unwrap();
+            revision = j
+                .select_goal("collect material", "fixture", json!({}), None)
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                j.investigation_budget("subject-a", 2, &revision).unwrap(),
+                Some((progress::Investigation::Start, 2))
+            );
+            j.investigation_spent("subject-a", false).unwrap();
+            j.investigation_spent("subject-a", false).unwrap();
+            assert_eq!(
+                j.investigation_budget("subject-b", 2, &revision).unwrap(),
+                Some((progress::Investigation::Start, 2))
+            );
+        }
+        let j = Journal::open(&path).unwrap();
+        assert_eq!(
+            j.investigation_budget("subject-a", 8, &revision).unwrap(),
+            Some((progress::Investigation::Exhausted, 0))
+        );
+        let other = Journal::open(&path).unwrap();
+        other
+            .select_goal("find food", "fixture", json!({}), None)
+            .unwrap();
+        assert!(
+            j.investigation_budget("stale-request", 4, &revision)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            j.get("needs_investigation").unwrap().as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            j.get("investigation_remaining").unwrap().as_deref(),
+            Some("0")
+        );
+    }
+    #[test]
+    fn large_context_preserves_experiment_errors_and_sdk_coordinates() {
+        let mut context = json!({"server":{"description":"x".repeat(30000)},"sdk_reference":"API docs".repeat(500),"goal":"goal","recent":vec![json!({"text":"x".repeat(10000)});12],"last_tool_result":{"result":{"content":"source".repeat(5000)}},"last_experiment":{"result":{"exit_code":101,"stderr":"compiler failure marker","local_action_feedback":{"requests":[]},"output_files":{"stderr":{"path":"complete-errors.txt"}}}},"observation":{"player":{"position":[12.25,64.0,-9.5],"inventory":[{"slot":7,"item":"custom:item","count":2}]},"world":{"blocks":[{"position":[12,64,-9],"block":"custom:resource"}]}}});
+        fit_context(&mut context).unwrap();
+        assert!(context.to_string().len() <= 32768);
+        assert_eq!(context["last_experiment"]["result"]["exit_code"], 101);
+        assert_eq!(
+            context["last_experiment"]["result"]["stderr"],
+            "compiler failure marker"
+        );
+        assert_eq!(
+            context["observation"]["world"]["blocks"][0]["position"],
+            json!([12, 64, -9])
+        );
+    }
     fn conversation(action: model::GoalAction, goal: &str) -> model::Conversation {
         model::Conversation {
             message: String::new(),
