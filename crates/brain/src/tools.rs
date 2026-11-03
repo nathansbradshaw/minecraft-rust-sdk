@@ -189,7 +189,13 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
         ) && let Some(id) = row["request"]["action_id"].as_str()
         {
             match tokio::time::timeout_at(deadline, brain.client.action_status(id)).await {
-                Ok(Ok(receipt)) => row["response"] = crate::feedback::receipt_summary(&receipt),
+                Ok(Ok(receipt)) => {
+                    row["response"] = crate::feedback::receipt_summary(&receipt);
+                    if let Ok(request) = serde_json::from_value(row["request"].clone()) {
+                        row["container_inspection"] =
+                            json!(crate::containers::inspection(&request, &receipt));
+                    }
+                }
                 Ok(Err(error)) => row["status_refresh_error"] = json!(error),
                 Err(_) => {
                     row["status_refresh_error"] =
@@ -198,6 +204,13 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
                 }
             }
         }
+    }
+    for row in feedback["requests"].as_array().into_iter().flatten() {
+        brain.journal.remember_container(
+            &brain.server.instance_id,
+            brain.observed.player["uuid"].as_str().unwrap_or_default(),
+            &row["container_inspection"],
+        )?;
     }
     Ok(
         json!({"exit_code":status.code(),"success":status.success()&&!timed_out&&captured,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"inventory_delta":crate::feedback::inventory_delta(&initial_inventory,&brain.observed.player["inventory"]),"local_action_feedback":feedback,"compiler_diagnostics":crate::feedback::compiler_diagnostics(&stdout),"output_truncated":stdout.len()>2000||stderr.len()>2000,"output_files":output_files,"stdout":crate::output::preview(&stdout),"stderr":crate::output::preview(&stderr)}),

@@ -13,6 +13,12 @@ field names. They omit data for context size; omitted terrain is unknown. Read a
 fresh full SDK observation when code needs additional facts. Historical compact
 journal entries may use an older view; current API documentation and runtime
 observations define the fields that new Rust programs should consume.
+menu.summary counts every slot in the current SDK snapshot, separately from
+player inventory. If its non-player slots are empty, paging the same menu adds no
+item evidence. inspected_containers retains prior SDK inspections by stable entity
+UUID or block position across restarts. These are historical facts, not current
+guarantees: contents may change. Do not repeatedly rediscover the same empty
+container without a reason to expect a change; investigate another resource path.
 
 Return one JSON command record matching the response schema. The container's
 scheduler executes it and returns its result on the next turn. This is a data
