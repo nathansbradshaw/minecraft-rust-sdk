@@ -3,6 +3,7 @@ mod chat;
 mod control;
 mod effects;
 mod motion;
+mod recipes;
 mod routes;
 use minecraft_sdk_java_1_21_1::{Wire, encode_signed_varint as vi};
 use minecraft_sdk_wire::{decode_string_prefix, decode_varint_prefix, encode_string as text};
@@ -1429,6 +1430,19 @@ fn dispatch(
                 })?;
                 let observation_ms = observation_started.elapsed().as_millis();
                 effects::validate_item_use(&action.action, &before)?;
+                if let Action::Craft { recipe, .. } = &action.action {
+                    if !discovery["observation_capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == recipes::CAPABILITY))
+                    {
+                        return Err(ApiError::new(
+                            ErrorCode::UnsupportedCapability,
+                            "Matching server integration with minecraft:recipes is required for recipe-book crafting",
+                        ));
+                    }
+                    let found=native.call("observe-extension",json!({"player_uuid":request.player_uuid,"capability":recipes::CAPABILITY,"input":{"recipe":recipe,"limit":1}})).map_err(|_|ApiError::new(ErrorCode::NotReady,"Runtime recipe validation unavailable; no gameplay packet sent"))?;
+                    recipes::validate(recipe, &found)?;
+                }
                 if before.player["health"].as_f64().is_some_and(|h| h <= 0.)
                     && !matches!(
                         action.action,

@@ -3,6 +3,7 @@ pub mod menu;
 pub mod navigation;
 #[cfg(test)]
 mod perform_tests;
+pub mod recipes;
 use reqwest::{Client as Http, Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;

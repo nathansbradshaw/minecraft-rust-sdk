@@ -4,6 +4,25 @@ The optional Rust `menu` helpers build actions; they do not dispatch, select a
 strategy or replay a mutation. Supply runtime recipe/item IDs and observed slot
 identifiers. No menu layout, material, server address or mod list is built in.
 
+Alpha.11 adds the read-only `minecraft:recipes` capability. Its advertised input
+schema accepts exact runtime recipe, output-item and recipe-type selectors, plus
+bounded pagination. `recipes::Query::request()` builds the same request for Rust
+clients. A recipe ID is distinct from its output item ID; discover it rather than
+assuming an item, tag or material category is a recipe. Results include this
+character's recipe-book knowledge, representative matching ingredient stacks,
+result metadata and shaped-grid dimensions where available. No recipes are
+unlocked by querying. Dynamic results and custom ingredient quantities/components
+can require a mod adapter; omitted alternatives or ingredients remain unknown.
+Respect `retry_after_ms`, `next_offset` and `complete`. Pages are live across data
+reloads; an output-filter miss cannot exclude dynamic recipes.
+
+The alpha.11 adapter requires that matching server capability before dispatching
+recipe-book crafting. It rejects an unknown ID or a recipe absent from this
+character's book before sending a gameplay packet. It does not claim that a
+known recipe fits the open menu or that available ingredients suffice. Installing
+the Java provider requires a saved restart; replacing the Rust adapter alone
+cannot add it. Existing finite controls and ordinary player permissions apply.
+
 `menu::prepare_recipe(&observation, recipe_id, make_all)` builds `Action::Craft`
 for the observed menu. This is recipe placement into a grid. A prepared result
 is not yet an item retained by the character.
