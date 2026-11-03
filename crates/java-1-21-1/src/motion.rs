@@ -436,7 +436,8 @@ impl Actor {
                             }
                             if d.released.is_none()
                                 && (!d.jump || p.medium != Medium::Air)
-                                && distance(e.body.position, d.target) < 0.18
+                                && distance(e.body.position, d.target) < 0.08
+                                && e.body.velocity[0].hypot(e.body.velocity[2]) < 0.025
                                 && (e.body.on_ground || p.medium != Medium::Air)
                             {
                                 release(&mut d, Outcome::Observed);
@@ -453,7 +454,7 @@ impl Actor {
                                         .any(|(pos, _)| distance(*pos, observed) < 0.08)
                                 {
                                     let verified = *outcome != Outcome::Observed
-                                        || distance(observed, d.target) < 0.35;
+                                        || movement_target_reached(observed, d.target);
                                     let final_outcome = if verified {
                                         outcome.clone()
                                     } else {
@@ -463,7 +464,7 @@ impl Actor {
                                         receipt.outcome = final_outcome;
                                         receipt.error=(!verified).then(||ApiError::new(ErrorCode::Conflict,"Released control did not reach its observed target"));
                                         let first = receipt.evidence["first_effect"].clone();
-                                        receipt.evidence = json!({"before":compact(&d.action.action,&d.before),"after":compact(&d.action.action,&snapshot.o),"native_effect_verified":verified,"input_released":true,"frames_sent":d.frames.len(),"elapsed_ms":d.started.elapsed().as_millis(),"first_effect":first,"release_scope":"Native pose matches a submitted released-input frame; passive gravity and momentum continue"});
+                                        receipt.evidence = json!({"before":compact(&d.action.action,&d.before),"after":compact(&d.action.action,&snapshot.o),"target":d.target,"target_tolerance_blocks":MOVEMENT_TARGET_TOLERANCE,"native_effect_verified":verified,"input_released":true,"frames_sent":d.frames.len(),"elapsed_ms":d.started.elapsed().as_millis(),"first_effect":first,"release_scope":"Native pose matches a submitted released-input frame; passive gravity and momentum continue"});
                                     }
                                 } else if released_at.elapsed() > Duration::from_secs(2) {
                                     finish_interrupted(
@@ -956,6 +957,58 @@ mod tests {
             packets.load(Ordering::Acquire) >= 10,
             "the same physical writer continues after input release"
         );
+        for (id, target, jump) in [
+            ("fixture-arrive-walk", [2.5, 1., 1.5], false),
+            ("fixture-arrive-jump", [0.5, 1., 0.5], true),
+        ] {
+            let request = ActionRequest {
+                action_id: id.into(),
+                action: Action::StartMove {
+                    target: Position {
+                        x: target[0],
+                        y: target[1],
+                        z: target[2],
+                    },
+                    jump,
+                    max_ticks: 100,
+                },
+            };
+            let state = Arc::new(Mutex::new(Receipt {
+                action_id: id.into(),
+                outcome: Outcome::Running,
+                adapter_version: VERSION.into(),
+                evidence: json!({}),
+                error: None,
+            }));
+            actor
+                .start_control(
+                    actor.observe().unwrap(),
+                    &request,
+                    0,
+                    state.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            wait_until(|| state.lock().unwrap().outcome.terminal());
+            let receipt = state.lock().unwrap();
+            assert_eq!(
+                receipt.outcome,
+                Outcome::Observed,
+                "{id}: {}",
+                receipt.evidence
+            );
+            let actual = std::array::from_fn(|i| {
+                receipt.evidence["after"]["player"]["position"][i]
+                    .as_f64()
+                    .unwrap()
+            });
+            assert!(
+                movement_target_reached(actual, target),
+                "Released native arrival must satisfy the public navigator's contract"
+            );
+            assert_eq!(receipt.evidence["target"], json!(target));
+            assert_eq!(receipt.evidence["input_released"], true);
+        }
         let request = ActionRequest {
             action_id: "fixture-correct".into(),
             action: Action::StartMove {

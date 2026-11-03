@@ -165,6 +165,8 @@ struct Attempt {
     scene: String,
     target: [f64; 3],
     outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    arrival_verification: Option<serde_json::Value>,
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -457,13 +459,29 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
+            let mut arrival = None;
             if receipt.outcome == Outcome::Observed {
                 let after = &receipt.evidence["after"]["player"]["position"];
                 let actual = [after[0].as_f64(), after[1].as_f64(), after[2].as_f64()];
                 if receipt.evidence["native_effect_verified"] != true
-                    || !matches!(actual,[Some(x),Some(y),Some(z)] if distance([x,y,z],pending.target)<0.15)
+                    || !matches!(actual,[Some(x),Some(y),Some(z)] if [x,y,z].into_iter().all(f64::is_finite))
                 {
-                    return Ok(j.report("needs_reconciliation","Observed receipt does not bind to the saved movement target; preserve the intention and investigate"));
+                    return Ok(j.report("needs_reconciliation","Observed receipt lacks usable native pose evidence; preserve the intention and investigate without replay"));
+                }
+                if receipt.evidence["after"]["player"]["uuid"].as_str() != Some(&j.state.actor)
+                    || receipt.evidence["after"]["player"]["dimension"].as_str()
+                        != Some(j.state.goal.dimension())
+                {
+                    return Err(error(
+                        ErrorCode::Conflict,
+                        "Movement receipt actor or dimension differs from the saved intention",
+                    ));
+                }
+                if let [Some(x), Some(y), Some(z)] = actual {
+                    arrival = Some((
+                        [x, y, z],
+                        movement_target_reached([x, y, z], pending.target),
+                    ));
                 }
             }
             let mut attempt = j
@@ -472,7 +490,9 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 .take()
                 .ok_or_else(|| local("Pending intention vanished"))?;
             attempt.outcome = Some(receipt.outcome.clone());
-            if receipt.outcome != Outcome::Observed {
+            attempt.arrival_verification=arrival.map(|(actual,reached)|serde_json::json!({"target_reached":reached,"native_after_position":actual,"tolerance_blocks":MOVEMENT_TARGET_TOLERANCE,"native_receipt_outcome":receipt.outcome}));
+            if receipt.outcome != Outcome::Observed || arrival.is_some_and(|(_, reached)| !reached)
+            {
                 j.state.blocked.insert(blocked_key(
                     &key(attempt.origin),
                     &key(attempt.target),
@@ -480,6 +500,11 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 ));
             }
             j.state.history.push(attempt);
+            if let Some((actual, false)) = arrival {
+                j.state.position = actual;
+                j.save()?;
+                return Ok(j.report("target_not_reached","The server ended this intention at a different verified pose; native outcome and target mismatch are retained. Reobserve and plan a new intention; this ID was not replayed."));
+            }
             j.save()?;
         }
         let observation = client.observe().await?;
@@ -649,6 +674,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
             scene,
             target: route.target,
             outcome: None,
+            arrival_verification: None,
         });
         j.save()?;
         // Persist before dispatch. Even an interrupted HTTP request is inspected
@@ -758,6 +784,81 @@ mod tests {
         .without_local_arbiter()
     }
     #[tokio::test]
+    async fn terminal_target_miss_is_retained_without_replay_while_unbound_receipts_stay_fenced() {
+        for case in ["miss", "foreign", "unverified"] {
+            let temp = Temp::new();
+            let path = temp.0.join("nav.json");
+            {
+                let mut j =
+                    Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+                j.state.pending = Some(Attempt {
+                    request: ActionRequest {
+                        action_id: "ended".into(),
+                        action: Action::StartMove {
+                            target: Position {
+                                x: 1.5,
+                                y: 1.,
+                                z: 0.5,
+                            },
+                            jump: false,
+                            max_ticks: 60,
+                        },
+                    },
+                    origin: [0.5, 1., 0.5],
+                    scene: "scene".into(),
+                    target: [1.5, 1., 0.5],
+                    outcome: None,
+                    arrival_verification: None,
+                });
+                j.save().unwrap();
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    observation([0.5, 1., 0.5]),
+                    200,
+                )
+                .await;
+                respond(&listener,"GET /v1/bots/fixture/actions/ended ",serde_json::json!({"action_id":"ended","outcome":"observed","adapter_version":"fixture","error":null,"evidence":{"native_effect_verified":case!="unverified","after":{"player":{"uuid":if case=="foreign"{"other"}else{"actor"},"dimension":"fixture:world","position":[1.7,1.,0.5]}}}}),200).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "No reconciliation or mutation is silently dispatched"
+                );
+            });
+            let result = navigate(&c, goal(), &path, Options::default()).await;
+            server.await.unwrap();
+            let j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+            match case {
+                "miss" => {
+                    let report = result.unwrap();
+                    assert_eq!(report.status, "target_not_reached");
+                    assert!(report.pending_action.is_none());
+                    assert!(j.state.pending.is_none());
+                    assert_eq!(j.state.history[0].outcome, Some(Outcome::Observed));
+                    assert_eq!(
+                        j.state.history[0].arrival_verification.as_ref().unwrap()["target_reached"],
+                        false
+                    );
+                    assert_eq!(j.state.history[0].request.action_id, "ended");
+                }
+                "foreign" => {
+                    assert_eq!(result.unwrap_err().code, ErrorCode::Conflict);
+                    assert!(j.state.pending.is_some());
+                }
+                _ => {
+                    assert_eq!(result.unwrap().status, "needs_reconciliation");
+                    assert!(j.state.pending.is_some());
+                }
+            }
+        }
+    }
+    #[tokio::test]
     async fn missing_interrupted_intention_is_inspected_but_never_submitted_again() {
         let temp = Temp::new();
         let path = temp.0.join("nav.json");
@@ -780,6 +881,7 @@ mod tests {
                 scene: "scene".into(),
                 target: [1.5, 1., 0.5],
                 outcome: None,
+                arrival_verification: None,
             });
             j.save().unwrap();
         }
@@ -860,6 +962,7 @@ mod tests {
                 scene: "scene".into(),
                 target: [1.5, 1., 0.5],
                 outcome: None,
+                arrival_verification: None,
             });
             j.save().unwrap();
         }
@@ -944,6 +1047,7 @@ mod tests {
                 scene: "known".into(),
                 target: [1.5, 1., 0.5],
                 outcome: None,
+                arrival_verification: None,
             });
             j.save().unwrap();
         }
