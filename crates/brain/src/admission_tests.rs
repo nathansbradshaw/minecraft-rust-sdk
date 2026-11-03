@@ -3,7 +3,7 @@ use super::*;
 use minecraft_sdk::{Action, BlockPos, Credential, Hand, Receipt, ServerInfo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn fixture(endpoint: &str) -> (tempfile::TempDir, Brain) {
+pub(super) fn fixture(endpoint: &str) -> (tempfile::TempDir, Brain) {
     let root = tempfile::tempdir().unwrap();
     let state = root.path().to_path_buf();
     let cfg:Config=serde_json::from_value(json!({"profile":state.join("profile"),"model_key":state.join("model"),"model_endpoint":"https://example.invalid/","workspace":state,"state":state,"goal":"fixture"})).unwrap();

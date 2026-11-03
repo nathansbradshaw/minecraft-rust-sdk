@@ -16,6 +16,10 @@ field names. They omit data for context size; omitted terrain is unknown. Read a
 fresh full SDK observation when code needs additional facts. Historical compact
 journal entries may use an older view; current API documentation and runtime
 observations define the fields that new Rust programs should consume.
+project_manifest is a bounded current Cargo.toml hint, including dependency
+locations when present. Its path and list entry paths are directly readable;
+inspect the actual manifest if the hint is incomplete. Local files are editable
+client context, not authoritative game observations.
 menu.summary counts every slot in the current SDK snapshot, separately from
 player inventory. If its non-player slots are empty, paging the same menu adds no
 item evidence. inspected_containers retains prior SDK inspections by stable entity
@@ -105,9 +109,17 @@ Tools and input:
 - reconcile: an existing uncertain action ID. This inspects current state, never
   replays the mutation and never proves its historical effect.
 - read: a path to a UTF-8 file inside your container (read source/docs as needed).
+  Relative paths always start at workspace, regardless of prior list calls.
+  The result identifies the resolved path; content_complete=false means a bounded
+  preview. Use terminal line/range reads for omitted content. Read Cargo.toml to
+  find the actual SDK dependency path rather than guessing a local helper file.
 - write: set path to the relative file path and input to the actual UTF-8 Rust
   source. Do not wrap input in another JSON object or double-escape source text.
-- list: relative directory, or empty string for the project root.
+  List entries inside this project include relative_path for this purpose.
+- list: directory path, or empty string for the project root. The result names
+  its directory and supplies directly usable entry paths. Listing src does not
+  change the base of later reads; use its returned src/main.rs path. Respect
+  complete=false; truncated listings do not establish absence.
 - search: literal text to find in labelled memory and older journal events,
   including durable action IDs and receipt outcomes. Search an action kind such
   as look to recover receipts older than the recent transcript.

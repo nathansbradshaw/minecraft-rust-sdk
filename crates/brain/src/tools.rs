@@ -257,17 +257,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
         "sdk" => brain.act(serde_json::from_str(&choice.input)?).await,
         "status" => Ok(serde_json::to_value(brain.inspect(&choice.input).await?)?),
         "reconcile" => brain.settle(&choice.input).await,
-        "read" => {
-            let path = Path::new(&choice.input);
-            let path = if path.is_absolute() {
-                path.to_owned()
-            } else {
-                brain.cfg.workspace.join(path)
-            };
-            let m = fs::metadata(&path)?;
-            ensure(m.is_file() && m.len() <= 65536, "Read a bounded UTF-8 file")?;
-            Ok(json!({"path":choice.input,"content":fs::read_to_string(path)?}))
-        }
+        "read" => crate::workspace::read(&brain.cfg.workspace, &choice.input),
         "write" => {
             ensure(
                 choice.input.len() <= 32768 && !choice.path.is_empty(),
@@ -281,19 +271,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                 json!({"path":choice.path,"before":before,"sha256":crate::digest(choice.input.as_bytes()),"bytes":choice.input.len()}),
             )
         }
-        "list" => {
-            let path = if choice.input.is_empty() {
-                brain.cfg.workspace.clone()
-            } else {
-                brain.cfg.workspace.join(&choice.input)
-            };
-            let mut names = Vec::new();
-            for entry in fs::read_dir(path)?.take(128) {
-                let entry = entry?;
-                names.push(json!({"name":entry.file_name().to_string_lossy(),"directory":entry.file_type()?.is_dir()}));
-            }
-            Ok(json!(names))
-        }
+        "list" => crate::workspace::list(&brain.cfg.workspace, &choice.input),
         "search" => Ok(
             json!({"memory":brain.journal.recall(&choice.input)?,"history":brain.journal.history(&choice.input)?}),
         ),
@@ -346,6 +324,57 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn nested_listing_supplies_a_readable_path_and_errors_identify_the_target() {
+        let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");
+        let src = brain.cfg.workspace.join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(
+            src.join("main.rs"),
+            "fn main() { println!(\"fixture\"); }\n",
+        )
+        .unwrap();
+        let mut choice = Choice {
+            tool: "list".into(),
+            input: "src".into(),
+            path: String::new(),
+            summary: "fixture".into(),
+            notes: String::new(),
+            experiment: false,
+        };
+        let listing = execute(&mut brain, &choice).await.unwrap();
+        assert_eq!(
+            listing["directory"],
+            fs::canonicalize(&src).unwrap().display().to_string()
+        );
+        let path = listing["entries"][0]["path"]
+            .as_str()
+            .expect("Listed child must have a directly usable path");
+        choice.tool = "read".into();
+        choice.input = path.into();
+        let content = execute(&mut brain, &choice).await.unwrap();
+        assert!(content["content"].as_str().unwrap().contains("fixture"));
+        choice.tool = "write".into();
+        choice.path = listing["entries"][0]["relative_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        choice.input = "fn main() { /* changed */ }\n".into();
+        execute(&mut brain, &choice).await.unwrap();
+        assert!(
+            fs::read_to_string(src.join("main.rs"))
+                .unwrap()
+                .contains("changed")
+        );
+        choice.tool = "read".into();
+        choice.path.clear();
+        choice.input = "main.rs".into();
+        let error = execute(&mut brain, &choice).await.unwrap_err().to_string();
+        assert!(
+            error.contains(&brain.cfg.workspace.join("main.rs").display().to_string()),
+            "Missing-file feedback must reveal which base was used: {error}"
+        );
+    }
     #[test]
     fn read_only_queries_retain_typed_bounds_without_actor_or_endpoint_overrides() {
         let good = json!({"capability":"minecraft:block_search","input":{"tag":"minecraft:logs","radius":32,"limit":8,"offset":0}});
