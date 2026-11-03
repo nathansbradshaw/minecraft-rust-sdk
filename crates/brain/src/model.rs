@@ -1,6 +1,7 @@
 use crate::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v1";
 use std::{path::Path, time::Duration};
 
 #[derive(Debug)]
