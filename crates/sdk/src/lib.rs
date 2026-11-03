@@ -1,6 +1,8 @@
 pub use minecraft_sdk_core::*;
 pub mod menu;
 pub mod navigation;
+#[cfg(test)]
+mod perform_tests;
 use reqwest::{Client as Http, Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
@@ -236,6 +238,78 @@ impl Client {
         }
         self.request(Method::GET, &self.bot_path(&format!("actions/{id}"))?, None)
             .await
+    }
+    /// Dispatch exactly once, then inspect a running action. A caller's wait
+    /// deadline returns its latest receipt; it never cancels or replays gameplay.
+    pub async fn perform(&self, request: &ActionRequest, wait: Duration) -> Result<Receipt> {
+        let until = tokio::time::Instant::now()
+            .checked_add(wait)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    "Wait duration exceeds monotonic clock bounds",
+                )
+            })?;
+        let receipt = self.act(request).await?;
+        let receipt = self
+            .wait_receipt(&request.action_id, receipt, until)
+            .await?;
+        if receipt.outcome.terminal()
+            && let Action::CancelUseItem { action_id } | Action::CancelControl { action_id } =
+                &request.action
+        {
+            // The cancellation and the original intention have separate durable
+            // journal rows. Flush the original before its adapter slot is reused.
+            let original = self.action_status(action_id).await?;
+            if original.action_id != *action_id {
+                return Err(ApiError::new(
+                    ErrorCode::Conflict,
+                    "Cancelled action receipt identity changed",
+                ));
+            }
+        }
+        Ok(receipt)
+    }
+    /// Observe an already dispatched ID without resubmitting it.
+    pub async fn wait_for_action(&self, id: &str, wait: Duration) -> Result<Receipt> {
+        let until = tokio::time::Instant::now()
+            .checked_add(wait)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    "Wait duration exceeds monotonic clock bounds",
+                )
+            })?;
+        let receipt = self.action_status(id).await?;
+        self.wait_receipt(id, receipt, until).await
+    }
+    async fn wait_receipt(
+        &self,
+        id: &str,
+        mut receipt: Receipt,
+        until: tokio::time::Instant,
+    ) -> Result<Receipt> {
+        if receipt.action_id != id {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "Action receipt identity changed",
+            ));
+        }
+        while receipt.outcome == Outcome::Running && tokio::time::Instant::now() < until {
+            tokio::time::sleep(
+                Duration::from_millis(100)
+                    .min(until.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+            receipt = self.action_status(id).await?;
+            if receipt.action_id != id {
+                return Err(ApiError::new(
+                    ErrorCode::Conflict,
+                    "Action status identity changed",
+                ));
+            }
+        }
+        Ok(receipt)
     }
     pub async fn pending_actions(&self) -> Result<Vec<PendingAction>> {
         self.request(Method::GET, &self.bot_path("actions/pending")?, None)

@@ -154,11 +154,26 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             )?)?;
             client.read_observation(&query).await?
         }
-        "act" => {
+        "act" | "perform" => {
             let request: ActionRequest = serde_json::from_slice(&std::fs::read(
                 args.get(2).ok_or("Action JSON file required")?,
             )?)?;
-            serde_json::to_value(client.act(&request).await?)?
+            let receipt = if args[0] == "perform" {
+                client
+                    .perform(
+                        &request,
+                        std::time::Duration::from_millis(
+                            args.get(3)
+                                .map(|s| s.parse())
+                                .transpose()?
+                                .unwrap_or(10_000),
+                        ),
+                    )
+                    .await?
+            } else {
+                client.act(&request).await?
+            };
+            serde_json::to_value(receipt)?
         }
         "status" => serde_json::to_value(
             client

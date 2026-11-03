@@ -16,6 +16,7 @@ fn independent_control(action: &Action) -> bool {
             | Action::Look { .. }
             | Action::StartMove { .. }
             | Action::CancelControl { .. }
+            | Action::CancelUseItem { .. }
             | Action::Move { .. }
             | Action::MotionFrame { .. }
             | Action::Jump

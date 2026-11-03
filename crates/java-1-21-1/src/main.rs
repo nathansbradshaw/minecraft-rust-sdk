@@ -1,6 +1,7 @@
 use minecraft_sdk_core::*;
 mod chat;
 mod control;
+mod effects;
 mod motion;
 mod routes;
 use minecraft_sdk_java_1_21_1::{Wire, encode_signed_varint as vi};
@@ -164,6 +165,7 @@ struct Player {
     corrections: Arc<AtomicU64>,
     correcting: Arc<AtomicBool>,
     control: Option<control::Job>,
+    interaction: Option<effects::Job>,
     motion: Option<([f64; 3], f64)>,
     wire: Arc<Mutex<Wire<TcpStream>>>,
     alive: Arc<AtomicBool>,
@@ -174,6 +176,9 @@ struct Player {
 impl Drop for Player {
     fn drop(&mut self) {
         if let Some(job) = &self.control {
+            job.stop();
+        }
+        if let Some(job) = &self.interaction {
             job.stop();
         }
         self.alive.store(false, Ordering::Release);
@@ -459,6 +464,7 @@ fn connect(
             corrections,
             correcting,
             control: None,
+            interaction: None,
             motion: None,
             wire,
             alive,
@@ -656,7 +662,9 @@ impl Player {
             .checked_add(1)
             .ok_or("Sequence exhausted; reconnect")?;
         let name = match action {
-            Action::StartMove { .. } | Action::CancelControl { .. } => {
+            Action::StartMove { .. }
+            | Action::CancelControl { .. }
+            | Action::CancelUseItem { .. } => {
                 return Err("Finite controls use their own scheduler".into());
             }
             Action::MotionFrame { target } => {
@@ -767,7 +775,7 @@ impl Player {
                 body.extend(vi(self.sequence));
                 "block_place"
             }
-            Action::UseItem { hand: h } => {
+            Action::UseItem { hand: h } | Action::StartUseItem { hand: h, .. } => {
                 body.extend(vi(hand(h)));
                 body.extend(vi(self.sequence));
                 for key in ["yaw", "pitch"] {
@@ -1049,9 +1057,13 @@ fn main() -> AnyResult<()> {
         || discovery["online_mode"] != true
         || !discovery["native_observation_features"]
             .as_array()
-            .is_some_and(|v| v.iter().any(|c| c == "minecraft:physics_facts"))
+            .is_some_and(|v| {
+                ["minecraft:physics_facts", "minecraft:native_action_effects"]
+                    .iter()
+                    .all(|required| v.iter().any(|c| c == required))
+            })
     {
-        return Err("Unsupported native integration".into());
+        return Err("Unsupported native integration: alpha.10 physics and native action effects are required".into());
     }
     let mut players: HashMap<String, Player> = HashMap::new();
     let mut identities: HashMap<String, (String, String, String)> = HashMap::new();
@@ -1165,6 +1177,7 @@ fn dispatch(
                     "minecraft:placement",
                     "minecraft:block_use",
                     "minecraft:item_use",
+                    "minecraft:finite_item_use",
                     "minecraft:entities",
                     "minecraft:inventory",
                     "minecraft:crafting",
@@ -1239,8 +1252,14 @@ fn dispatch(
                         ApiError::new(ErrorCode::NotReady, "Native observation unavailable")
                     })?;
                 if let Some(player) = players.get(&request.bot_id) {
+                    if let Some(job) = &player.interaction {
+                        job.freshen(&mut observation);
+                    }
                     if let Some(job) = &player.control {
                         observation.player["control"] = job.observation();
+                    }
+                    if let Some(job) = &player.interaction {
+                        observation.player["interaction"] = job.observation();
                     }
                     if observation.world.get("chat").is_none() {
                         observation.world["chat"] = json!(
@@ -1350,6 +1369,41 @@ fn dispatch(
                         .cancel(&action.action_id, action_id)
                         .map(AdapterResponse::Receipt);
                 }
+                if let Action::CancelUseItem { action_id } = &action.action {
+                    return player
+                        .interaction
+                        .as_mut()
+                        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "No item use to cancel"))?
+                        .cancel(&action.action_id, action_id)
+                        .map(AdapterResponse::Receipt);
+                }
+                if player
+                    .interaction
+                    .as_ref()
+                    .is_some_and(|job| job.needs_status())
+                    && !matches!(
+                        action.action,
+                        Action::Chat { .. }
+                            | Action::Look { .. }
+                            | Action::StartMove { .. }
+                            | Action::Sprint { .. }
+                            | Action::Sneak { .. }
+                            | Action::Respawn
+                    )
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::Conflict,
+                        "Inspect the active interaction, or cancel held item use before another interaction",
+                    ));
+                }
+                if let Action::StartUseItem { max_ticks, .. } = &action.action
+                    && *max_ticks > config.control_max_ticks
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidRequest,
+                        "Item use exceeds the deployment finite-control limit",
+                    ));
+                }
                 if player.control.as_ref().is_some_and(|c| c.running())
                     && matches!(
                         action.action,
@@ -1374,6 +1428,7 @@ fn dispatch(
                     )
                 })?;
                 let observation_ms = observation_started.elapsed().as_millis();
+                effects::validate_item_use(&action.action, &before)?;
                 if before.player["health"].as_f64().is_some_and(|h| h <= 0.)
                     && !matches!(
                         action.action,
@@ -1488,6 +1543,20 @@ fn dispatch(
                 }
                 // A send failure may be partial. Never return a definite rejection after entering dispatch.
                 let sent = player.action(&action.action, &before);
+                if effects::managed(&action.action) {
+                    let job = effects::Job::start(
+                        player,
+                        native.clone(),
+                        before,
+                        action,
+                        sent.is_ok(),
+                        config.control_max_ticks,
+                        correction_epoch,
+                    );
+                    let receipt = job.status(&action.action_id)?;
+                    player.interaction = Some(job);
+                    return Ok(AdapterResponse::Receipt(receipt));
+                }
                 thread::sleep(Duration::from_millis(150));
                 let after = native.observe(&request.player_uuid).ok();
                 let verified = sent.is_ok()
@@ -1513,18 +1582,39 @@ fn dispatch(
                     },
                 }))
             }
-            AdapterOperation::ActionStatus { action_id } => players
-                .get(&request.bot_id)
-                .and_then(|p| p.control.as_ref())
-                .ok_or_else(|| {
+            AdapterOperation::ActionStatus { action_id } => {
+                let player = players.get(&request.bot_id).ok_or_else(|| {
                     ApiError::new(
                         ErrorCode::UncertainOutcome,
-                        "Control process history unavailable; reconcile without replay",
+                        "Character history unavailable; reconcile without replay",
                     )
-                })?
-                .status(action_id)
-                .map(AdapterResponse::Receipt),
+                })?;
+                if let Some(job) = &player.interaction
+                    && let Ok(receipt) = job.status(action_id)
+                {
+                    return Ok(AdapterResponse::Receipt(receipt));
+                }
+                player
+                    .control
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ErrorCode::UncertainOutcome,
+                            "Control history unavailable; reconcile without replay",
+                        )
+                    })?
+                    .status(action_id)
+                    .map(AdapterResponse::Receipt)
+            }
             AdapterOperation::Reconcile { action_id } => {
+                if let Some(job) = players
+                    .get(&request.bot_id)
+                    .and_then(|p| p.interaction.as_ref())
+                    && let Ok(receipt) = job.status(action_id)
+                    && (receipt.outcome.terminal() || receipt.outcome == Outcome::Running)
+                {
+                    return Ok(AdapterResponse::Receipt(receipt));
+                }
                 if let Some(job) = players
                     .get(&request.bot_id)
                     .and_then(|p| p.control.as_ref())
@@ -1547,6 +1637,24 @@ fn dispatch(
                         ErrorCode::UncertainOutcome,
                         "Player state has not settled",
                     ));
+                }
+                if first.player["uuid"] != request.player_uuid
+                    || second.player["uuid"] != request.player_uuid
+                    || !first.player["dimension"].is_string()
+                    || first.player["dimension"] != second.player["dimension"]
+                    || first.player["using_item"] != second.player["using_item"]
+                    || second.player["using_item"] == true
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::UncertainOutcome,
+                        "Character binding or held input has not settled",
+                    ));
+                }
+                if let Some(job) = players
+                    .get(&request.bot_id)
+                    .and_then(|p| p.interaction.as_ref())
+                {
+                    job.acknowledge_reconciliation(action_id);
                 }
                 Ok(AdapterResponse::Receipt(Receipt {
                     action_id: action_id.clone(),
@@ -1722,7 +1830,10 @@ fn compact(action: &Action, o: &Observation) -> Value {
         .filter(|b| positions.iter().any(|p| b["position"] == json!(p)))
         .cloned()
         .collect();
-    json!({"revision":o.revision,"player":o.player,"menu":o.menu,"world":{"game_time":o.world["game_time"],"day_time":o.world["day_time"],"sample_clock":o.world["sample_clock"],"blocks":blocks}})
+    let entities:Vec<_>=o.world["entities"].as_array().into_iter().flatten()
+        .filter(|row|matches!(action,Action::Attack{entity}|Action::Interact{entity,..} if row["entity_id"]==*entity))
+        .cloned().collect();
+    json!({"revision":o.revision,"player":o.player,"menu":o.menu,"world":{"game_time":o.world["game_time"],"day_time":o.world["day_time"],"sample_clock":o.world["sample_clock"],"blocks":blocks,"entities":entities}})
 }
 
 #[cfg(test)]

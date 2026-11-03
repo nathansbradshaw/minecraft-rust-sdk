@@ -80,8 +80,8 @@ key/controller binding as normal observations. Rust `Client::read_observation`,
 Input is at most 8 KiB and an object; responses are at most 8 MiB. Default observations
 retain their 1 MiB client bound. Missing providers return `unsupported_capability`.
 
-The alpha.9 Java adapter uses one continuous physical writer for each admitted
-player connection. It requires the alpha.9 NeoForge physics facts. Idle gravity,
+The alpha.10 Java adapter uses one continuous physical writer for each admitted
+player connection. It requires matching NeoForge physics and action-effect facts. Idle gravity,
 collisions and momentum continue outside coding-agent containers and independently
 of model requests or gameplay actions. Native observations supply dimensions,
 effective jump strength, gravity, surface friction and effects. Server relocation
@@ -108,6 +108,41 @@ widen the tolerance. Receipts retain the target and tolerance for inspection.
 Navigation retains a terminal, verified pose outside that target as
 `target_not_reached`, preserving the native outcome and retiring the intention
 without replay. Missing native proof or mismatched actor bindings stay fenced.
+
+Interactions use a separate finite observer lane. Mining, placement, menu changes,
+item use and combat can return `running` while their native effects develop. An
+initial lack of change is progress information, not an uncertain mutation. Inspect
+the current interaction before replacing it; its final receipt must reach the
+gateway journal before a later interaction takes its slot. Movement, looking,
+conversation and observation remain available. The container brain flushes terminal
+interaction receipts and can cancel held item use before urgent movement.
+
+`start_use_item` accepts `hand` and positive `max_ticks`, bounded by the deployment's
+finite-control limit. Native game ticks measure active held use; a wall deadline
+of twice that tick budget plus two seconds bounds stalled execution. Legacy
+`use_item` uses the deployment budget. `cancel_use_item` references the original
+action ID and releases ordinary held input. A cancelled or expired use can have
+verified release without a verified consumption effect. Food/health gains remain
+separate observations. A bow or mod item without an implemented completion verifier
+can expire without a success claim even when the input was released correctly.
+
+The server records bounded, connection-scoped post-effect sequences for finished
+item use and direct player-attack damage. Attack verification binds the new event
+to this actor, native dimension and the originally observed entity UUID; another
+attacker lowering the target's health is insufficient. Menu verification covers a
+new own-player menu after exclusive interaction, not arbitrary mod side effects.
+Ordinary permission/claim handling still runs in Minecraft's packet handlers;
+observation hooks grant no additional authority. A finite effect budget expiring
+does not assert that a later effect is impossible. Actual connection, dimension,
+clock or observation interruption remains uncertain and requires reconciliation.
+Reconciliation retains its explicit lack of historical proof and never resends
+the original input.
+
+Rust clients can call `perform(&request, wait_duration)` to dispatch exactly once
+and wait using status reads only. `wait_for_action(id, wait_duration)` resumes a
+wait. The caller's deadline returns the latest receipt, possibly still running;
+it does not cancel the action. The CLI equivalent is
+`mc-sdk perform PROFILE ACTION.json [WAIT_MS]` (default wait 10,000 ms).
 The release is checked against fresh native poses without requiring a guaranteed
 safe landing. A legal action may cause ordinary fall damage or death.
 
