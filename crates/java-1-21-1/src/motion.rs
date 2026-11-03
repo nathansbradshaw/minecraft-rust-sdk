@@ -212,6 +212,7 @@ struct Drive {
     target: [f64; 3],
     jump: bool,
     started: Instant,
+    input_started: Option<Instant>,
     expiry: Duration,
     state: Arc<Mutex<Receipt>>,
     cancel: Arc<AtomicBool>,
@@ -430,7 +431,7 @@ impl Actor {
                             if d.cancel.load(Ordering::Acquire) {
                                 release(&mut d, Outcome::Cancelled);
                             }
-                            if d.started.elapsed() >= d.expiry {
+                            if d.input_started.is_some_and(|at| at.elapsed() >= d.expiry) {
                                 release(&mut d, Outcome::Expired);
                             }
                             if d.released.is_none()
@@ -585,6 +586,9 @@ impl Actor {
                     e.frames += 1;
                     e.reason = "continuous native-observed physics".into();
                     if let Some(d) = &mut e.drive {
+                        if d.released.is_none() && d.input_started.is_none() {
+                            d.input_started = Some(Instant::now());
+                        }
                         d.frames.push((next.position, next.on_ground));
                         if d.released.is_some() && d.release_frame_at.is_none() {
                             d.release_frame_at = Some(Instant::now());
@@ -693,6 +697,7 @@ impl Actor {
             target,
             jump: *jump,
             started: Instant::now(),
+            input_started: None,
             expiry: Duration::from_millis(u64::from(*max_ticks) * 50),
             state,
             cancel,

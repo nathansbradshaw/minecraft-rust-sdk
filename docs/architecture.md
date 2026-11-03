@@ -92,6 +92,8 @@ with this controller. Use `start_move`, including its jump option.
 
 Rust alpha.5 additionally advertises `minecraft:finite_locomotion`. `start_move`
 accepts a waypoint, `jump` and positive `max_ticks` (fifty milliseconds per tick).
+The input lease begins with its first submitted physical frame, so a one-tick
+request cannot expire in the writer's scheduling queue before applying input.
 Discovery advertises the deployment's `finite_control_max_ticks`; the Rust
 adapter configuration defaults to 100 and permits an operator budget of 1–600.
 It returns `running` immediately and leases finite input to the connection's
