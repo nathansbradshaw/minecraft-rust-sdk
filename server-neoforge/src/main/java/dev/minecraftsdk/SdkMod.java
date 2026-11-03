@@ -6,6 +6,7 @@ import net.neoforged.neoforge.event.server.*;
 public final class SdkMod {
     public SdkMod(){
         NativeChat.install();
+        NativeEffects.install();
         NeoForge.EVENT_BUS.addListener((ServerStartedEvent event)->{
             try{var service=new SdkService(event.getServer());NativeBlockSearch.install(service);SdkService.active=service;}
             catch(Exception failure){throw new IllegalStateException("SDK integration failed closed",failure);}

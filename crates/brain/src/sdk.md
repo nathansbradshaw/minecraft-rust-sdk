@@ -24,8 +24,19 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   coding deployments; old examples using them require adaptation.
 - client.act(&ActionRequest{action_id:String,action}).await? returns Receipt.
   Outcome::Running means poll client.action_status(&id).await? until terminal.
+  client.perform(&request, Duration::from_secs(10)).await? dispatches once and
+  waits using status reads only. wait_for_action(&id, duration) resumes that wait.
+  A wait deadline returns the latest receipt, possibly still Running; it never
+  replays or cancels the action. Use this for staged mining, crafting, placement,
+  inventory transfer and entity interactions as well as finite controls.
   Observed verifies the requested effect. Cancelled, Expired, Failed and Rejected
   are feedback, not success. Reobserve/replan after defensive cancellation.
+- StartUseItem { hand:Hand, max_ticks:u16 } holds use for a finite native-tick
+  budget; CancelUseItem { action_id:String } releases that action's held input.
+  Legacy UseItem is also bounded by the deployment control budget. Using an item
+  and remaining_use_ticks are progress, not proof of consumption. Item completion
+  and attributed attack damage use own-character native post-effect evidence.
+  Cancelled/Expired held use can have verified release without a completed effect.
 - The inherited MC_SDK_ARBITER defers ordinary gameplay during danger while code
   and chat remain available. A deferred action's old target may be stale; inspect
   its receipt and fresh observation. Do not bypass the local body scheduler.

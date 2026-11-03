@@ -340,6 +340,8 @@ async fn controller(
     let mut conditions = String::new();
     let mut previous_health = Value::Null;
     let mut body_sprint = false;
+    let mut inspected_interaction = String::new();
+    let mut cancelled_item_use = String::new();
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -418,7 +420,39 @@ async fn controller(
             if !shared.emergency.swap(true, Ordering::AcqRel) {
                 j.event("body_emergency",json!({"revision":observed.revision,"health":observed.player["health"],"position":p,"nearest_hostile_distance":nearby.map(|(_,d)|d)}))?;
             }
+        }
+        // Flush terminal interaction evidence to the gateway before a later
+        // body interaction replaces the adapter's current job. Reads never
+        // replay input and remain independent of slow model/tool execution.
+        let interaction = &observed.player["interaction"];
+        if let Some(id) = interaction["action_id"].as_str()
+            && interaction["outcome"] != "running"
+            && id != inspected_interaction
+            && let Ok(Ok(receipt)) =
+                tokio::time::timeout(Duration::from_millis(400), client.action_status(id)).await
+            && (receipt.outcome.terminal() || receipt.outcome == Outcome::Uncertain)
+        {
+            inspected_interaction = id.into();
+            j.event("body_interaction_status",json!({"action_id":id,"outcome":receipt.outcome,"native_effect_verified":receipt.evidence["native_effect_verified"],"input_released":receipt.evidence["input_released"],"evidence_sha256":crate::digest(receipt.evidence.to_string().as_bytes()),"replayed":false}))?;
+        }
+        if danger {
             let _guard = shared.mutation.lock().await;
+            if interaction["held_item_use"] == true
+                && interaction["outcome"] == "running"
+                && let Some(id) = interaction["action_id"].as_str()
+                && id != cancelled_item_use
+            {
+                let receipt = send(
+                    &client,
+                    j,
+                    Action::CancelUseItem {
+                        action_id: id.into(),
+                    },
+                )
+                .await?;
+                cancelled_item_use = id.into();
+                j.event("body_preempted_item_use",json!({"action_id":id,"cancel_action_id":receipt.action_id,"outcome":receipt.outcome,"reason":"release held input before urgent survival work","replayed":false}))?;
+            }
             let toward_threat = nearby.is_some_and(|(enemy, d)| {
                 d < 5.
                     && geometry::point(&active["target"])

@@ -3,7 +3,7 @@ plugins {
     id 'net.neoforged.moddev' version '2.0.148'
 }
 group = 'dev.minecraftsdk'
-version = '0.1.0-alpha.9'
+version = '0.1.0-alpha.10'
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 repositories { mavenCentral() }
 neoForge {

@@ -677,7 +677,7 @@ impl Brain {
             action,
             minecraft_sdk::Action::Chat { .. } | minecraft_sdk::Action::Look { .. }
         );
-        let cancelling = matches!(&action,minecraft_sdk::Action::CancelControl{action_id} if action_id==&previous);
+        let cancelling = matches!(&action,minecraft_sdk::Action::CancelControl{action_id}|minecraft_sdk::Action::CancelUseItem{action_id} if action_id==&previous);
         if !previous.is_empty() && !independent && !cancelling {
             self.inspect(&previous).await?;
             previous = self.journal.get("pending_action")?.unwrap_or_default();
@@ -692,7 +692,11 @@ impl Brain {
         )?;
         let id = format!("brain-{}-{sequence}", self.run_id);
         self.journal.note_intention(&id, independent)?;
-        let receipt = self
+        let movement = matches!(
+            action,
+            minecraft_sdk::Action::StartMove { .. } | minecraft_sdk::Action::CancelControl { .. }
+        );
+        let mut receipt = self
             .client
             .act(&ActionRequest {
                 action_id: id,
@@ -700,6 +704,12 @@ impl Brain {
             })
             .await?;
         drop(_guard);
+        if !movement && receipt.outcome == Outcome::Running {
+            receipt = self
+                .client
+                .wait_for_action(&receipt.action_id, Duration::from_secs(10))
+                .await?;
+        }
         self.journal.resolve_pending(&receipt)?;
         self.journal
             .event("action_receipt", serde_json::to_value(&receipt)?)?;

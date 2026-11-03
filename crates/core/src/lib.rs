@@ -215,6 +215,14 @@ pub enum Action {
     UseItem {
         hand: Hand,
     },
+    /// Hold item use for a finite lease; completion and release are observed separately.
+    StartUseItem {
+        hand: Hand,
+        max_ticks: u16,
+    },
+    CancelUseItem {
+        action_id: String,
+    },
     UseBlock {
         block: BlockPos,
         face: u8,
@@ -275,6 +283,7 @@ impl Action {
             Self::Place { .. } => "minecraft:placement",
             Self::UseBlock { .. } => "minecraft:block_use",
             Self::UseItem { .. } => "minecraft:item_use",
+            Self::StartUseItem { .. } | Self::CancelUseItem { .. } => "minecraft:finite_item_use",
             Self::Interact { .. } | Self::Attack { .. } => "minecraft:entities",
             Self::SelectSlot { .. } | Self::ClickSlot { .. } | Self::CloseMenu { .. } => {
                 "minecraft:inventory"
@@ -297,6 +306,8 @@ impl Action {
                         .all(|x| x.is_finite() && x.abs() <= 30_000_000.)
             }
             Self::CancelControl { action_id } => valid_id(action_id),
+            Self::CancelUseItem { action_id } => valid_id(action_id),
+            Self::StartUseItem { max_ticks, .. } => *max_ticks > 0,
             Self::Move { target, .. } | Self::MotionFrame { target } => {
                 [target.x, target.y, target.z]
                     .iter()
