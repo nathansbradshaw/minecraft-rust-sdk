@@ -162,12 +162,22 @@ impl Model {
         })
     }
     pub async fn choose(&self, context: &Value, develop: bool) -> Result<(Choice, Value)> {
-        let model = if develop { "gpt-6.1-sol" } else { "gpt-6-luna" };
+        self.choose_for(context, develop, develop).await
+    }
+    /// Work purpose survives allocation fallback; it does not select a provider
+    /// or change the character's allowances. Conversation remains independent.
+    pub async fn choose_for(
+        &self,
+        context: &Value,
+        use_sol: bool,
+        development: bool,
+    ) -> Result<(Choice, Value)> {
+        let model = if use_sol { "gpt-6.1-sol" } else { "gpt-6-luna" };
         let (content, usage) = self
             .request(
                 context,
                 model,
-                if develop { "develop" } else { "plan" },
+                if development { "develop" } else { "plan" },
                 schema(),
                 include_str!("system.md"),
                 4096,
@@ -241,7 +251,7 @@ impl Model {
             .ok_or("Model content missing")?;
         Ok((
             content.to_owned(),
-            json!({"model":model,"elapsed_ms":started.elapsed().as_millis(),"response_bytes":bytes.len(),"prompt_sha256":crate::digest(prompt.as_bytes()),"host_tools_executed":false}),
+            json!({"model":model,"purpose":purpose,"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":bytes.len(),"prompt_sha256":crate::digest(prompt.as_bytes()),"host_tools_executed":false}),
         ))
     }
 }
@@ -281,6 +291,59 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn development_fallback_keeps_luna_allocation_and_development_purpose() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move {
+            for (purpose, effort) in [("plan", "low"), ("develop", "medium")] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(socket.read_u8().await.unwrap());
+                    assert!(header.len() < 8192);
+                }
+                let header = String::from_utf8(header).unwrap();
+                let size = header
+                    .lines()
+                    .find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                assert!(size <= 65536);
+                let mut body = vec![0; size];
+                socket.read_exact(&mut body).await.unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["model"], "gpt-6-luna");
+                assert_eq!(body["purpose"], purpose);
+                let answer=json!({"tool":"observe","input":"","path":"","summary":"Inspect","notes":"","experiment":false}).to_string();
+                let reply=json!({"done":true,"reasoning_effort":effort,"usage":{"input_tokens":12,"cached_input_tokens":3,"output_tokens":5,"private":"must not be copied"},"message":{"content":answer}}).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let model = Model {
+            http: reqwest::Client::new(),
+            endpoint,
+        };
+        for (development, purpose, effort) in [(false, "plan", "low"), (true, "develop", "medium")]
+        {
+            let (_, usage) = model
+                .choose_for(&json!({"goal":"same context"}), false, development)
+                .await
+                .unwrap();
+            assert_eq!(usage["model"], "gpt-6-luna");
+            assert_eq!(usage["purpose"], purpose);
+            assert_eq!(usage["provider_reasoning_effort"], effort);
+            assert_eq!(
+                usage["provider_usage"],
+                json!({"input_tokens":12,"cached_input_tokens":3,"output_tokens":5})
+            );
+        }
+        upstream.await.unwrap();
+    }
     #[test]
     fn proxy_error_pages_preserve_status_without_leaking_the_response_or_retrying() {
         let error = response_envelope(502, b"<html>private upstream detail</html>").unwrap_err();

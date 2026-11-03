@@ -78,10 +78,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if !(4..=5).contains(&args.len())
-        || !["routine", "develop"].contains(&args[2].as_str())
+        || !["routine", "develop", "investigate"].contains(&args[2].as_str())
         || args[3].len() > 128
     {
-        return Err("model-probe HTTPS_ENDPOINT ALLOCATED_KEY routine|develop LABEL [PRIVATE_CONTEXT.json] | model-probe HTTPS_ENDPOINT ALLOCATED_KEY conversation LABEL PRIVATE_CONTEXT.json".into());
+        return Err("model-probe HTTPS_ENDPOINT ALLOCATED_KEY routine|develop|investigate LABEL [PRIVATE_CONTEXT.json] | model-probe HTTPS_ENDPOINT ALLOCATED_KEY conversation LABEL PRIVATE_CONTEXT.json".into());
     }
     let model = Model::new(&args[0], std::path::Path::new(&args[1]))?;
     let start = minecraft_sdk_brain::now();
@@ -93,7 +93,9 @@ async fn main() -> Result<()> {
     } else {
         json!({"goal":"Inference integration probe only: choose observe with empty input and path. No returned tool will execute; no game state or gameplay task exists.","probe_label":args[3]})
     };
-    let result = model.choose(&context, args[2] == "develop").await;
+    let result = model
+        .choose_for(&context, args[2] == "develop", args[2] != "routine")
+        .await;
     match result {
         Ok((choice, usage)) => println!(
             "{}",
