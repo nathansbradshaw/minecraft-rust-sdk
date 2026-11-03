@@ -47,6 +47,10 @@ It validates every DNS result, rejects private/LAN/link-local/metadata and
 IPv6 transition addresses, and connects the checked numeric address. An
 optional exact SDK socket exception is for a deployment's private gateway.
 The proxy image/configuration remain outside the editable coding workspace.
+Active tunnels have no absolute ten-minute lifetime. A shared ten-minute idle
+deadline advances when bytes move in either direction, including one-way streams.
+CONNECT headers retain a five-second total deadline and an 8 KiB limit; DNS,
+connection establishment, concurrency and destination checks remain bounded.
 
 Do not mount personal credentials. Provision a separate bot-scoped SDK key
 and explicitly allocated model access. Source compilation/execution happens
