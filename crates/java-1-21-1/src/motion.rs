@@ -748,6 +748,268 @@ fn finish_interrupted(d: Drive, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    fn wait_until(test: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !test() {
+            assert!(
+                Instant::now() < deadline,
+                "physical worker did not reach the expected state"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Exercise the actual sampler, writer and input lease against framed TCP
+    /// and a native-shaped HTTP observer; pure physics tests cannot prove this.
+    #[test]
+    fn actor_has_one_input_owner_releases_in_air_and_invalidates_on_correction() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut blocks = Vec::new();
+        for x in -4..=5 {
+            for y in -2..=4 {
+                for z in -4..=4 {
+                    blocks.push(json!({"position":[x,y,z],"friction":0.6,"speed_factor":1.,"collision":if y == 0 {json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+                }
+            }
+        }
+        let observed = Arc::new(Mutex::new(Observation {
+            revision: "0".into(),
+            menu: Value::Null,
+            player: json!({"uuid":"fixture","entity_id":7,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"velocity":[0.,0.,0.],"health":20.,"movement_speed":0.1,"on_ground":true,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
+            world: json!({"blocks":blocks,"sample_clock":{"epoch":"fixture","nanos":"1"}}),
+        }));
+        let http = TcpListener::bind("127.0.0.1:0").unwrap();
+        http.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", http.local_addr().unwrap());
+        let http_alive = alive.clone();
+        let http_observed = observed.clone();
+        let sampler = thread::spawn(move || {
+            let mut serial = 1u64;
+            while http_alive.load(Ordering::Acquire) {
+                let Ok((mut stream, _)) = http.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                loop {
+                    let mut byte = [0u8];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(headers.len() < 8192);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                assert!(headers.starts_with("POST /v1/observe "));
+                let size = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                assert!(size < 1024);
+                let mut body = vec![0u8; size];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap()["player_uuid"],
+                    "fixture"
+                );
+                let body = {
+                    let mut o = http_observed.lock().unwrap();
+                    serial += 1;
+                    o.revision = serial.to_string();
+                    o.world["sample_clock"]["nanos"] = json!((serial * 150_000_000).to_string());
+                    serde_json::to_vec(&*o).unwrap()
+                };
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sender = TcpStream::connect(socket.local_addr().unwrap()).unwrap();
+        let (receiver, _) = socket.accept().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        let packets = Arc::new(AtomicU64::new(0));
+        let received = packets.clone();
+        let wire_observed = observed.clone();
+        let reader = thread::spawn(move || {
+            let mut wire = Wire::new(receiver);
+            while let Ok(packet) = wire.receive() {
+                assert_eq!(
+                    packet.id,
+                    Tables::new().id("play", "toServer", "position").unwrap()
+                );
+                assert_eq!(packet.payload.len(), 25);
+                let mut p = [0.; 3];
+                for (i, v) in p.iter_mut().enumerate() {
+                    *v = f64::from_be_bytes(packet.payload[i * 8..i * 8 + 8].try_into().unwrap());
+                }
+                let mut o = wire_observed.lock().unwrap();
+                o.player["position"] = json!(p);
+                o.player["on_ground"] = json!(packet.payload[24] != 0);
+                received.fetch_add(1, Ordering::Release);
+            }
+        });
+        let corrections = Arc::new(AtomicU64::new(0));
+        let correcting = Arc::new(AtomicBool::new(false));
+        let native = Native {
+            endpoint,
+            token: "fixture-token".into(),
+            http: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+        };
+        let writer = Arc::new(Mutex::new(Wire::new(sender)));
+        let actor = Actor::start(
+            native,
+            "fixture".into(),
+            observed.lock().unwrap().clone(),
+            Wires {
+                writer: writer.clone(),
+                tables: Tables::new(),
+                alive: alive.clone(),
+                corrections: corrections.clone(),
+                correcting: correcting.clone(),
+                ground: Arc::new(AtomicBool::new(true)),
+                impulses: Arc::new(Mutex::new(VecDeque::new())),
+                entity: Arc::new(AtomicI32::new(7)),
+            },
+        )
+        .unwrap();
+        wait_until(|| packets.load(Ordering::Acquire) >= 3);
+        let request = ActionRequest {
+            action_id: "fixture-expire".into(),
+            action: Action::StartMove {
+                target: Position {
+                    x: 3.,
+                    y: 1.,
+                    z: 0.5,
+                },
+                jump: true,
+                max_ticks: 1,
+            },
+        };
+        let state = Arc::new(Mutex::new(Receipt {
+            action_id: request.action_id.clone(),
+            outcome: Outcome::Running,
+            adapter_version: VERSION.into(),
+            evidence: json!({}),
+            error: None,
+        }));
+        let before = actor.observe().unwrap();
+        actor
+            .start_control(
+                before.clone(),
+                &request,
+                0,
+                state.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        assert_eq!(
+            actor
+                .start_control(
+                    before,
+                    &request,
+                    0,
+                    state.clone(),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        wait_until(|| state.lock().unwrap().outcome.terminal());
+        assert_eq!(state.lock().unwrap().outcome, Outcome::Expired);
+        assert!(
+            state.lock().unwrap().evidence["after"]["player"]["position"][1]
+                .as_f64()
+                .unwrap()
+                > 1.1,
+            "release was verified while airborne"
+        );
+        wait_until(|| {
+            let e = actor.engine.lock().unwrap();
+            e.body.on_ground && e.body.position[1] == 1.
+        });
+        assert!(
+            packets.load(Ordering::Acquire) >= 10,
+            "the same physical writer continues after input release"
+        );
+        let request = ActionRequest {
+            action_id: "fixture-correct".into(),
+            action: Action::StartMove {
+                target: Position {
+                    x: 3.,
+                    y: 1.,
+                    z: 0.5,
+                },
+                jump: true,
+                max_ticks: 60,
+            },
+        };
+        let state = Arc::new(Mutex::new(Receipt {
+            action_id: request.action_id.clone(),
+            outcome: Outcome::Running,
+            adapter_version: VERSION.into(),
+            evidence: json!({}),
+            error: None,
+        }));
+        actor
+            .start_control(
+                actor.observe().unwrap(),
+                &request,
+                0,
+                state.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        correcting.store(true, Ordering::Release);
+        corrections.fetch_add(1, Ordering::AcqRel);
+        thread::sleep(Duration::from_millis(100));
+        let count = packets.load(Ordering::Acquire);
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            packets.load(Ordering::Acquire),
+            count,
+            "no position writes during native correction"
+        );
+        observed.lock().unwrap().player["position"] = json!([1.5, 1., 0.5]);
+        correcting.store(false, Ordering::Release);
+        wait_until(|| state.lock().unwrap().outcome == Outcome::Uncertain);
+        assert_eq!(state.lock().unwrap().outcome, Outcome::Uncertain);
+        assert!(
+            actor.engine.lock().unwrap().drive.is_none(),
+            "interrupted input must not replay"
+        );
+        observed.lock().unwrap().world["blocks"] = json!([]);
+        wait_until(|| !alive.load(Ordering::Acquire));
+        assert!(
+            actor
+                .engine
+                .lock()
+                .unwrap()
+                .reason
+                .contains("unobserved terrain")
+        );
+        // The writer closes its socket on loss of native geometry. No orphan
+        // sampler or packet-reader may survive the fixture's explicit shutdown.
+        reader.join().unwrap();
+        sampler.join().unwrap();
+        assert!(actor.observe().is_err());
+    }
     #[test]
     fn native_impulses_are_actor_scoped_bounded_and_keep_packet_order() {
         let mut bytes = vi(7);
