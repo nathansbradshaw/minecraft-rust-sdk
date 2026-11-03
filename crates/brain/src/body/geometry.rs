@@ -318,7 +318,24 @@ pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
                 }
             })
             .fold(0., f64::max);
-        distance * 2. + cover + sidestep * 8.
+        // A head-on retreat stays on an archer's firing line. Start moving
+        // across that line before a close shot is already in flight, while
+        // distance and cover still reward outward progress and protected routes.
+        let ranged_lateral = threats
+            .iter()
+            .filter(|(_, ranged)| *ranged)
+            .map(|(enemy, _)| {
+                let dx = start[0] - enemy[0];
+                let dz = start[2] - enemy[2];
+                let length = dx.hypot(dz);
+                if length > 0.001 {
+                    ((p[0] - start[0]) * -dz + (p[2] - start[2]) * dx).abs() / length
+                } else {
+                    0.
+                }
+            })
+            .fold(0., f64::max);
+        distance * 2. + cover + sidestep * 8. + ranged_lateral * 2.
     };
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
@@ -503,6 +520,21 @@ mod tests {
         o.world["entities"][0]["ranged_attack"] = json!(false);
         assert!(!threatened(&o));
         assert!(evade(&o).is_none());
+    }
+    #[test]
+    fn ranged_retreat_moves_laterally_before_an_arrow_is_already_incoming() {
+        let mut o = world();
+        o.world["entities"][0]["position"] = json!([8.5, 1., 0.5]);
+        o.world["entities"][0]["ranged_attack"] = json!(true);
+        assert!(!incoming(&o));
+        let route = evade(&o).unwrap();
+        let retreat = 0.5 - route.target.x;
+        let lateral = (route.target.z - 0.5).abs();
+        assert!(retreat > 0.7, "Retreat still needs outward progress");
+        assert!(
+            lateral >= retreat * 0.5,
+            "Do not wait for an already imminent arrow before moving across its firing line: {route:?}"
+        );
     }
     #[test]
     fn a_one_block_descent_is_not_rejected_as_an_unsupported_diagonal_ramp() {
