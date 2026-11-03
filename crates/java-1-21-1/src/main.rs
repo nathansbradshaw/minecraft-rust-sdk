@@ -988,11 +988,7 @@ fn trajectory(
 ) -> AnyResult<Vec<([f64; 3], bool)>> {
     let mut frames = Vec::new();
     let mut p = start;
-    let mut velocity = if jump || target[1] > start[1] + 0.2 {
-        0.42
-    } else {
-        -0.08
-    };
+    let mut velocity = if jump { 0.42 } else { -0.08 };
     let mut peak = start[1];
     for _ in 0..60 {
         let dx = target[0] - p[0];

@@ -119,6 +119,9 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
         return Err("Movement option surface budget exceeded".into());
     }
     let mut hash = std::collections::hash_map::DefaultHasher::new();
+    // A changed control contract invalidates failed edges from old predictions
+    // even if their terrain and endpoints are unchanged.
+    "java767-input-preview-v2".hash(&mut hash);
     input.target.map(|p| p.map(f64::to_bits)).hash(&mut hash);
     before.player["dimension"].to_string().hash(&mut hash);
     before.player["movement_speed"].to_string().hash(&mut hash);
@@ -213,6 +216,28 @@ mod tests {
                 .iter()
                 .any(|r| r["target"][0].as_f64().unwrap() > 1.)
         );
+    }
+    #[test]
+    fn an_uphill_prediction_must_declare_its_jump_input() {
+        let mut o = room(false);
+        let step = o.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|b| b["position"] == json!([1, 1, 0]))
+            .unwrap();
+        step["block"] = json!("fixture:step");
+        step["collision"] = json!([[0, 0, 0, 1, 1, 1]]);
+        let routes = all(&o);
+        let uphill = routes
+            .iter()
+            .find(|r| r["target"] == json!([1.5, 2., 0.5]))
+            .expect("A normal one-block jump remains available");
+        assert_eq!(
+            uphill["jump"], true,
+            "Preview cannot secretly jump while advertising a grounded control"
+        );
+        assert!(control::preview(&o, [1.5, 2., 0.5], false).is_err());
     }
     #[test]
     fn unknown_air_is_not_a_reachable_route_and_queries_are_closed() {
