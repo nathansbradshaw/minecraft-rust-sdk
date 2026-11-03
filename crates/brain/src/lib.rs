@@ -102,6 +102,10 @@ pub struct Config {
     pub cargo_target: Option<PathBuf>,
     pub state: PathBuf,
     pub goal: String,
+    /// Client behavior preferences retained across replaceable gameplay goals.
+    /// Empty by default; this does not change server authority or SDK policy.
+    #[serde(default)]
+    pub instructions: String,
     #[serde(default = "default_turns")]
     pub max_turns: u32,
     #[serde(default = "default_timeout")]
@@ -113,6 +117,9 @@ pub struct Config {
 }
 fn conversation_default() -> bool {
     true
+}
+fn model_context_contract(instructions: &str) -> String {
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1","sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
@@ -512,6 +519,10 @@ impl Brain {
             "Invalid run budget/goal",
         )?;
         ensure(
+            cfg.instructions.len() <= 2048,
+            "Deployment instructions exceed context budget",
+        )?;
+        ensure(
             (1..=64).contains(&cfg.max_inspections_without_execution),
             "Invalid inspection budget",
         )?;
@@ -543,13 +554,7 @@ impl Brain {
             "Another brain owns this state directory",
         )?;
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
-        journal.context_contract(&digest(
-            concat!(
-                "sdk-shaped-observation-v1\nfocused-observation-v1\nretrievable-memory-v1\ncontainer-inspection-memory-v1\n",
-                include_str!("sdk.md")
-            )
-            .as_bytes(),
-        ))?;
+        journal.context_contract(&model_context_contract(&cfg.instructions))?;
         let imported = journal.import_program_history(&cfg.state)?;
         if imported > 0 {
             journal.event(
@@ -876,6 +881,7 @@ impl Brain {
                 .unwrap_or(json!([]));
             let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
+            context["deployment_instructions"] = json!(self.cfg.instructions);
             context["inspected_containers"] = self
                 .journal
                 .recalled_containers(&self.server.instance_id, &self.observed)?;
@@ -1245,6 +1251,19 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_pressure_preserves_complete_standing_instructions() {
+        assert_ne!(
+            model_context_contract("preserve builds"),
+            model_context_contract("")
+        );
+        let instructions = "Retain this deployment preference across all player tasks. ".repeat(30);
+        let mut context = json!({"goal":"new player task","deployment_instructions":instructions,"server":"s".repeat(3000),"observation":{"world":{"blocks":(0..100).map(|n|json!({"position":[n,64,0],"block":"minecraft:stone"})).collect::<Vec<_>>()},"player":{"position":[1.,64.,2.]}},"recent":["x".repeat(16000)],"sdk_reference":include_str!("sdk.md")});
+        fit_context(&mut context).unwrap();
+        assert_eq!(context["deployment_instructions"], instructions);
+        assert_eq!(context["goal"], "new player task");
+        assert!(context.to_string().len() <= 32768);
+    }
     #[test]
     fn inspections_cannot_replace_the_last_experiment_or_reset_a_repeated_failure() {
         let dir = tempfile::tempdir().unwrap();

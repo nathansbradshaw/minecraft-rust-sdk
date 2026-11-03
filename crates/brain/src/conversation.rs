@@ -62,6 +62,7 @@ impl Handle {
                         for message in &incoming {journal.event("chat_received",message.clone())?;}
                         let requested_revision=brain.get("goal_revision")?.unwrap_or_default();
                         let mut context=json!({"messages":incoming,"goal":brain.get("goal")?.unwrap_or_else(||cfg.goal.clone()),"goal_revision":requested_revision,"player":observed.player,"body":body.view()});
+                        context["deployment_instructions"]=json!(cfg.instructions);
                         crate::bound_value(&mut context["messages"],12000);
                         crate::bound_value(&mut context["player"],6000);
                         let request=async {
