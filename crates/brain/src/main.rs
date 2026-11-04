@@ -4,13 +4,25 @@ async fn main() {
     if let Err(e) = run().await {
         eprintln!(
             "{}",
-            serde_json::json!({"event":"brain_stopped","error":e.to_string()})
+            serde_json::json!({"event":if std::env::args().nth(1).as_deref()==Some("decision-worker"){"decision_worker_stopped"}else{"brain_stopped"},"error":e.to_string()})
         );
         std::process::exit(1);
     }
 }
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == "decision-worker" {
+        return minecraft_sdk_brain::worker::serve().await;
+    }
+    if args.len() == 3 && args[0] == "replace-worker" {
+        let cfg: Config =
+            serde_json::from_slice(&private_read(std::path::Path::new(&args[1]), 16384)?)?;
+        println!(
+            "{}",
+            minecraft_sdk_brain::worker::replace(&cfg, std::path::Path::new(&args[2]))?
+        );
+        return Ok(());
+    }
     if args.len() == 2 && args[0] == "navigation-worker" {
         return minecraft_sdk_brain::navigation::worker(std::path::Path::new(&args[1])).await;
     }

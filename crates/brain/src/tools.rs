@@ -84,7 +84,7 @@ fn observation_query(input: &str) -> Result<minecraft_sdk::ObservationQuery> {
     query.validate()?;
     Ok(query)
 }
-struct ProcessGroup(u32);
+pub(crate) struct ProcessGroup(pub(crate) u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         // Also clean up background descendants on timeout, cancellation or
@@ -309,6 +309,19 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                 None,
             )?;
             Ok(json!({"goal":brain.goal}))
+        }
+        "replace_worker" => {
+            let path = std::path::Path::new(&choice.input);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                brain.cfg.workspace.join(path)
+            };
+            let selected = crate::worker::replace(&brain.cfg, &path)?;
+            brain
+                .journal
+                .event("decision_worker_selected", selected.clone())?;
+            Ok(selected)
         }
         "report" => {
             ensure(
