@@ -310,12 +310,26 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
             )?;
             Ok(json!({"goal":brain.goal}))
         }
+        "report" => {
+            ensure(
+                !choice.input.trim().is_empty() && choice.input.len() <= 2048,
+                "Bounded progress report required",
+            )?;
+            brain.journal.event(
+                "progress_report",
+                json!({"goal":brain.goal,"report":choice.input,"completed":false}),
+            )?;
+            Ok(json!({"recorded":"progress report","goal_remains_active":true}))
+        }
         "complete" => {
+            let claim = crate::completion::claim(&choice.input)?;
+            let crate::completion::Status::Succeeded = claim.status;
             let claimed_goal = brain.goal.clone();
             brain.refresh().await?;
+            let checks = crate::completion::verify(&brain.cfg, &claimed_goal, &brain.observed)?;
             brain.journal.event("model_completion_claim",json!({"goal":claimed_goal,"claim":choice.input,"observed":crate::projection(&brain.observed),"externally_verified":false}))?;
             Ok(
-                json!({"recorded":"model claim","native_observation":crate::projection(&brain.observed),"benchmark_pass_granted":false}),
+                json!({"recorded":"model claim","summary":claim.summary,"configured_checks":checks,"native_observation":crate::projection(&brain.observed),"benchmark_pass_granted":false}),
             )
         }
         _ => Err("Unknown tool".into()),
@@ -324,6 +338,39 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn incomplete_reports_and_legacy_completion_cannot_finish_a_goal() {
+        let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");
+        let revision = brain
+            .journal
+            .select_goal("fixture", "fixture", json!({}), None)
+            .unwrap();
+        let mut command = Choice {
+            tool: "report".into(),
+            input: "Tool built; workbench still needs recovery".into(),
+            path: String::new(),
+            summary: "progress".into(),
+            notes: String::new(),
+            experiment: false,
+        };
+        let result = execute(&mut brain, &command).await.unwrap();
+        assert_eq!(result["goal_remains_active"], true);
+        assert!(!brain.journal.goal_completed("fixture").unwrap());
+        command.tool = "complete".into();
+        command.input = r#"{"kind":"complete","text":"Requirement is not met"}"#.into();
+        assert!(
+            execute(&mut brain, &command)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("use report")
+        );
+        assert_eq!(
+            brain.journal.get("goal_revision").unwrap().unwrap(),
+            revision.to_string()
+        );
+        assert!(!brain.journal.goal_completed("fixture").unwrap());
+    }
     #[tokio::test]
     async fn nested_listing_supplies_a_readable_path_and_errors_identify_the_target() {
         let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");

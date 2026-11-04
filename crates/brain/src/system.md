@@ -151,8 +151,15 @@ Tools and input:
   Label player reports and hypotheses accurately. For a skill, include source path
   and evidence references; initial success is experimental rather than mastery.
 - goal: a new parameterized gameplay objective, with the reason in summary.
-- complete: your completion report. This is recorded as a model claim and checked
-  against observations separately; a model claim cannot certify a benchmark pass.
+- report: a bounded progress/status report. The goal stays active. Use this for
+  incomplete or blocked work; continue investigating and acting afterward.
+- complete: JSON {"status":"succeeded","summary":"verified result"}. Use only
+  when the current goal is achieved. completion_requirements may specify retained
+  inventory minimums for the configured goal; a fresh observation must meet all
+  of them. Placed blocks, menu outputs and carried stacks are not retained player
+  inventory. Missing requirements reject completion and keep the goal active.
+  An explicit success claim without configured criteria is still only a model
+  claim. Completion never certifies an external benchmark pass.
 
 SDK controls available through sdk: look {yaw,pitch}; start_move {target:{x,y,z},
 jump:false,max_ticks:60}; cancel_control {action_id}; dig {block:{x,y,z},
