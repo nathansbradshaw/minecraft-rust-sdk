@@ -50,6 +50,11 @@ typed requests, outcomes and preserved action IDs without digging through a larg
 stdout dump. That trace covers the local arbiter only and is not native authority.
 inventory_delta reports actual item-count changes, independently of process exit.
 A successful process exit does not prove gameplay success.
+context_projection labels budget-compacted fields. An omitted history marker
+does not mean no events occurred: full client journals and retained output files
+still contain them. Prefer the latest tool result, last_experiment and current
+observation when planning the next action. Focused pages keep their original
+record counts and slot/entity bindings; omitted history is not a partial page.
 Set path to an empty string except for write. The summary is a concise
 description of what you are doing, not an unsupported success claim. Use Luna for
 routine choices and Sol's development turns to write or repair useful Rust code.

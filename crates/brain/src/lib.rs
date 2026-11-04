@@ -126,12 +126,18 @@ fn conversation_default() -> bool {
     true
 }
 fn model_context_contract(instructions: &str) -> String {
-    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v2","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
 }
 impl Journal {
+    /// Read-only diagnostics never migrate, chmod or write the supplied journal.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(Duration::from_secs(3))?;
+        Ok(Self { db })
+    }
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -1210,13 +1216,39 @@ fn bound_value(value: &mut Value, budget: usize) {
         if value.to_string().len() <= budget {
             return;
         }
+        let before = value.to_string().len();
         shrink_value(value);
+        if value.to_string().len() == before {
+            return;
+        }
     }
 }
 fn fit_context(context: &mut Value) -> Result<()> {
     // Focused views have already been paged under a byte ceiling. Truncating
     // their records again would invalidate returned counts and slot bindings.
     let focused = context["last_tool_result"]["result"]["view"].is_string();
+    let tracked: Vec<_> = [
+        "server",
+        "memory",
+        "inspected_containers",
+        "recent",
+        "observation",
+        "development_request",
+        "completed_tool_activity",
+        "last_tool_result",
+        "last_experiment",
+        "working_notes",
+        "player_request",
+    ]
+    .into_iter()
+    .map(|field| {
+        (
+            field,
+            context[field].to_string().len(),
+            context[field].as_array().map(Vec::len),
+        )
+    })
+    .collect();
     for (field, budget) in [
         ("server", 2500),
         ("memory", 5000),
@@ -1230,7 +1262,9 @@ fn fit_context(context: &mut Value) -> Result<()> {
         ("working_notes", 2000),
         ("player_request", 2000),
     ] {
-        bound_value(&mut context[field], budget);
+        if !(focused && field == "last_tool_result") {
+            bound_value(&mut context[field], budget);
+        }
     }
     // Preserve the experiment/error channel under pressure. Older history,
     // redundant world detail and long source previews have complete file paths.
@@ -1247,11 +1281,86 @@ fn fit_context(context: &mut Value) -> Result<()> {
         if serde_json::to_vec(context)?.len() <= 32768 {
             break;
         }
-        bound_value(&mut context[field], budget);
+        if !(focused && field == "last_tool_result") {
+            bound_value(&mut context[field], budget);
+        }
+    }
+    // Recursive shrinking has a floor: short scalar fields, complete inventory
+    // bindings and the final two records cannot shrink further. Two copies of
+    // a normal experiment can therefore exceed their nominal history budgets.
+    // Mark compaction honestly, then elide redundant history before discarding
+    // any current observation, latest tool feedback or experiment/error channel.
+    let mut projection = serde_json::Map::new();
+    for (field, bytes, records) in &tracked {
+        if context[field].to_string().len() != *bytes {
+            projection.insert((*field).into(), json!({"complete":false,"view":"compacted","original_bytes":bytes,"original_records":records}));
+        }
+    }
+    if !projection.is_empty() {
+        context["context_projection"] = json!(projection);
+    }
+    for field in [
+        "completed_tool_activity",
+        "recent",
+        "memory",
+        "inspected_containers",
+    ] {
+        if serde_json::to_vec(context)?.len() <= 32768 {
+            break;
+        }
+        if context[field].is_null() || context[field].as_array().is_some_and(Vec::is_empty) {
+            continue;
+        }
+        let (_, bytes, records) = tracked
+            .iter()
+            .find(|(name, _, _)| *name == field)
+            .ok_or("Context budget field missing")?;
+        context[field] = json!({"omitted_for_context_budget":true,"original_bytes":bytes,"original_records":records,"retained_in":"persistent client journal and original tool output files"});
+        projection.insert(field.into(), json!({"complete":false,"view":"elided_redundant_history","original_bytes":bytes,"original_records":records}));
+        context["context_projection"] = json!(projection);
     }
     ensure(
         serde_json::to_vec(context)?.len() <= 32768,
         "Context budget exceeded",
+    )
+}
+
+/// Offline replay of saved journal feedback over a previously accepted frame.
+/// The previous observation is retained; this does not observe or reconnect a
+/// character, call inference, replay actions or certify a gameplay outcome.
+pub fn replay_context(journal: &Journal, context: &mut Value) -> Result<Value> {
+    let goal = context["goal"]
+        .as_str()
+        .ok_or("Context goal missing")?
+        .to_owned();
+    context["last_tool_result"] = journal.last_result()?;
+    context["recent"] = journal.recent()?;
+    context["memory"] = journal.recall(&goal)?;
+    for (field, key) in [
+        ("completed_tool_activity", "activity"),
+        ("last_experiment", "last_experiment"),
+    ] {
+        context[field] = journal
+            .get(key)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Null);
+    }
+    context["working_notes"] = json!(journal.get("working_notes")?);
+    let sizes = |v: &Value| -> Value {
+        v.as_object()
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| (k.clone(), json!(v.to_string().len())))
+                    .collect::<serde_json::Map<_, _>>()
+            })
+            .map(Value::Object)
+            .unwrap_or(Value::Null)
+    };
+    let before_bytes = serde_json::to_vec(context)?.len();
+    let before_fields = sizes(context);
+    let error = fit_context(context).err().map(|e| e.to_string());
+    Ok(
+        json!({"scope":"offline saved-observation/journal replay; no SDK or model access","budget_bytes":32768,"fit":error.is_none(),"error":error,"before_bytes":before_bytes,"after_bytes":serde_json::to_vec(context)?.len(),"before_fields":before_fields,"after_fields":sizes(context)}),
     )
 }
 fn shrink_value(value: &mut Value) {
@@ -1329,6 +1438,52 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_floors_do_not_stop_reasoning_or_corrupt_latest_evidence() {
+        // Short fields reach shrink_value's floor even though their enclosing
+        // record exceeds its nominal budget. No private journal data is used.
+        let history: serde_json::Map<String, Value> = (0..50)
+            .map(|n| {
+                (
+                    format!("field_{n}"),
+                    json!("short retained fact ".repeat(20)),
+                )
+            })
+            .collect();
+        let page = json!({"view":"menu","complete":true,"menu_id":7,"state_id":11,"returned":1,"slots":[{"slot":8,"item":"custom:resource","count":3}]});
+        let experiment = json!({"exit_code":101,"stderr":"compile error: missing method","inventory_delta":[{"item":"custom:resource","change":1,"current_count":3}],"local_action_feedback":{"requests":[{"request":{"action_id":"durable-failed-action"},"response":{"outcome":"rejected"}}]},"output_files":{"stderr":{"path":"retained-errors.txt"}}});
+        let player = json!({"position":[1.25,64.0,3.5],"health":17,"inventory":[{"slot":8,"item":"custom:resource","count":3}]});
+        let mut context = json!({"sdk_reference":include_str!("sdk.md"),"goal":"craft a tool","completed_tool_activity":[history.clone(),history.clone()],"recent":[history.clone(),history],"last_tool_result":{"result":page},"last_experiment":experiment,"observation":{"player":player}});
+        assert!(context.to_string().len() > 32768);
+        fit_context(&mut context).unwrap();
+        assert!(context.to_string().len() <= 32768);
+        assert_eq!(context["last_tool_result"]["result"], page);
+        assert_eq!(context["last_experiment"], experiment);
+        assert_eq!(context["observation"]["player"], player);
+        assert_eq!(
+            context["completed_tool_activity"]["omitted_for_context_budget"],
+            true
+        );
+        assert_eq!(
+            context["context_projection"]["completed_tool_activity"]["complete"],
+            false
+        );
+        assert_eq!(context["goal"], "craft a tool");
+    }
+    #[test]
+    fn diagnostic_journal_refuses_creation_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite");
+        assert!(Journal::open_read_only(&path).is_err());
+        assert!(!path.exists());
+        let journal = Journal::open(&path).unwrap();
+        journal.event("fixture", json!({"id":"preserved"})).unwrap();
+        drop(journal);
+        let before = fs::read(&path).unwrap();
+        let read_only = Journal::open_read_only(&path).unwrap();
+        assert!(read_only.event("mutation", json!({})).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
     #[test]
     fn context_pressure_preserves_complete_standing_instructions() {
         assert_ne!(
