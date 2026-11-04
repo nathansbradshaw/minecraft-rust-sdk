@@ -381,12 +381,13 @@ pub fn evade(o: &Observation) -> Option<Escape> {
     evade_avoiding(o, &[])
 }
 pub fn evade_avoiding(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
-    evade_with_stationary(o, blocked, &[])
+    evade_with_stationary(o, blocked, &[], &[])
 }
 pub(super) fn evade_with_stationary(
     o: &Observation,
     blocked: &[[i32; 3]],
     stationary: &[String],
+    recent_retreat: &[[f64; 3]],
 ) -> Option<Escape> {
     if water_danger(o) {
         return water_escape(o, blocked);
@@ -485,7 +486,7 @@ pub(super) fn evade_with_stationary(
     };
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
-    let mut best_score = current + 0.4;
+    let mut best_score = f64::NEG_INFINITY;
     // Narrow ledges rarely line up with a fixed angle and stride. Include
     // observed collision-top centres as landings, without inventing support.
     let mut candidates = Vec::new();
@@ -540,7 +541,19 @@ pub(super) fn evade_with_stationary(
             if !route {
                 continue;
             }
-            let value = score(p) - length * 0.1 - if jump { 0.2 } else { 0. };
+            let safety = score(p) - length * 0.1 - if jump { 0.2 } else { 0. };
+            if safety <= current + 0.4 {
+                continue;
+            }
+            // Recent positions are a preference, not an obstruction. Keep an
+            // actually viable way back when every new route is worse than
+            // staying, and let strong cover/projectile scores win.
+            let revisit = recent_retreat
+                .iter()
+                .filter(|q| (q[1] - p[1]).abs() < 0.75)
+                .map(|q| (2.0 - (p[0] - q[0]).hypot(p[2] - q[2])).max(0.0))
+                .fold(0.0, f64::max);
+            let value = safety - revisit * 4.0;
             if value > best_score {
                 best_score = value;
                 best = Some(Escape {
@@ -760,6 +773,33 @@ mod tests {
             lateral >= retreat * 0.5,
             "Do not wait for an already imminent arrow before moving across its firing line: {route:?}"
         );
+    }
+    #[test]
+    fn ranged_retreat_prefers_an_alternative_to_a_recently_traversed_landing() {
+        let mut o = world();
+        o.world["entities"][0]["position"] = json!([-8.5, 1., 0.5]);
+        o.world["entities"][0]["ranged_attack"] = json!(true);
+        let first = evade(&o).expect("clear retreat");
+        let seen = [first.target.x, first.target.y, first.target.z];
+        let alternative = evade_with_stationary(&o, &[], &[], &[seen]).expect("alternate retreat");
+        assert!((alternative.target.z - first.target.z).abs() > 2.0);
+        assert!(
+            alternative.target.x > 1.0,
+            "continue increasing enemy distance"
+        );
+
+        // A recently traversed corridor is still usable if it is the only
+        // observed escape; history must never turn the floor into an obstacle.
+        let mut corridor = world();
+        corridor.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["position"][2] == 0);
+        let seen: Vec<_> = (-4..=0).map(|x| [f64::from(x) + 0.5, 1., 0.5]).collect();
+        let fallback =
+            evade_with_stationary(&corridor, &[], &[], &seen).expect("only safe corridor");
+        assert!(fallback.target.x < 0.0);
+        assert!((fallback.target.z - 0.5).abs() < 1e-6);
     }
     #[test]
     fn a_one_block_descent_is_not_rejected_as_an_unsupported_diagonal_ramp() {

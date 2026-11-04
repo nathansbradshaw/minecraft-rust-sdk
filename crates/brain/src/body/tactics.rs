@@ -3,6 +3,60 @@ use super::geometry::point;
 use minecraft_sdk::Observation;
 use std::collections::BTreeMap;
 
+/// Keep a short trail of positions the player actually reached under threat.
+/// This is local route feedback, never evidence of unseen walkable terrain.
+#[derive(Default)]
+pub(super) struct RetreatTrail {
+    scope: Option<(String, String, String, i64)>,
+    last: Option<([f64; 3], i64)>,
+    points: Vec<([f64; 3], i64)>,
+}
+impl RetreatTrail {
+    pub fn update(&mut self, o: &Observation, danger: bool) -> Vec<[f64; 3]> {
+        let sample = || {
+            Some((
+                (
+                    o.player["uuid"].as_str()?.to_owned(),
+                    o.player["dimension"].as_str()?.to_owned(),
+                    o.world["sample_clock"]["epoch"].as_str()?.to_owned(),
+                    o.player["entity_id"].as_i64()?,
+                ),
+                point(&o.player["position"])?,
+                o.world["game_time"].as_i64()?,
+            ))
+        };
+        let Some((scope, p, tick)) = sample() else {
+            *self = Self::default();
+            return Vec::new();
+        };
+        let distance =
+            |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>();
+        if self.scope.as_ref() != Some(&scope)
+            || self.last.is_some_and(|(q, t)| {
+                tick < t || tick.saturating_sub(t) > 20 || distance(q, p) > 64.
+            })
+            || o.player["health"].as_f64().is_some_and(|h| h <= 0.0)
+        {
+            self.points.clear();
+        }
+        self.scope = Some(scope);
+        self.last = Some((p, tick));
+        self.points.retain(|&(_, t)| tick.saturating_sub(t) <= 160);
+        if danger
+            && self
+                .points
+                .last()
+                .is_none_or(|&(q, _)| distance(q, p) >= 2.25)
+        {
+            if self.points.len() == 12 {
+                self.points.remove(0);
+            }
+            self.points.push((p, tick));
+        }
+        self.points.iter().map(|(position, _)| *position).collect()
+    }
+}
+
 /// Client inference from advancing native positions. An embedded arrow can
 /// retain a nonzero reported velocity; that alone does not establish flight.
 #[derive(Default)]
@@ -199,7 +253,7 @@ mod tests {
             "Stateless single-frame prediction stays conservative"
         );
         assert!(
-            super::super::geometry::evade_with_stationary(&o, &[], &stationary).is_none(),
+            super::super::geometry::evade_with_stationary(&o, &[], &stationary, &[]).is_none(),
             "An observed stationary arrow alone does not require another escape"
         );
         assert_eq!(
