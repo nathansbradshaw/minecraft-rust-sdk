@@ -8,6 +8,7 @@ async fn planning_refresh_waits_for_a_fresh_retry_without_admitting_stale_state(
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(Some((
@@ -177,6 +178,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -226,6 +228,7 @@ async fn delayed_interactions_return_final_feedback_without_leasing_the_survival
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -351,6 +354,7 @@ async fn real_local_proxy_returns_the_receipt_and_retains_only_compact_diagnosti
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -411,6 +415,7 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
     );
     let shared = Arc::new(Shared {
         feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         model_lanes: crate::model::Lanes::default(),
         emergency: AtomicBool::new(true),
