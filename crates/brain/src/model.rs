@@ -61,17 +61,31 @@ fn http_failure(status: u16, envelope: &Value, now: i64) -> HttpFailure {
 /// Only an explicit, bounded daily-reset or pacing timestamp permits a retry.
 /// Authentication/schema/queue/provider failures still require investigation.
 pub fn retry_at(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<i64> {
-    error.downcast_ref::<HttpFailure>().and_then(|e| e.retry_at)
+    error
+        .downcast_ref::<HttpFailure>()
+        .and_then(|e| e.retry_at)
+        .or_else(|| {
+            error
+                .downcast_ref::<crate::worker::Failure>()
+                .and_then(|e| e.retry_at)
+        })
 }
 
 /// A daily allocation rejection applies only to the requested model. Queue,
 /// pacing, authentication and schema errors do not authorize model hopping.
 pub(crate) fn daily_reset(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<i64> {
-    error.downcast_ref::<HttpFailure>().and_then(|e| {
-        (e.status == 429 && e.class == "allocation_daily_limit")
-            .then_some(e.retry_at)
-            .flatten()
-    })
+    error
+        .downcast_ref::<HttpFailure>()
+        .and_then(|e| {
+            (e.status == 429 && e.class == "allocation_daily_limit")
+                .then_some(e.retry_at)
+                .flatten()
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<crate::worker::Failure>()
+                .and_then(|e| e.daily_reset)
+        })
 }
 
 /// Container-local coordination for the shared allocated model credentials.
@@ -104,7 +118,7 @@ pub struct Choice {
     #[serde(default)]
     pub experiment: bool,
 }
-pub const TOOLS: [&str; 17] = [
+pub const TOOLS: [&str; 18] = [
     "develop",
     "observe",
     "query",
@@ -120,9 +134,20 @@ pub const TOOLS: [&str; 17] = [
     "run",
     "remember",
     "goal",
+    "replace_worker",
     "report",
     "complete",
 ];
+pub(crate) fn validate_choice(choice: &Choice) -> Result<()> {
+    ensure(
+        TOOLS.contains(&choice.tool.as_str())
+            && choice.input.len() <= 10000
+            && choice.path.len() <= 256
+            && choice.summary.len() <= 1024
+            && choice.notes.len() <= 4096,
+        "Invalid bounded worker/model tool choice",
+    )
+}
 pub fn schema() -> Value {
     json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, compilation, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual tool input: Rust source for write, command for terminal, binary name for run, serialized typed action for sdk."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
@@ -202,14 +227,7 @@ impl Model {
             .await?;
         let choice: Choice =
             serde_json::from_str(&content).map_err(|e| format!("Invalid model tool JSON: {e}"))?;
-        ensure(
-            TOOLS.contains(&choice.tool.as_str())
-                && choice.input.len() <= 10000
-                && choice.path.len() <= 256
-                && choice.summary.len() <= 1024,
-            "Invalid tool choice",
-        )?;
-        ensure(choice.notes.len() <= 4096, "Working notes exceed budget")?;
+        validate_choice(&choice)?;
         Ok((choice, usage))
     }
     pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {

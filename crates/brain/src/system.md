@@ -151,6 +151,12 @@ Tools and input:
   Label player reports and hypotheses accurately. For a skill, include source path
   and evidence references; initial success is experimental rather than mastery.
 - goal: a new parameterized gameplay objective, with the reason in summary.
+- replace_worker: path to a compiled Rust decision executable implementing the
+  version1 stdin/stdout protocol, when decision_worker.enabled is true. This
+  executable must have no shared write permissions; chmod 700 build output.
+  changes the container-local reasoner after the current decision/tool settles.
+  The engine, Survival body, journals, model-lane permits and native session stay
+  resident. It does not replace the engine/body implementation or server code.
 - report: a bounded progress/status report. The goal stays active. Use this for
   incomplete or blocked work; continue investigating and acting afterward.
 - complete: JSON {"status":"succeeded","summary":"verified result"}. Use only

@@ -211,6 +211,43 @@ SDK provider's perception; it must not be presented as a player-visibility proof
 All model/tool source is MIT. Do not include generated worlds, keys, personal bot
 memory or deployment journals in a release or source publication.
 
+## Resident engine and replaceable decision processes
+
+Set optional `decision_worker` to the absolute path of a compiled Rust executable
+inside the container. The provided `minecraft-sdk-brain` executable implements
+this interface itself. The engine snapshots the initial image, owns the player
+session, actor/state locks, Survival thread, conversation, journals and tool
+execution. A decision child receives one bounded version1 JSON request on stdin
+and returns one response on stdout, then exits. It never acquires those locks or
+opens a player connection. Per-model permits remain in the parent and proxy
+allowances remain authoritative.
+
+The model's local `replace_worker` tool accepts a compiled executable path.
+Stage writable-workspace build output with `chmod 700` before activation; shared
+write permissions and symlinks are rejected. Read-only root-owned image binaries
+are also accepted.
+Operators can also run `minecraft-sdk-brain replace-worker PRIVATE_CONFIG.json
+NEW_EXECUTABLE` inside the container. Activation snapshots the image by SHA-256
+and atomically updates a private selection file. Pending decisions/tools settle
+before the new image is used; superseded decision output is discarded. A failed
+worker leaves the parent/body active and waits for changed worker selection or a
+new goal rather than repeatedly polling the same failure. Invalid candidates do
+not replace the prior selection. This replaces decision code; upgrading the
+resident engine/body itself requires its own lifecycle procedure.
+
+Protocol fields are defined in `src/worker.rs`. Frames are limited to64KiB,
+context to32KiB, executable snapshots to32MiB and an exchange to260seconds
+(including stdin/stdout and exit). These are reference-deployment limits, not
+SDK bot counts. Snapshots consume the bot's workspace budget and retain recovery
+history. Only private stdin carries the allocated model-key path; no private
+native credentials are supplied. Host-side inference tools remain disabled.
+
+`decision-probe` is a declared zero-inference lifecycle fixture. Its optional
+workspace-local `.worker-probe.json` can specify `delay_ms` (at most10000),
+`fail`, or `wrong_identity`. It is not an intelligence or gameplay baseline.
+Native threat/worker-replacement acceptance remains separate from subprocess
+tests and configured cadence.
+
 `control-latency-probe PRIVATE_CONFIG.json` is a model-free native diagnostic for
 an otherwise inactive test character. It selects one observed flat, clear walking
 route, compares idle observation latency with a concurrent observation during the

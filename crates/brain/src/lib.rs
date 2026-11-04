@@ -19,6 +19,7 @@ mod routing;
 pub mod tools;
 pub mod versions;
 pub mod views;
+pub mod worker;
 mod workspace;
 use minecraft_sdk::{ActionRequest, Client, ErrorCode, Observation, Outcome, Profile};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -125,6 +126,9 @@ pub struct Config {
     pub model_interval_secs: u64,
     #[serde(default)]
     pub exit_on_complete: bool,
+    /// Optional replaceable decision executable; the resident engine owns play.
+    #[serde(default)]
+    pub decision_worker: Option<PathBuf>,
 }
 fn conversation_default() -> bool {
     true
@@ -490,7 +494,7 @@ impl Journal {
         )))
     }
     fn diagnosis_subject(&self, source: &str, revision: &str, environment: &str) -> Result<String> {
-        Ok(digest(json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.get("experiment_signature")?,"context_contract":self.get("context_contract")?,"discovery_revision":self.get("discovery_revision")?}).to_string().as_bytes()))
+        Ok(digest(json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.get("experiment_signature")?,"context_contract":self.get("context_contract")?,"discovery_revision":self.get("discovery_revision")?,"decision_worker_revision":self.get("decision_worker_revision")?}).to_string().as_bytes()))
     }
     fn investigation_spent(&self, subject: &str, finished: bool) -> Result<()> {
         self.db.execute("UPDATE investigations SET remaining=CASE WHEN ?2 THEN 0 ELSE max(remaining-1,0) END WHERE subject=?1",params![subject,finished])?;
@@ -706,6 +710,12 @@ impl Brain {
         })
     }
     pub async fn refresh(&mut self) -> Result<()> {
+        if self.cfg.decision_worker.is_some() {
+            let revision = worker::revision(&self.cfg)?;
+            if self.journal.get("decision_worker_revision")?.as_deref() != Some(&revision) {
+                self.journal.set("decision_worker_revision", &revision)?;
+            }
+        }
         self.observed = if let Some(h) = &self.body {
             h.shared.wait_fresh().await?
         } else {
@@ -857,6 +867,16 @@ impl Brain {
     }
     pub async fn run(&mut self) -> Result<()> {
         let model = model::Model::new(&self.cfg.model_endpoint, &self.cfg.model_key)?;
+        match worker::initialize(&self.cfg) {
+            Ok(Some(selected)) => {
+                self.journal
+                    .event("decision_worker_initialized", selected)?;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.journal.event("decision_worker_initialization_error",json!({"error":error.to_string(),"body_owner":"resident engine","next_action":"activate a valid worker; no unchanged retry"}))?;
+            }
+        }
         let mut next = tokio::time::Instant::now();
         for turn in 0..self.cfg.max_turns {
             while tokio::time::Instant::now() < next {
@@ -977,6 +997,7 @@ impl Brain {
             context["deployment_instructions"] = json!(self.cfg.instructions);
             context["project_manifest"] = workspace::manifest_hint(&self.cfg.workspace);
             context["completion_requirements"] = completion::view(&self.cfg, &self.goal);
+            context["decision_worker"] = json!({"enabled":self.cfg.decision_worker.is_some(),"protocol":1,"activate":"replace_worker with a compiled Rust executable path; current decision/tool settles first; body and native connection stay resident"});
             context["inspected_containers"] = self
                 .journal
                 .recalled_containers(&self.server.instance_id, &self.observed)?;
@@ -992,13 +1013,24 @@ impl Brain {
             self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"preferred_development":preferred,"quota_fallback":preferred != develop,"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
             let requested_goal = self.goal.clone();
             let requested_revision = self.journal.get("goal_revision")?.unwrap_or_default();
+            let worker_revision = worker::revision(&self.cfg)?;
+            let worker_cfg = self.cfg.clone();
+            let worker_journal = if self.cfg.decision_worker.is_some() {
+                Some(Journal::open(&self.cfg.state.join("brain.sqlite"))?)
+            } else {
+                None
+            };
             let lanes = self.body.as_ref().map(|h| h.shared.model_lanes.clone());
             let future = async {
                 let _permit = match lanes {
                     Some(lanes) => Some(lanes.acquire(develop).await?),
                     None => None,
                 };
-                model.choose_for(&context, develop, preferred).await
+                if let Some(journal) = &worker_journal {
+                    worker::choose(&worker_cfg, journal, &context, develop, preferred).await
+                } else {
+                    model.choose_for(&context, develop, preferred).await
+                }
             };
             tokio::pin!(future);
             let answer = loop {
@@ -1014,6 +1046,10 @@ impl Brain {
                     .remember_daily_reset(develop, error.as_ref(), now())?,
                 Ok(_) => false,
             };
+            if worker::revision(&self.cfg)? != worker_revision {
+                self.journal.event("decision_worker_replaced",json!({"old_revision":worker_revision,"discarded_pending_output":true,"body_and_native_connection":"resident and unchanged"}))?;
+                continue;
+            }
             if self.goal != requested_goal
                 || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision
             {
@@ -1036,6 +1072,7 @@ impl Brain {
                     while self.goal == requested_goal
                         && self.journal.get("goal_revision")?.unwrap_or_default()
                             == requested_revision
+                        && worker::revision(&self.cfg)? == worker_revision
                     {
                         if retry_at.is_some_and(|at| now() >= at) {
                             break;
