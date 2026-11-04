@@ -47,7 +47,7 @@ impl Handle {
                     let mut sequence=journal.get("chat_sequence")?.and_then(|s|s.parse::<u64>().ok()).unwrap_or_default();
                     let mut retry_at=None;
                     while !stopped.load(Ordering::Acquire) {
-                        let observed=body.observe()?;
+                        let observed=body.wait_fresh().await?;
                         if !brain.model_available(false,crate::now())? {tokio::time::sleep(Duration::from_millis(250)).await;continue;}
                         if retry_at.is_some_and(|at|crate::now()<at){tokio::time::sleep(Duration::from_millis(250)).await;continue;}
                         retry_at=None;
@@ -77,7 +77,7 @@ impl Handle {
                                     if stopped.load(Ordering::Acquire){break None;}
                                     // A failed body ends the controller; conversation cannot
                                     // silently leave an unattended character connected.
-                                    body.observe()?;
+                                    body.wait_fresh().await?;
                                 }
                             }
                         };

@@ -49,6 +49,14 @@ pub struct Shared {
     reason: Mutex<String>,
     pub failed: tokio::sync::Notify,
 }
+#[derive(Debug)]
+struct StaleObservation;
+impl std::fmt::Display for StaleObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Body observation is stale")
+    }
+}
+impl std::error::Error for StaleObservation {}
 impl Shared {
     pub fn urgent(&self) -> bool {
         self.emergency.load(Ordering::Acquire)
@@ -66,11 +74,28 @@ impl Shared {
             .lock()
             .map_err(|_| "Body observation unavailable")?;
         let (at, o) = latest.as_ref().ok_or("Body observation has not arrived")?;
-        ensure(
-            at.elapsed() < Duration::from_secs(3),
-            "Body observation is stale",
-        )?;
+        if at.elapsed() >= Duration::from_secs(3) {
+            return Err(Box::new(StaleObservation));
+        }
         Ok((**o).clone())
+    }
+    /// Readers can await the body's existing transport retry. This never makes
+    /// stale data admissible for gameplay and does not consume the supervisor's
+    /// failure notification. The body retains its own loss/disconnect policy.
+    pub async fn wait_fresh(&self) -> Result<Observation> {
+        self.wait_fresh_for(Duration::from_millis(2500)).await
+    }
+    async fn wait_fresh_for(&self, budget: Duration) -> Result<Observation> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.observe() {
+                Ok(observation) => return Ok(observation),
+                Err(error) if error.is::<StaleObservation>() && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 pub struct Handle {
