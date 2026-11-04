@@ -707,7 +707,7 @@ impl Brain {
     }
     pub async fn refresh(&mut self) -> Result<()> {
         self.observed = if let Some(h) = &self.body {
-            h.shared.observe()?
+            h.shared.wait_fresh().await?
         } else {
             self.client.observe().await?
         };

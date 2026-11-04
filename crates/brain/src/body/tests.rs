@@ -1,5 +1,69 @@
 use super::*;
 #[tokio::test]
+async fn planning_refresh_waits_for_a_fresh_retry_without_admitting_stale_state() {
+    let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");
+    let mut observed = brain.observed.clone();
+    observed.revision = "old".into();
+    let shared = Arc::new(Shared {
+        mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
+        feedback: Mutex::new(crate::feedback::Trace::default()),
+        emergency: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        latest: Mutex::new(Some((
+            Instant::now() - Duration::from_secs(4),
+            Arc::new(observed.clone()),
+        ))),
+        reason: Mutex::new("recovering observation transport".into()),
+        failed: tokio::sync::Notify::new(),
+    });
+    assert!(
+        shared.observe().is_err(),
+        "Immediate gameplay reads must remain fenced"
+    );
+    brain.body = Some(Handle {
+        shared: shared.clone(),
+        socket: brain.cfg.state.join("fixture.sock"),
+        stop: Arc::new(AtomicBool::new(false)),
+        thread: None,
+    });
+    let updating = shared.clone();
+    let update = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        observed.revision = "fresh-after-retry".into();
+        *updating.latest.lock().unwrap() = Some((Instant::now(), Arc::new(observed)));
+    });
+    brain.refresh().await.unwrap();
+    update.await.unwrap();
+    assert_eq!(brain.observed.revision, "fresh-after-retry");
+    {
+        let mut latest = shared.latest.lock().unwrap();
+        latest.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(4);
+    }
+    assert!(
+        shared
+            .wait_fresh_for(Duration::from_millis(40))
+            .await
+            .is_err()
+    );
+    shared.running.store(false, Ordering::Release);
+    shared.failed.notify_one();
+    assert!(
+        shared
+            .wait_fresh()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stopped")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), shared.failed.notified())
+            .await
+            .is_ok(),
+        "The supervisor must retain its failure notification"
+    );
+}
+#[tokio::test]
 async fn controller_defends_without_ending_escape_then_cancels_a_stuck_route() {
     controller_projectile_scenario(false).await;
     controller_projectile_scenario(true).await;
