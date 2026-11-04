@@ -126,7 +126,7 @@ fn conversation_default() -> bool {
     true
 }
 fn model_context_contract(instructions: &str) -> String {
-    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v2","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v2/bounded-investigation-routing-v2","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
@@ -459,9 +459,21 @@ impl Journal {
         for (key, value) in [
             ("investigation_subject", subject.to_owned()),
             ("investigation_remaining", remaining.to_string()),
-            ("develop_next", "true".to_owned()),
         ] {
             tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+        }
+        // Initialize the persisted finite session, not just its legacy boolean.
+        // A continued/reopened process must never replenish an existing subject.
+        if known.is_none() && remaining > 0 {
+            for (key, value) in [
+                ("develop_next", "true".to_owned()),
+                (
+                    "development_turns_remaining",
+                    remaining.min(routing::DEVELOPMENT_TURNS).to_string(),
+                ),
+            ] {
+                tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value])?;
+            }
         }
         tx.commit()?;
         Ok(Some((
@@ -1438,6 +1450,47 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn investigation_gets_a_finite_sol_session_without_restart_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite");
+        let j = Journal::open(&path).unwrap();
+        let revision = j
+            .select_goal("make progress", "fixture", json!({}), None)
+            .unwrap()
+            .to_string();
+        j.set("development_turns_remaining", "0").unwrap();
+        assert_eq!(
+            j.investigation_budget("stalled", 2, &revision).unwrap(),
+            Some((progress::Investigation::Start, 2))
+        );
+        assert!(j.take_development_turn().unwrap());
+        j.investigation_spent("stalled", false).unwrap();
+        drop(j);
+        let j = Journal::open(&path).unwrap();
+        assert_eq!(
+            j.investigation_budget("stalled", 2, &revision).unwrap(),
+            Some((progress::Investigation::Continue, 1))
+        );
+        assert!(j.take_development_turn().unwrap());
+        assert!(!j.take_development_turn().unwrap());
+        j.investigation_spent("stalled", false).unwrap();
+        assert_eq!(
+            j.investigation_budget("stalled", 8, &revision).unwrap(),
+            Some((progress::Investigation::Exhausted, 0))
+        );
+        assert!(!j.take_development_turn().unwrap());
+        // A genuinely new subject receives at most the normal four turns.
+        j.investigation_budget("changed-facts", 8, &revision)
+            .unwrap();
+        j.set("sol_daily_reset", "200").unwrap();
+        assert_eq!(j.available_model(true, 100).unwrap(), Some(false));
+        for _ in 0..routing::DEVELOPMENT_TURNS {
+            assert!(j.take_development_turn().unwrap());
+        }
+        assert!(!j.take_development_turn().unwrap());
+        assert_eq!(j.get("sol_daily_reset").unwrap().as_deref(), Some("200"));
+    }
     #[test]
     fn history_floors_do_not_stop_reasoning_or_corrupt_latest_evidence() {
         // Short fields reach shrink_value's floor even though their enclosing
