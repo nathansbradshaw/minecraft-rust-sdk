@@ -401,3 +401,13 @@ unchanged diagnosis records a defect boundary and stops polling that subject;
 body/chat and unrelated tasks continue. Source fingerprints exclude compiler
 caches. These cost hints are not evidence of useful gameplay; native evidence
 still decides gates.
+## Recovery during coding
+
+The resident body can eat ordinary prepared food from the hotbar or offhand
+when native observations show hunger and a safe opening. It checks the
+selected hand again on the next observation after changing slots, uses the
+item's observed duration to bound the action, and releases held use if
+danger returns. An interrupted or rejected action is not replayed. Food
+gain is reported separately from item-use dispatch. This default policy
+does not forage, move food from the backpack, or assume modded foods are
+safe; those strategies can be added in the bot workspace.

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -43,6 +43,9 @@ pub struct Shared {
     pub mutation: Arc<tokio::sync::Mutex<()>>,
     pub model_lanes: crate::model::Lanes,
     pub feedback: Mutex<crate::feedback::Trace>,
+    // Bumped under mutation ownership before submitting an SDK program's
+    // action. A food choice cannot act on a hand snapshot older than that.
+    program_generation: AtomicU64,
     emergency: AtomicBool,
     running: AtomicBool,
     latest: Mutex<Option<(Instant, Arc<Observation>)>>,
@@ -139,6 +142,7 @@ impl Handle {
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let shared = Arc::new(Shared {
             feedback: Mutex::new(crate::feedback::Trace::default()),
+            program_generation: AtomicU64::new(0),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
             model_lanes: crate::model::Lanes::default(),
             emergency: AtomicBool::new(false),
@@ -302,7 +306,9 @@ async fn proxy(
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
                 return Err("Local action caller disconnected".into());
             }
+            shared.program_generation.fetch_add(1, Ordering::AcqRel);
             let mut result = client.act(&request.request).await;
+            shared.program_generation.fetch_add(1, Ordering::Release);
             drop(guard);
             if let Ok(receipt) = &result
                 && receipt.outcome == Outcome::Running
@@ -389,11 +395,14 @@ async fn controller(
     let mut progress = tactics::Progress::default();
     let mut projectiles = tactics::Projectiles::default();
     let mut retreat_trail = tactics::RetreatTrail::default();
+    let mut last_meal = None;
+    let mut owned_meal: Option<(String, tactics::Meal)> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
         let started = Instant::now();
+        let observed_generation = shared.program_generation.load(Ordering::Acquire);
         let observed = match tokio::time::timeout(Duration::from_secs(2), client.observe()).await {
             Ok(Ok(o)) => o,
             result => {
@@ -468,6 +477,9 @@ async fn controller(
             None
         };
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
+        if dead {
+            last_meal = None;
+        }
         let in_water = geometry::water_danger(&observed);
         if cycles.is_multiple_of(10) || observed.player["health"] != previous_health {
             j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"air":observed.player["air"],"max_air":observed.player["max_air"],"in_water":in_water,"in_lava":observed.player["in_lava"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming,"incoming_projectile_ids":incoming_projectiles,"stationary_projectile_ids":stationary_projectiles,"stationary_scope":"client inference from advancing native positions, not a server flight flag or future guarantee"}))?;
@@ -500,6 +512,26 @@ async fn controller(
         {
             inspected_interaction = id.into();
             j.event("body_interaction_status",json!({"action_id":id,"outcome":receipt.outcome,"native_effect_verified":receipt.evidence["native_effect_verified"],"input_released":receipt.evidence["input_released"],"evidence_sha256":crate::digest(receipt.evidence.to_string().as_bytes()),"replayed":false}))?;
+            if owned_meal.as_ref().is_some_and(|(action, _)| action == id)
+                && let Some((_, meal)) = owned_meal.take()
+            {
+                j.event("body_meal_result", json!({
+                    "action_id":id,"item":meal.item,"slot":meal.slot,
+                    "outcome":receipt.outcome,"input_released":receipt.evidence["input_released"],
+                    "native_effect":receipt.evidence["effect"]["kind"],
+                    "food_before":receipt.evidence["before"]["player"]["food"],
+                    "food_after":receipt.evidence["after"]["player"]["food"],
+                    "saturation_after":receipt.evidence["after"]["player"]["saturation"],
+                    "replayed":false
+                }))?;
+                if receipt.outcome == Outcome::Cancelled
+                    && receipt.evidence["input_released"] == true
+                {
+                    // A later safe opening may start a new intention. The
+                    // cancelled durable ID is never replayed.
+                    last_meal = None;
+                }
+            }
         }
         if danger {
             let _guard = shared.mutation.lock().await;
@@ -636,6 +668,42 @@ async fn controller(
                 "body_program_resumed",
                 json!({"revision":observed.revision,"position":p}),
             )?;
+        } else if !shared.urgent()
+            && safe_since.elapsed() >= Duration::from_secs(1)
+            && let Some(meal) = tactics::meal(&observed)
+            && last_meal.as_ref() != Some(&meal)
+            && (interaction["action_id"].is_null()
+                || interaction["action_id"] == inspected_interaction)
+        {
+            let _guard = shared.mutation.lock().await;
+            if observed_generation.is_multiple_of(2)
+                && shared.program_generation.load(Ordering::Acquire) == observed_generation
+                && observed_at.elapsed() < Duration::from_millis(250)
+            {
+                let action = meal.action();
+                let using = matches!(action, Action::StartUseItem { .. });
+                last_meal = Some(meal.clone());
+                j.event("body_meal_attempt",json!({"item":meal.item,"slot":meal.slot,"count":meal.stock,"hunger":meal.hunger,"revision":observed.revision,"finite_use":using,"reason":"observed safe opening and confirmed edible stock"}))?;
+                match tokio::time::timeout(Duration::from_millis(500), send(&client, j, action))
+                    .await
+                {
+                    Ok(Ok(r)) if using && r.outcome == Outcome::Running => {
+                        owned_meal = Some((r.action_id, meal));
+                    }
+                    Ok(Ok(_)) => {}
+                    result => {
+                        let error = match result {
+                            Ok(Err(e)) => e.to_string(),
+                            _ => "Meal dispatch deadline exceeded; inspect pending ID, no replay"
+                                .into(),
+                        };
+                        j.event(
+                            "body_meal_deferred",
+                            json!({"error":error,"unchanged_attempt_retried":false}),
+                        )?;
+                    }
+                }
+            }
         } else if !shared.urgent()
             && cycles.is_multiple_of(10)
             && let Some(item) = client

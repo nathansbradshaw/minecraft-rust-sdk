@@ -1,7 +1,109 @@
 //! Client policy: fresh native evidence drives defense and local replanning.
 use super::geometry::point;
-use minecraft_sdk::Observation;
+use minecraft_sdk::{Action, Hand, Observation};
 use std::collections::BTreeMap;
+
+// Replaceable client policy. Native nutrition alone doesn't establish that
+// modded food is safe. Start with ordinary prepared foods whose use is known.
+const MEALS: &[&str] = &[
+    "minecraft:apple",
+    "minecraft:baked_potato",
+    "minecraft:bread",
+    "minecraft:carrot",
+    "minecraft:cooked_beef",
+    "minecraft:cooked_chicken",
+    "minecraft:cooked_cod",
+    "minecraft:cooked_mutton",
+    "minecraft:cooked_porkchop",
+    "minecraft:cooked_rabbit",
+    "minecraft:cooked_salmon",
+    "minecraft:golden_carrot",
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Meal {
+    pub slot: u8,
+    pub item: String,
+    pub stock: u64,
+    pub hunger: u64,
+    selected: u8,
+    ticks: u16,
+    nutrition: u64,
+    saturation: f64,
+}
+impl Meal {
+    pub fn action(&self) -> Action {
+        if self.slot <= 8 && self.slot != self.selected {
+            Action::SelectSlot { slot: self.slot }
+        } else {
+            Action::StartUseItem {
+                hand: if self.slot == 40 {
+                    Hand::Off
+                } else {
+                    Hand::Main
+                },
+                max_ticks: self.ticks + 8,
+            }
+        }
+    }
+}
+pub(super) fn meal(o: &Observation) -> Option<Meal> {
+    let player = &o.player;
+    let hunger = player["food"].as_u64()?;
+    let health = player["health"].as_f64()?;
+    let max_health = player["max_health"].as_f64()?;
+    if health <= 0.0
+        || !(hunger <= 14 || (hunger < 18 && health + 0.1 < max_health))
+        || player["using_item"] != false
+        || player["on_ground"] != true
+        || player["sprinting"] == true
+        || player["control"]["outcome"] == "running"
+        || player["interaction"]["outcome"] == "running"
+        || o.menu["menu_id"] != 0
+    {
+        return None;
+    }
+    let selected = u8::try_from(player["selected"].as_u64()?).ok()?;
+    player["inventory"]
+        .as_array()?
+        .iter()
+        .filter_map(|row| {
+            let slot = u8::try_from(row["slot"].as_u64()?).ok()?;
+            let item = row["item"].as_str()?;
+            let stock = row["count"].as_u64()?;
+            let ticks = u16::try_from(row["use_duration_ticks"].as_u64()?).ok()?;
+            let food = &row["food"];
+            let nutrition = food["nutrition"].as_u64()?;
+            let saturation = food["saturation"].as_f64()?;
+            ((slot <= 8 || slot == 40)
+                && stock > 0
+                && (1..=64).contains(&ticks)
+                && nutrition > 0
+                && row["use_animation"] == "EAT"
+                && row["on_cooldown"] == false
+                && food["can_eat"] == true
+                && MEALS.contains(&item))
+            .then(|| Meal {
+                slot,
+                item: item.to_owned(),
+                stock,
+                hunger,
+                selected,
+                ticks,
+                nutrition,
+                saturation,
+            })
+        })
+        .max_by(|a, b| {
+            a.nutrition
+                .min(20 - hunger)
+                .cmp(&b.nutrition.min(20 - hunger))
+                .then(a.saturation.total_cmp(&b.saturation))
+                .then(
+                    (a.slot == selected || a.slot == 40).cmp(&(b.slot == selected || b.slot == 40)),
+                )
+        })
+}
 
 /// Keep a short trail of positions the player actually reached under threat.
 /// This is local route feedback, never evidence of unseen walkable terrain.
@@ -203,6 +305,45 @@ pub(super) fn defensive_target(o: &Observation) -> Option<i32> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn hungry_body_uses_observed_prepared_food_and_respects_hand_and_control_state() {
+        let mut o = fixture();
+        o.menu = json!({"menu_id":0});
+        o.player["food"] = json!(12);
+        o.player["health"] = json!(16.);
+        o.player["max_health"] = json!(20.);
+        o.player["using_item"] = json!(false);
+        o.player["on_ground"] = json!(true);
+        o.player["selected"] = json!(0);
+        o.player["inventory"] = json!([
+            {"slot":0,"item":"minecraft:spider_eye","count":3,"use_duration_ticks":32,"use_animation":"EAT","on_cooldown":false,"food":{"can_eat":true,"nutrition":8,"saturation":20.0}},
+            {"slot":3,"item":"minecraft:bread","count":2,"use_duration_ticks":32,"use_animation":"EAT","on_cooldown":false,"food":{"can_eat":true,"nutrition":5,"saturation":6.0}}
+        ]);
+        assert!(meal(&o).is_none(), "do not eat during active movement");
+        o.player["control"] = json!(null);
+        assert!(matches!(
+            meal(&o).unwrap().action(),
+            Action::SelectSlot { slot: 3 }
+        ));
+        o.player["selected"] = json!(3);
+        assert!(matches!(
+            meal(&o).unwrap().action(),
+            Action::StartUseItem {
+                hand: Hand::Main,
+                max_ticks: 40
+            }
+        ));
+        o.player["inventory"][1]["slot"] = json!(40);
+        assert!(matches!(
+            meal(&o).unwrap().action(),
+            Action::StartUseItem {
+                hand: Hand::Off,
+                max_ticks: 40
+            }
+        ));
+        o.player["inventory"][1]["food"]["can_eat"] = json!(false);
+        assert!(meal(&o).is_none());
+    }
     fn fixture() -> Observation {
         Observation {
             revision: "1".into(),
