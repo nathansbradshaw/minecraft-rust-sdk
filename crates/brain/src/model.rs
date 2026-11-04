@@ -104,7 +104,7 @@ pub struct Choice {
     #[serde(default)]
     pub experiment: bool,
 }
-pub const TOOLS: [&str; 16] = [
+pub const TOOLS: [&str; 17] = [
     "develop",
     "observe",
     "query",
@@ -120,6 +120,7 @@ pub const TOOLS: [&str; 16] = [
     "run",
     "remember",
     "goal",
+    "report",
     "complete",
 ];
 pub fn schema() -> Value {

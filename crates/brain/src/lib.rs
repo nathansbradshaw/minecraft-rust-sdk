@@ -4,6 +4,7 @@ mod admission;
 #[cfg(test)]
 mod admission_tests;
 pub mod body;
+mod completion;
 pub mod containers;
 pub mod conversation;
 mod discovery;
@@ -109,6 +110,9 @@ pub struct Config {
     pub cargo_target: Option<PathBuf>,
     pub state: PathBuf,
     pub goal: String,
+    /// Optional success checks for this configured goal, not other player goals.
+    #[serde(default)]
+    pub completion_inventory: std::collections::BTreeMap<String, u64>,
     /// Client behavior preferences retained across replaceable gameplay goals.
     /// Empty by default; this does not change server authority or SDK policy.
     #[serde(default)]
@@ -543,6 +547,7 @@ pub struct Brain {
 }
 impl Brain {
     pub async fn open(cfg: Config) -> Result<Self> {
+        completion::validate_config(&cfg)?;
         ensure(
             Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists(),
             "Run the brain inside its isolated container",
@@ -595,7 +600,7 @@ impl Brain {
             "Another brain owns this state directory",
         )?;
         let journal = Journal::open(&cfg.state.join("brain.sqlite"))?;
-        journal.context_contract(&model_context_contract(&cfg.instructions))?;
+        journal.context_contract(&digest(json!({"model":model_context_contract(&cfg.instructions),"configured_completion_goal":cfg.goal,"configured_completion_inventory":cfg.completion_inventory}).to_string().as_bytes()))?;
         let imported = journal.import_program_history(&cfg.state)?;
         if imported > 0 {
             journal.event(
@@ -650,6 +655,10 @@ impl Brain {
                 return Err(e.into());
             }
         };
+        if let Err(error) = completion::bind(&journal, &cfg, &goal, &observed) {
+            let _ = client.disconnect().await;
+            return Err(error);
+        }
         let body = if cfg.body.enabled {
             if ![
                 "minecraft:finite_locomotion",
@@ -967,6 +976,7 @@ impl Brain {
             context["investigation"] = investigation;
             context["deployment_instructions"] = json!(self.cfg.instructions);
             context["project_manifest"] = workspace::manifest_hint(&self.cfg.workspace);
+            context["completion_requirements"] = completion::view(&self.cfg, &self.goal);
             context["inspected_containers"] = self
                 .journal
                 .recalled_containers(&self.server.instance_id, &self.observed)?;

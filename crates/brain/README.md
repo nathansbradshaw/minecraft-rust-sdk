@@ -191,8 +191,18 @@ Normal completion, run-budget exit and handled termination disconnect the SDK
 character rather than leaving it unattended. Abrupt process/container loss still
 needs deployment supervision; this is not a proven background Survival controller.
 
-Model `complete` is recorded as a claim with an observation. It cannot certify an
-evaluation or evidence gate. This initial harness has not established autonomous
+Use `report` for incomplete progress; it leaves the current goal active.
+`complete` requires JSON `{"status":"succeeded","summary":"verified result"}`.
+Optional config `completion_inventory` maps runtime item IDs to positive minimum
+counts (at most eight entries). These checks apply only to the configured `goal`,
+and never carry over to a different player goal. Completion checks a fresh player
+inventory; placed blocks, menu outputs and carried stacks do not count. A newly
+changed contract reopens an incompatible old completion while preserving its
+claim in history. Unchanged criteria preserve historical completion after later
+item loss. These are client behavior checks; editable client code can bypass
+them. Goals without criteria still have only a model success claim.
+
+Model completion cannot certify an evaluation or evidence gate. This initial harness has not established autonomous
 Survival, comprehensive chat delivery, transfer, endurance, fair player-like
 perception, or competitive performance. Those need their own integration and
 native evaluations. The current observation projection inherits the installed
