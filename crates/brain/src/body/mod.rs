@@ -388,6 +388,7 @@ async fn controller(
     let mut cancelled_item_use = String::new();
     let mut progress = tactics::Progress::default();
     let mut projectiles = tactics::Projectiles::default();
+    let mut retreat_trail = tactics::RetreatTrail::default();
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -454,8 +455,15 @@ async fn controller(
         let burning = observed.player["fire_ticks"]
             .as_i64()
             .is_some_and(|n| n > 0);
+        let threatened = geometry::threatened(&observed);
+        let trail = retreat_trail.update(&observed, threatened || incoming);
         let escape = if active["outcome"] != "running" {
-            geometry::evade_with_stationary(&observed, &rejected_routes, &stationary_projectiles)
+            geometry::evade_with_stationary(
+                &observed,
+                &rejected_routes,
+                &stationary_projectiles,
+                &trail,
+            )
         } else {
             None
         };
@@ -467,7 +475,7 @@ async fn controller(
         }
         let danger = dead
             || in_water
-            || geometry::threatened(&observed)
+            || threatened
             || escape.is_some()
             || incoming
             || burning
@@ -586,7 +594,7 @@ async fn controller(
                             rejected_routes.push(key);
                             j.event("body_route_failure",json!({"target":key,"outcome":r.outcome,"error":r.error,"next_action":"try a different observed route; investigate if none works"}))?;
                         }
-                        j.event("body_reaction",json!({"reason":route.reason,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"policy_ms":policy_ms,"dispatch_ms":dispatch_started.elapsed().as_millis(),"observation_ms":observation_ms,"gateway_dispatch_timing":r.evidence["gateway_dispatch_timing"],"adapter_dispatch_timing":r.evidence["adapter_dispatch_timing"],"outcome":r.outcome,"action_id":dispatched_id,"revision":observed.revision,"sample_clock":observed.world["sample_clock"]}))?;
+                        j.event("body_reaction",json!({"reason":route.reason,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"policy_ms":policy_ms,"dispatch_ms":dispatch_started.elapsed().as_millis(),"observation_ms":observation_ms,"gateway_dispatch_timing":r.evidence["gateway_dispatch_timing"],"adapter_dispatch_timing":r.evidence["adapter_dispatch_timing"],"outcome":r.outcome,"action_id":dispatched_id,"revision":observed.revision,"sample_clock":observed.world["sample_clock"],"recent_retreat_points":trail.len()}))?;
                         // Start displacement before waiting on the optional
                         // sprint modifier's effect verification. This first
                         // trajectory uses its observed walking speed; the next
