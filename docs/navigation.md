@@ -6,6 +6,14 @@ The matching adapter must advertise `minecraft:movement_options`. It computes
 paged, read-only predictions using the same collision, gravity and cancellation
 admission as finite controls. No prediction is an executed game effect.
 
+For direct diagnostic queries, `minecraft:movement_options` accepts `offset`,
+an optional nearby `target`, and `limit` (1–64, default 64). For example,
+`{"offset":0,"limit":4}` bounds a page to four evaluated candidates and at most
+four returned waypoints. Follow `next_offset` until `complete`, retaining pages
+only while origin and scene match. A candidate may yield no waypoint, so an
+empty page does not imply completion. Smaller pages bound output, not a new
+movement capability or evidence that the goal is reachable.
+
 ```json
 {"kind":"position","dimension":"example:dimension","target":[12.5,64.0,8.5],"distance":0.25}
 ```
