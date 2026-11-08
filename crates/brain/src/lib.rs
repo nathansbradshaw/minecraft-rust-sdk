@@ -135,7 +135,7 @@ fn conversation_default() -> bool {
     true
 }
 fn model_context_contract(instructions: &str) -> String {
-    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v2/bounded-investigation-routing-v2","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v2/bounded-investigation-routing-v2/native-navigation-feedback-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
@@ -419,18 +419,20 @@ impl Journal {
         source: &str,
         goal_revision: &str,
     ) -> Result<bool> {
-        if !["terminal", "run"].contains(&choice.tool.as_str())
-            || (choice.tool != "run"
-                && !choice.experiment
-                && result["local_action_feedback"]["requests"]
-                    .as_array()
-                    .is_none_or(Vec::is_empty))
+        let navigation = choice.tool == "navigate" && result["navigation"].is_object();
+        if !navigation
+            && (!["terminal", "run"].contains(&choice.tool.as_str())
+                || (choice.tool != "run"
+                    && !choice.experiment
+                    && result["local_action_feedback"]["requests"]
+                        .as_array()
+                        .is_none_or(Vec::is_empty)))
         {
             return Ok(false);
         }
         let signature = progress::experiment_signature(source, result);
         let novel = self.get("experiment_signature")?.as_deref() != Some(signature.as_str());
-        let mut saved = json!({"command":choice.input,"summary":choice.summary,"source_sha256":source,"goal_revision":goal_revision,"signature":signature,"result":result,"authority":"container diagnostics, not benchmark/native certification"});
+        let mut saved = json!({"tool":choice.tool,"command":choice.input,"summary":choice.summary,"source_sha256":source,"goal_revision":goal_revision,"signature":signature,"result":result,"authority":"container diagnostics, not benchmark/native certification"});
         compact_history(&mut saved);
         bound_value(&mut saved, 8192);
         self.set("last_experiment", &saved.to_string())?;
@@ -1684,6 +1686,64 @@ mod tests {
         assert_eq!(context["deployment_instructions"], instructions);
         assert_eq!(context["goal"], "new player task");
         assert!(context.to_string().len() <= 32768);
+    }
+    #[test]
+    fn builtin_navigation_replaces_stale_program_feedback_without_polling_credit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.sqlite");
+        let j = Journal::open(&path).unwrap();
+        let mut choice = model::Choice {
+            tool: "run".into(),
+            input: "cargo run".into(),
+            path: String::new(),
+            summary: "old program".into(),
+            notes: String::new(),
+            experiment: true,
+        };
+        assert!(
+            j.experiment(
+                &choice,
+                &json!({"success":false,"exit_code":101}),
+                "source",
+                "goal"
+            )
+            .unwrap()
+        );
+        j.set("active_diagnostic_feedback", &json!({"goal_revision":"goal",
+            "experiment_signature":j.get("experiment_signature").unwrap(),"error":"old oversized query"}).to_string()).unwrap();
+        choice.tool = "navigate".into();
+        choice.experiment = false;
+        choice.input = "typed goal".into();
+        let mut result = json!({"success":false,"exit_code":0,"navigation":{"report":{
+            "status":"budget_exhausted","elapsed_ms":100,"journal":"old/path","pending_action":null,
+            "remaining_distance":12.0}},"local_action_feedback":{"requests":[]}});
+        assert!(j.experiment(&choice, &result, "source", "goal").unwrap());
+        let saved: Value =
+            serde_json::from_str(&j.get("last_experiment").unwrap().unwrap()).unwrap();
+        assert_eq!(saved["tool"], "navigate");
+        assert_eq!(
+            saved["result"]["navigation"]["report"]["status"],
+            "budget_exhausted"
+        );
+        assert!(j.diagnostic_context("goal").unwrap().is_null());
+        result["navigation"]["report"]["elapsed_ms"] = json!(999);
+        result["navigation"]["report"]["journal"] = json!("new/path");
+        result["navigation"]["report"]["remaining_distance"] = json!(11.99);
+        choice.input = "same stalled world with a slightly different requested radius".into();
+        drop(j);
+        let j = Journal::open(&path).unwrap();
+        assert!(!j.experiment(&choice, &result, "source", "goal").unwrap());
+        result["navigation"]["report"]["status"] = json!("no_known_route");
+        assert!(j.experiment(&choice, &result, "source", "goal").unwrap());
+        choice.tool = "query".into();
+        assert!(
+            !j.experiment(&choice, &json!({"success":true}), "source", "goal")
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&j.get("last_experiment").unwrap().unwrap()).unwrap()["tool"],
+            "navigate"
+        );
     }
     #[test]
     fn inspections_cannot_replace_the_last_experiment_or_reset_a_repeated_failure() {
