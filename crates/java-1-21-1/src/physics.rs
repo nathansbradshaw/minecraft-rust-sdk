@@ -78,6 +78,9 @@ pub struct Parameters {
     pub water_efficiency: f64,
     pub dolphins_grace: bool,
     pub sprinting: bool,
+    /// Native facing at takeoff, in Minecraft degrees. Sprint jumping adds
+    /// forward momentum even when the held movement input points elsewhere.
+    pub yaw_degrees: f64,
     pub slow_falling: bool,
     pub levitation: Option<u8>,
     pub no_gravity: bool,
@@ -96,6 +99,7 @@ impl Default for Parameters {
             water_efficiency: 0.,
             dolphins_grace: false,
             sprinting: false,
+            yaw_degrees: 0.,
             slow_falling: false,
             levitation: None,
             no_gravity: false,
@@ -118,7 +122,16 @@ impl Body {
         let friction_ground = self.on_ground;
         if jump {
             match p.medium {
-                Medium::Air if self.on_ground => self.velocity[1] = p.jump_velocity,
+                Medium::Air if self.on_ground && p.jump_velocity > 1.0e-5 => {
+                    self.velocity[1] = p.jump_velocity;
+                    // Java 1.21.1 LivingEntity.jumpFromGround. This is a
+                    // takeoff impulse, not a held airborne acceleration.
+                    if p.sprinting {
+                        let yaw = p.yaw_degrees.to_radians();
+                        self.velocity[0] -= yaw.sin() * 0.2;
+                        self.velocity[2] += yaw.cos() * 0.2;
+                    }
+                }
                 Medium::Water | Medium::Lava => self.velocity[1] += 0.04,
                 _ => {}
             }
@@ -217,6 +230,41 @@ impl Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sprint_takeoff_uses_facing_once_and_release_preserves_its_momentum() {
+        let floor = [-20., 0., -20., 20., 1., 20.];
+        for (yaw, expected) in [
+            (0., [0., 0.2]),
+            (90., [-0.2, 0.]),
+            (-90., [0.2, 0.]),
+            (180., [0., -0.2]),
+        ] {
+            let mut b = Body {
+                position: [0., 1., 0.],
+                velocity: [0.; 3],
+                on_ground: true,
+            };
+            let p = Parameters {
+                sprinting: true,
+                yaw_degrees: yaw,
+                ..Parameters::default()
+            };
+            b.tick([0.; 3], true, p, &[floor]);
+            assert!((b.position[0] - expected[0]).abs() < 1e-7);
+            assert!((b.position[2] - expected[1]).abs() < 1e-7);
+            assert!((b.position[1] - 1.42).abs() < 1e-7);
+            let airborne_velocity = b.velocity;
+            // Another held jump in air cannot add a second impulse. Releasing
+            // movement likewise cannot erase native takeoff momentum.
+            let mut held = b;
+            held.tick([0.; 3], true, p, &[floor]);
+            b.tick([0.; 3], false, p, &[floor]);
+            assert_eq!(held.position, b.position);
+            assert_eq!(held.velocity, b.velocity);
+            assert!((b.position[0] - expected[0] - airborne_velocity[0]).abs() < 1e-7);
+            assert!((b.position[2] - expected[1] - airborne_velocity[2]).abs() < 1e-7);
+        }
+    }
     #[test]
     fn input_release_and_idle_support_removal_continue_ballistic_motion() {
         let floor = [-20., 0., -20., 20., 1., 20.];

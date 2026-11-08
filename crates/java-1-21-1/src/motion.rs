@@ -190,6 +190,11 @@ fn parameters(o: &Observation) -> AnyResult<Parameters> {
             .filter(|n| *n >= 0)
             .and_then(|n| u8::try_from(n).ok()),
         sprinting: o.player["sprinting"] == true,
+        yaw_degrees: if o.player["sprinting"] == true {
+            number(&o.player, "yaw", -36_000_000., 36_000_000.)?
+        } else {
+            0.
+        },
         medium: if o.player["in_water"] == true {
             Medium::Water
         } else if o.player["in_lava"] == true {
@@ -857,6 +862,22 @@ mod tests {
             player: json!({"uuid":"fixture","dimension":"minecraft:overworld","position":[0.5,1.,0.5],"velocity":[0.,0.,0.],"health":20.,"movement_speed":0.1,"on_ground":true,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
             world: json!({"blocks":blocks}),
         }
+    }
+    #[test]
+    fn sprint_jump_prediction_uses_native_facing_and_rejects_missing_yaw() {
+        let mut o = input_prediction_fixture();
+        o.player["sprinting"] = json!(true);
+        o.player["movement_speed"] = json!(0.13);
+        o.player["yaw"] = json!(-90.);
+        let frames = preview(&o, [3.5, 1., 0.5], true).unwrap();
+        assert!((frames[0].0[0] - 0.83).abs() < 1e-6);
+        assert!((frames[0].0[2] - 0.5).abs() < 1e-6);
+        o.player["yaw"] = json!(0.);
+        let frames = preview(&o, [3.5, 1., 0.5], true).unwrap();
+        assert!((frames[0].0[0] - 0.63).abs() < 1e-6);
+        assert!((frames[0].0[2] - 0.7).abs() < 1e-6);
+        o.player.as_object_mut().unwrap().remove("yaw");
+        assert!(preview(&o, [3.5, 1., 0.5], true).is_err());
     }
     #[test]
     fn longer_local_input_still_requires_observed_swept_geometry() {
