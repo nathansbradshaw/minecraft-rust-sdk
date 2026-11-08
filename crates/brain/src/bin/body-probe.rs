@@ -30,6 +30,10 @@ async fn main() -> Result<()> {
     cfg.body.enabled = true;
     let mut brain = Brain::open(cfg).await?;
     let started = Instant::now();
+    let initial_scene = brain.client.observe().await?;
+    brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
+        "scope":"Full SDK observation for this diagnostic; body may already be acting. Not an earlier frozen-trial scene.",
+        "observation":initial_scene}))?;
     brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler."}))?;
     let run=async {
         if args[1]=="compile" {
@@ -46,6 +50,9 @@ async fn main() -> Result<()> {
         if started.elapsed()<Duration::from_secs(seconds) {tokio::time::sleep(Duration::from_secs(seconds)-started.elapsed()).await;}
         let observed=brain.client.observe().await?;
         brain.journal.event("body_probe_finished",json!({"elapsed_ms":started.elapsed().as_millis(),"health":observed.player["health"],"food":observed.player["food"],"position":observed.player["position"],"revision":observed.revision,"body":brain.body.as_ref().map(|b|b.shared.view()),"models_called":0,"ordinary_respawn_is_not_survival_success":true}))?;
+        brain.journal.event("body_probe_scene",json!({"phase":"before_body_stop",
+            "scope":"Full SDK observation; final session disconnect and saved player state follow separately",
+            "observation":observed}))?;
         Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
     }.await;
     if let Some(body) = brain.body.take() {
