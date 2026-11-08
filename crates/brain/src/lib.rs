@@ -1000,6 +1000,7 @@ impl Brain {
                 self.refresh().await?;
             };
             let pending = self.journal.get("pending_action")?.unwrap_or_default();
+            let active_work = preferred || investigation_left > 0;
             let activity: Value = self
                 .journal
                 .get("activity")?
@@ -1007,6 +1008,18 @@ impl Brain {
                 .unwrap_or(json!([]));
             let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
+            context["diagnostic_feedback"] = self
+                .journal
+                .diagnostic_context(&self.journal.get("goal_revision")?.unwrap_or_default())?;
+            context["decision_session"] = json!({
+                "role":if develop {"sol"} else {"luna"},
+                "requested_model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},
+                "mode":if investigation_left>0 {"investigation"} else if active_work {"development"} else {"routine"},
+                "investigation_decisions_including_this":investigation_left,
+                "following_development_decisions":self.journal.get("development_turns_remaining")?.and_then(|s|s.parse::<u32>().ok()).unwrap_or(0),
+                "develop_available":!active_work,
+                "routing_note":if active_work {"Work mode is already active: choose a diagnostic, edit, execution or gameplay command; do not request development mode again."} else {"Use develop to request a bounded coding session when needed."}
+            });
             context["deployment_instructions"] = json!(self.cfg.instructions);
             context["project_manifest"] = workspace::manifest_hint(&self.cfg.workspace);
             context["completion_requirements"] = completion::view(&self.cfg, &self.goal);
@@ -1040,9 +1053,9 @@ impl Brain {
                     None => None,
                 };
                 if let Some(journal) = &worker_journal {
-                    worker::choose(&worker_cfg, journal, &context, develop, preferred).await
+                    worker::choose(&worker_cfg, journal, &context, develop, active_work).await
                 } else {
-                    model.choose_for(&context, develop, preferred).await
+                    model.choose_for(&context, develop, active_work).await
                 }
             };
             tokio::pin!(future);
@@ -1101,9 +1114,10 @@ impl Brain {
             if !choice.notes.is_empty() {
                 self.journal.set("working_notes", &choice.notes)?;
             }
-            if choice.tool == "develop"
-                || (!develop
-                    && (choice.tool == "write" || (choice.tool == "terminal" && choice.experiment)))
+            if !active_work
+                && (choice.tool == "develop"
+                    || choice.tool == "write"
+                    || (choice.tool == "terminal" && choice.experiment))
             {
                 self.journal.request_development()?;
             } else if choice.tool == "complete" {

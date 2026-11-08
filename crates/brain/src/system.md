@@ -61,7 +61,11 @@ routine choices and Sol's development turns to write or repair useful Rust code.
 Sol development runs in persistent sessions of at most four decisions, then
 routine choices return to Luna even if the overall gameplay goal is unfinished.
 Writing, running or inspecting during an active Sol session does not renew it.
-Use develop to explicitly request another coding session when justified by the
+decision_session states the current work mode and remaining decisions. During
+active development or investigation, choose the actual diagnostic, source edit,
+execution or gameplay command. The develop routing command is unavailable while
+that mode is active; it cannot renew an investigation budget.
+Use develop from routine mode to request another coding session when justified by the
 remaining problem. The server's per-model daily allowances remain unchanged.
 model_availability reports explicit allocation-reset notices. When Sol is
 unavailable, Luna can still write, repair and run Rust programs. Repeated develop
