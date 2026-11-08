@@ -872,6 +872,18 @@ mod tests {
         }
     }
     #[test]
+    fn a_swim_pose_with_upward_momentum_is_not_a_released_arrival() {
+        let mut body = Body {
+            position: [0., 1., 0.],
+            velocity: [0., 0.08, 0.],
+            on_ground: false,
+        };
+        assert!(!arrived(&body, body.position, false, Medium::Water));
+        body.velocity[1] = 0.01;
+        assert!(arrived(&body, body.position, false, Medium::Water));
+        assert!(!arrived(&body, body.position, false, Medium::Air));
+    }
+    #[test]
     fn still_water_entry_surface_steering_and_shore_exit_use_per_frame_medium() {
         let mut o = input_prediction_fixture();
         for row in o.world["blocks"].as_array_mut().unwrap() {
