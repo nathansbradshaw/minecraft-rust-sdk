@@ -45,6 +45,13 @@ while its caller is idle. The reference body permits surface swimming only
 with native eyes-clear/full-air facts; submersion, reduced air or missing facts
 retain protective behavior independently of reasoning and compilation.
 
+`cargo run -p minecraft-sdk --example cancel_waypoint -- PROFILE PREFIX X Y Z`
+is a bounded conformance probe for a connected disposable character. It submits
+a finite waypoint, samples after 150 ms, cancels in the same process, verifies
+the original cancelled outcome and native input release, then disconnects.
+Use fresh IDs and a permitted observed target that cannot complete before the
+sample. It does not prepare a world or establish autonomous gameplay competence.
+
 The client journal is a private local file, distinct from the trusted server
 journal. It binds instance, character and goal, takes an exclusive invocation
 lock, and persists an intention before dispatch. Resume with the same file;

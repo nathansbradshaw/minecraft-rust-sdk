@@ -131,6 +131,13 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   it never mines, teleports, breaks obstacles or chooses your task.
   The brain's navigate tool composes this same helper through its body arbiter;
   use it for a bounded route rather than one model turn per local waypoint.
+  With alpha12 minecraft:fluid_facts, the adapter predicts still-water medium
+  transitions and offers observed surface-water waypoints. Fluid height/tags/flow
+  come from native observations, including waterlogged cells; currents, lava or
+  unsupported fluid physics fail explicitly. A finite swim releases input on
+  completion; it does not hold position while planning. The independent body
+  permits active surface swimming only with native eyes-clear/full-air facts,
+  and protects a submerged character while reasoning or compilation continues.
 - Put its journal under MC_SDK_STATE, using a distinct file per goal. Reuse that
   journal to resume; pending IDs are inspected rather than replayed. Options
   controls operation deadline, actions, nodes and caller-supplied forbidden block
