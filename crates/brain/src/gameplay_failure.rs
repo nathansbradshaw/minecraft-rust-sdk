@@ -41,10 +41,7 @@ impl Journal {
         let identity = json!({"goal_revision":revision,"action":intention(action)?,
             "outcome":receipt.outcome,"error_code":receipt.error.as_ref().map(|e|&e.code)});
         let key = digest(identity.to_string().as_bytes());
-        if self.get("gameplay_failure_revision")?.as_deref() == Some(key.as_str()) {
-            return Ok(false);
-        }
-        self.set("gameplay_failure_revision", &key)?;
+        let changed = self.get("gameplay_failure_revision")?.as_deref() != Some(key.as_str());
         let action_value = serde_json::to_value(action)?;
         let action_bytes = serde_json::to_vec(&action_value)?;
         let request = if action_bytes.len() <= 2048 {
@@ -59,6 +56,12 @@ impl Journal {
             "error":error,"selected_before":before.player["selected"].as_i64(),
             "scope":"Historical direct SDK failure, not a current world fact or effect proof. Inspect/reconcile uncertain IDs; do not replay them under a new ID."});
         self.set("gameplay_failure_context", &witness.to_string())?;
+        // Refresh the status/reconciliation reference even when this diagnosis
+        // stays exhausted. A newer receipt is not a new reasoning allowance.
+        if !changed {
+            return Ok(false);
+        }
+        self.set("gameplay_failure_revision", &key)?;
         self.event("gameplay_failure_scoped",json!({"revision":key,"action_id":receipt.action_id,
             "outcome":receipt.outcome,"provider_allowances_changed":false,"mutation_replayed":false}))?;
         Ok(true)
@@ -232,6 +235,10 @@ mod tests {
                 .unwrap()
         );
         assert!(j.gameplay_failure_context(&revision).unwrap().is_object());
+        assert_eq!(
+            j.gameplay_failure_context(&revision).unwrap()["action_id"],
+            "second"
+        );
         assert!(
             j.gameplay_failure_context("another goal")
                 .unwrap()
