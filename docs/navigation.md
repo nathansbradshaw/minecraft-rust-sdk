@@ -31,6 +31,27 @@ action/node budgets and forbidden runtime block IDs. No block policy is imposed
 by the core helper. Unknown terrain cannot be assumed to be air. No known route
 is a report about the explored graph, not proof that the world has no route.
 
+The alpha12 NeoForge integration adds `minecraft:fluid_facts`: versioned native
+fluid tags, occupied height, and known flow for each observed cell, plus the
+character's `eyes_in_water`. The matching Rust predictor changes medium at each
+predicted body position and offers observed still-water surface waypoints.
+Flowing/unknown currents, lava transitions and fluids without supported physics
+return explicit admission errors; a water tag does not promise compatibility
+with arbitrary modded fluid behavior. Older installations retain their existing
+admission and do not gain transition support from the client alone.
+
+A completed finite swim releases input. It does not keep a character afloat
+while its caller is idle. The reference body permits surface swimming only
+with native eyes-clear/full-air facts; submersion, reduced air or missing facts
+retain protective behavior independently of reasoning and compilation.
+
+`cargo run -p minecraft-sdk --example cancel_waypoint -- PROFILE PREFIX X Y Z`
+is a bounded conformance probe for a connected disposable character. It submits
+a finite waypoint, samples after 150 ms, cancels in the same process, verifies
+the original cancelled outcome and native input release, then disconnects.
+Use fresh IDs and a permitted observed target that cannot complete before the
+sample. It does not prepare a world or establish autonomous gameplay competence.
+
 The client journal is a private local file, distinct from the trusted server
 journal. It binds instance, character and goal, takes an exclusive invocation
 lock, and persists an intention before dispatch. Resume with the same file;

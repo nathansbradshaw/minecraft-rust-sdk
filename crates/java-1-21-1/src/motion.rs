@@ -83,6 +83,7 @@ struct Scene {
     boxes: Vec<[f64; 6]>,
     cells: std::collections::HashSet<[i32; 3]>,
     surfaces: Vec<([f64; 6], f64, f64)>,
+    fluids: Option<fluids::Volumes>,
 }
 impl Scene {
     fn new(o: &Observation) -> AnyResult<Self> {
@@ -124,6 +125,7 @@ impl Scene {
             boxes,
             cells,
             surfaces,
+            fluids: fluids::Volumes::new(o.world["blocks"].as_array().ok_or("Terrain missing")?)?,
         })
     }
     fn covers(&self, from: [f64; 3], to: [f64; 3], p: Parameters) -> bool {
@@ -223,6 +225,7 @@ fn arrived(body: &Body, target: [f64; 3], needs_jump: bool, medium: Medium) -> b
     (!needs_jump || medium != Medium::Air)
         && distance(body.position, target) < 0.08
         && body.velocity[0].hypot(body.velocity[2]) < 0.025
+        && (medium == Medium::Air || body.velocity[1].abs() < 0.025)
         && (body.on_ground || medium != Medium::Air)
 }
 fn steering(
@@ -284,7 +287,13 @@ fn steering(
     if jump && p.medium == Medium::Air {
         *needs_jump = false;
     }
-    if p.medium != Medium::Air && target[1] > body.position[1] + 0.1 {
+    if p.medium == Medium::Water {
+        // Pulse ordinary swim-up input to approach the requested height with
+        // low momentum. Waiting for a fixed height error builds an upward
+        // impulse that overshoots on release or oscillates until expiry.
+        let desired_vertical = ((target[1] - body.position[1]) * 0.5).clamp(-0.1, 0.1);
+        jump = body.velocity[1] < desired_vertical - 0.02;
+    } else if p.medium != Medium::Air && target[1] > body.position[1] + 0.1 {
         jump = true;
     }
     Ok((change, jump))
@@ -302,13 +311,18 @@ pub(super) fn preview(
     let mut needs_jump = jump;
     let mut frames = Vec::new();
     for _ in 0..100 {
-        if arrived(&body, target, needs_jump, params.medium) {
+        let medium = match &scene.fluids {
+            Some(v) => v.medium(body.position, params.width, params.height)?,
+            None => params.medium,
+        };
+        if arrived(&body, target, needs_jump, medium) {
             return Ok(frames);
         }
         let (friction, speed_factor) = scene.surface(&body, params.width);
         let p = Parameters {
             friction,
             speed_factor,
+            medium,
             ..params
         };
         let (acceleration, jump) = steering(&body, target, &mut needs_jump, o, p)?;
@@ -537,6 +551,20 @@ impl Actor {
                             }
                             if let Ok(mut receipt) = d.state.lock() {
                                 receipt.evidence["server_momentum"] = d.momentum_evidence();
+                            }
+                        }
+                    }
+                    let mut p = p;
+                    if let Some(fluids) = &snapshot.scene.fluids {
+                        match fluids.medium(e.body.position, p.width, p.height) {
+                            Ok(medium) => p.medium = medium,
+                            Err(reason) => {
+                                if let Some(d) = e.drive.take() {
+                                    finish_interrupted(
+                                        d,
+                                        &format!("Fluid conditions changed: {reason}"),
+                                    );
+                                }
                             }
                         }
                     }
@@ -862,6 +890,53 @@ mod tests {
             player: json!({"uuid":"fixture","dimension":"minecraft:overworld","position":[0.5,1.,0.5],"velocity":[0.,0.,0.],"health":20.,"movement_speed":0.1,"on_ground":true,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
             world: json!({"blocks":blocks}),
         }
+    }
+    #[test]
+    fn a_swim_pose_with_upward_momentum_is_not_a_released_arrival() {
+        let mut body = Body {
+            position: [0., 1., 0.],
+            velocity: [0., 0.08, 0.],
+            on_ground: false,
+        };
+        assert!(!arrived(&body, body.position, false, Medium::Water));
+        body.velocity[1] = 0.01;
+        assert!(arrived(&body, body.position, false, Medium::Water));
+        assert!(!arrived(&body, body.position, false, Medium::Air));
+    }
+    #[test]
+    fn still_water_entry_surface_steering_and_shore_exit_use_per_frame_medium() {
+        let mut o = input_prediction_fixture();
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            let water = row["position"][0].as_i64().unwrap() >= 1
+                && (-2..=0).contains(&row["position"][1].as_i64().unwrap());
+            row["fluid"] = json!({"format":"java767-fluid-v1","empty":!water,
+                "water":water,"lava":false,"height":if row["position"][1]==0 {0.8888889}else{1.},
+                "flow_known":true,"flow":[0,0,0]});
+            if water {
+                row["collision"] = json!([]);
+            }
+        }
+        let target = [2.5, 0.5, 0.5];
+        let entered = preview(&o, target, false).expect("dry to observed still water");
+        assert!(distance(entered.last().unwrap().0, target) < 0.08);
+        o.player["position"] = json!(target);
+        o.player["on_ground"] = json!(false);
+        o.player["in_water"] = json!(true);
+        let shore = [0.5, 1., 0.5];
+        let exited = preview(&o, shore, false).expect("observed shore exit");
+        assert!(distance(exited.last().unwrap().0, shore) < 0.08);
+        assert!(exited.last().unwrap().1);
+        let swim = preview(&o, [3.5, 0.5, 0.5], false).expect("surface swim");
+        assert!(distance(swim.last().unwrap().0, [3.5, 0.5, 0.5]) < 0.08);
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            if row["fluid"]["water"] == true {
+                row["fluid"]["flow"] = json!([0.2, 0, 0]);
+            }
+        }
+        assert!(
+            preview(&o, [3.5, 0.5, 0.5], false).is_err(),
+            "currents are explicitly unsupported"
+        );
     }
     #[test]
     fn sprint_jump_prediction_uses_native_facing_and_rejects_missing_yaw() {

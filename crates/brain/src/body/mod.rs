@@ -491,13 +491,13 @@ async fn controller(
         if dead {
             last_meal = None;
         }
-        let in_water = geometry::water_danger(&observed);
+        let water_emergency = geometry::water_danger(&observed);
         if cycles.is_multiple_of(10) || observed.player["health"] != previous_health {
-            j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"air":observed.player["air"],"max_air":observed.player["max_air"],"in_water":in_water,"in_lava":observed.player["in_lava"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming,"incoming_projectile_ids":incoming_projectiles,"stationary_projectile_ids":stationary_projectiles,"stationary_scope":"client inference from advancing native positions, not a server flight flag or future guarantee"}))?;
+            j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"air":observed.player["air"],"max_air":observed.player["max_air"],"in_water":observed.player["in_water"],"eyes_in_water":observed.player["eyes_in_water"],"water_emergency":water_emergency,"in_lava":observed.player["in_lava"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming,"incoming_projectile_ids":incoming_projectiles,"stationary_projectile_ids":stationary_projectiles,"stationary_scope":"client inference from advancing native positions, not a server flight flag or future guarantee"}))?;
             previous_health = observed.player["health"].clone();
         }
         let danger = dead
-            || in_water
+            || water_emergency
             || threatened
             || escape.is_some()
             || incoming
@@ -575,7 +575,7 @@ async fn controller(
                 && (active["action_id"].as_str() != Some(&owned_control)
                     || new_projectile
                     || toward_threat
-                    || (in_water && !owned_water_control)
+                    || (water_emergency && !owned_water_control)
                     || stuck)
             {
                 if active["cancel_requested"] != true
@@ -631,7 +631,7 @@ async fn controller(
                         let dispatched_id = r.action_id.clone();
                         if r.outcome == Outcome::Running {
                             owned_control = dispatched_id.clone();
-                            owned_water_control = in_water;
+                            owned_water_control = water_emergency;
                             owned_projectiles = incoming_projectiles.clone();
                         } else {
                             rejected_routes.push(key);
