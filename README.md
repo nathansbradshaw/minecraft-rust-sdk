@@ -89,6 +89,14 @@ takeoff direction before a forward sprint jump. Cancellation releases input
 while gravity and momentum continue. Native trajectory calibration is separate
 from surviving a particular hazard or fuse.
 
+For declared native motor conformance, `cargo run -p minecraft-sdk --example
+movement_handoff -- CONNECTED_PROFILE UNIQUE_PREFIX NEW_REPORT.jsonl` records a
+run-up, explicitly verified input release, and a hop using fresh durable IDs.
+Prepare a disposable sprinting character on known flat ground with a clear
+eastbound corridor of at least five blocks; face east for a forward takeoff.
+The example records a cancelled-input handoff, not seamless full-speed
+retargeting. It cannot prepare a world, connect a character, or grant privileges.
+
 Every mutation needs a stable unique action ID. The same ID with the same action
 returns its original receipt. Reusing it for another action is an error.
 `observed` means the adapter obtained action-specific native evidence.
