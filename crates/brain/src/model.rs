@@ -275,7 +275,7 @@ impl Model {
             .ok_or("Model content missing")?;
         Ok((
             content.to_owned(),
-            json!({"model":model,"purpose":purpose,"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":crate::digest(context.as_bytes()),"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
+            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":crate::digest(context.as_bytes()),"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
         ))
     }
     async fn request_transport(&self, body: &Value) -> Result<(Value, usize, u8)> {
@@ -408,7 +408,7 @@ mod tests {
                     }
                     let choice = json!({"tool":"sdk","input":"{\"kind\":\"look\",\"yaw\":0.0,\"pitch\":0.0}","path":"","summary":"Look","notes":"","experiment":false});
                     let reply =
-                        json!({"done":true,"message":{"content":choice.to_string()}}).to_string();
+                        json!({"done":true,"provider_model":"gpt-5.6-luna","message":{"content":choice.to_string()}}).to_string();
                     socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
                 }
                 requests
@@ -428,6 +428,7 @@ mod tests {
             assert_eq!(choice.tool, "sdk");
             assert_eq!(usage["transport_attempts"], 2);
             assert_eq!(usage["host_tools_executed"], false);
+            assert_eq!(usage["provider_model"], "gpt-5.6-luna");
             let requests = upstream.await.unwrap();
             assert_eq!(requests.len(), 2);
             assert_eq!(
