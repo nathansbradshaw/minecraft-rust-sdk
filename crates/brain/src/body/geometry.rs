@@ -118,7 +118,9 @@ pub(super) struct Admitted {
 }
 /// Client behavior only: ranged actors must not be declared safe at melee range.
 pub fn threat_radius(entity: &Value) -> f64 {
-    if entity["ranged_attack"] == true {
+    if super::aerial::diver(entity) {
+        32.
+    } else if entity["ranged_attack"] == true {
         24.
     } else if entity["creeper"]["powered"] == true {
         14.
@@ -456,7 +458,7 @@ pub(super) fn evade_with_native(
             .sum::<f64>()
             .sqrt();
         if e["hostile"] == true && d < threat_radius(e) {
-            threats.push((p, e["ranged_attack"] == true));
+            threats.push((p, e["ranged_attack"] == true, super::aerial::diver(e)));
             if let Some(radius) = primed_blast(e)
                 && d <= radius + 2.
                 && blasts.len() < 4
@@ -480,7 +482,7 @@ pub(super) fn evade_with_native(
                     .sqrt();
                 if (0.0..=12.).contains(&t) && miss < 1.5 {
                     projectile_danger = true;
-                    threats.push((p, true));
+                    threats.push((p, true, false));
                     incoming_directions.push(v);
                 }
             }
@@ -499,15 +501,36 @@ pub(super) fn evade_with_native(
         .collect();
     let obstacles = boxes(o);
     let blast_escape = !blasts.is_empty();
+    // Begin approaching observed refuge before a dive reaches melee range.
+    // Only safe, supported floor centres participate; no unseen shelter is invented.
+    let seek_refuge = threats.iter().any(|(_, _, aerial)| *aerial)
+        && !blast_escape
+        && !projectile_danger
+        && !burning;
+    let refuges: Vec<_> = if seek_refuge {
+        obstacles
+            .iter()
+            .map(|b| [(b[0] + b[3]) / 2., b[4], (b[2] + b[5]) / 2.])
+            .filter(|p| {
+                (p[0] - start[0]).hypot(p[2] - start[2]) <= 6.
+                    && (p[1] - start[1]).abs() <= 1.
+                    && super::aerial::roofed(*p, &obstacles)
+                    && supported(&cells, *p, &obstacles)
+                    && clear(&cells, *p, &obstacles)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let score = |p: [f64; 3]| -> f64 {
         let distance = threats
             .iter()
-            .map(|(e, _)| ((p[0] - e[0]).powi(2) + (p[2] - e[2]).powi(2)).sqrt())
+            .map(|(e, _, _)| ((p[0] - e[0]).powi(2) + (p[2] - e[2]).powi(2)).sqrt())
             .fold(30., f64::min);
         let cover = threats
             .iter()
-            .filter(|(e, _)| covered(p, *e, &obstacles))
-            .map(|(_, ranged)| if *ranged { 24. } else { 4. })
+            .filter(|(e, _, _)| covered(p, *e, &obstacles))
+            .map(|(_, ranged, _)| if *ranged { 24. } else { 4. })
             .sum::<f64>();
         let sidestep = incoming_directions
             .iter()
@@ -525,8 +548,8 @@ pub(super) fn evade_with_native(
         // distance and cover still reward outward progress and protected routes.
         let ranged_lateral = threats
             .iter()
-            .filter(|(_, ranged)| *ranged)
-            .map(|(enemy, _)| {
+            .filter(|(_, ranged, _)| *ranged)
+            .map(|(enemy, _, _)| {
                 let dx = start[0] - enemy[0];
                 let dz = start[2] - enemy[2];
                 let length = dx.hypot(dz);
@@ -557,7 +580,25 @@ pub(super) fn evade_with_native(
             })
             .reduce(f64::min)
             .unwrap_or(0.0);
-        distance * 2. + cover + sidestep * 8. + ranged_lateral * 2. + blast_safety * 48.0
+        // Never buy aerial cover by moving next to another observed melee threat.
+        let refuge_safe = !threats.iter().any(|(enemy, _, aerial)| {
+            !aerial && (0..3).map(|i| (p[i] - enemy[i]).powi(2)).sum::<f64>() < 4.5_f64.powi(2)
+        });
+        let refuge = if seek_refuge && refuge_safe {
+            let approach = refuges
+                .iter()
+                .map(|q| (6. - (p[0] - q[0]).hypot(p[2] - q[2])).max(0.) * 4.)
+                .fold(0., f64::max);
+            approach
+                + if super::aerial::roofed(p, &obstacles) {
+                    60.
+                } else {
+                    0.
+                }
+        } else {
+            0.
+        };
+        distance * 2. + cover + sidestep * 8. + ranged_lateral * 2. + blast_safety * 48.0 + refuge
     };
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
@@ -675,6 +716,8 @@ pub(super) fn evade_with_native(
                         "evade incoming projectile"
                     } else if burning {
                         "leave burning terrain"
+                    } else if seek_refuge && !refuges.is_empty() {
+                        "approach observed low-roof refuge from flying attacker"
                     } else {
                         "increase threat distance and seek cover"
                     }
@@ -704,6 +747,41 @@ mod tests {
             world: json!({"blocks":blocks,"entities":[{"visible":true,"hostile":true,"position":[2.5,1.,0.5]}]}),
             menu: Value::Null,
         }
+    }
+    #[test]
+    fn visible_phantom_is_detected_before_the_melee_radius() {
+        let mut o = world();
+        o.world["entities"] = json!([{"entity_id":9,"type":"minecraft:phantom","visible":true,"hostile":true,"position":[-12.,20.,0.5]}]);
+        assert!(threatened(&o));
+        o.world["entities"][0]["visible"] = json!(false);
+        assert!(!threatened(&o));
+        o.world["entities"][0]["visible"] = json!(true);
+        o.world["entities"][0]["type"] = json!("minecraft:zombie");
+        assert!(!threatened(&o), "do not broaden every melee threat");
+    }
+    #[test]
+    fn aerial_escape_prefers_reachable_observed_roof_to_open_distance() {
+        let mut o = world();
+        o.player["on_ground"] = json!(true);
+        o.world["entities"] = json!([{"entity_id":9,"type":"minecraft:phantom","visible":true,"hostile":true,"position":[-12.,20.,0.5]}]);
+        assert!(evade(&o).unwrap().target.x > 0.5);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"] == json!([-2, 3, 0]) {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let route = evade(&o).unwrap();
+        assert!(
+            route.target.x < 0.5,
+            "approach the observed roof: {route:?}"
+        );
+        assert!(route.reason.contains("refuge"));
+        o.world["entities"].as_array_mut().unwrap().push(json!({"entity_id":10,"type":"minecraft:zombie","visible":true,"hostile":true,"position":[-2.5,1.,0.5]}));
+        assert!(
+            evade(&o).unwrap().target.x > 0.5,
+            "roof reward must not lead into an observed melee threat"
+        );
     }
     fn pool() -> Observation {
         let mut o = world();
