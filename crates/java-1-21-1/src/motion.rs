@@ -225,6 +225,7 @@ fn arrived(body: &Body, target: [f64; 3], needs_jump: bool, medium: Medium) -> b
     (!needs_jump || medium != Medium::Air)
         && distance(body.position, target) < 0.08
         && body.velocity[0].hypot(body.velocity[2]) < 0.025
+        && (medium == Medium::Air || body.velocity[1].abs() < 0.025)
         && (body.on_ground || medium != Medium::Air)
 }
 fn steering(
