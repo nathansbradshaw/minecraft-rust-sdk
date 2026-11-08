@@ -243,6 +243,18 @@ this fallback grants no competing model control or extra model allowance.
 `body-probe inspect-observation` replays only the fast policy without acting.
 These diagnostics do not establish general Survival competence.
 
+Visible hostile phantoms receive a 32-block warning radius in the replaceable
+body policy rather than the ordinary 10-block melee radius. The body prefers
+approaching observed low collision roofs over increasing open-ground distance.
+Refuge candidates require known clear, supported floor and solid cover over the
+player footprint; unseen shelter and foliage without collision do not qualify.
+This preference is disabled for incoming projectiles, primed blasts and burning,
+and cannot reward a landing within 4.5 blocks of another visible melee threat.
+A roof is a route preference, not an immunity or survival guarantee. Normal
+collision admission, observed outcomes, defense and recovery still apply.
+Native flying-attack trials with blocked inference and real compilation remain
+required; policy regressions alone do not establish effectiveness.
+
 Generated SDK programs inherit `MC_SDK_ARBITER`, a private same-UID Unix socket.
 It accepts bounded typed actions and no credentials/actor override. Urgent body
 control defers ordinary program actions; conversation remains available. Stalled,

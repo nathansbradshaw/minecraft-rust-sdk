@@ -11,11 +11,15 @@ async fn main() -> Result<()> {
     if args.len() == 2 && args[0] == "inspect-observation" {
         let bytes = private_read(Path::new(&args[1]), 1024 * 1024)?;
         let observed: minecraft_sdk::Observation = serde_json::from_slice(&bytes)?;
+        let policy_started = Instant::now();
         let geometry = minecraft_sdk_brain::body::geometry::evade(&observed)
             .map(|route| json!({"target":route.target,"jump":route.jump,"reason":route.reason}));
+        let threatened = minecraft_sdk_brain::body::geometry::threatened(&observed);
+        let incoming = minecraft_sdk_brain::body::geometry::incoming(&observed);
+        let policy_ms = policy_started.elapsed().as_secs_f64() * 1000.;
         println!(
             "{}",
-            json!({"event":"body_observation_diagnostic","scope":"offline copied observation; no connection or gameplay mutation","observation_sha256":minecraft_sdk_brain::digest(&bytes),"revision":observed.revision,"position":observed.player["position"],"health":observed.player["health"],"threatened":minecraft_sdk_brain::body::geometry::threatened(&observed),"incoming_projectile":minecraft_sdk_brain::body::geometry::incoming(&observed),"escape":geometry})
+            json!({"event":"body_observation_diagnostic","scope":"offline copied observation; no connection or gameplay mutation","observation_sha256":minecraft_sdk_brain::digest(&bytes),"revision":observed.revision,"position":observed.player["position"],"health":observed.player["health"],"threatened":threatened,"incoming_projectile":incoming,"escape":geometry,"policy_ms":policy_ms})
         );
         return Ok(());
     }
