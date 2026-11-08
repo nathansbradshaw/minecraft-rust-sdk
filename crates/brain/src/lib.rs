@@ -10,6 +10,7 @@ pub mod conversation;
 mod diagnostics;
 mod discovery;
 pub mod feedback;
+mod gameplay_failure;
 pub mod memory;
 pub mod model;
 pub mod navigation;
@@ -500,6 +501,9 @@ impl Journal {
     fn diagnosis_subject(&self, source: &str, revision: &str, environment: &str) -> Result<String> {
         self.admit_diagnostic_feedback(source, revision)?;
         let mut subject = json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.get("experiment_signature")?,"context_contract":self.get("context_contract")?,"discovery_revision":self.get("discovery_revision")?,"decision_worker_revision":self.get("decision_worker_revision")?});
+        if let Some(failure) = self.get("gameplay_failure_revision")? {
+            subject["gameplay_failure_revision"] = json!(failure);
+        }
         // Preserve existing subject identities when there is no new feedback.
         if let Some(notice) = self.get("diagnostic_feedback_revision")? {
             subject["diagnostic_feedback_revision"] = json!(notice);
@@ -819,6 +823,8 @@ impl Brain {
                 .await?;
         }
         self.journal.resolve_pending(&receipt)?;
+        self.journal
+            .note_gameplay_failure(&action, &receipt, &self.observed)?;
         if let Some(snapshot) = containers::inspection(
             &ActionRequest {
                 action_id: id,
@@ -1013,6 +1019,9 @@ impl Brain {
             context["diagnostic_feedback"] = self
                 .journal
                 .diagnostic_context(&self.journal.get("goal_revision")?.unwrap_or_default())?;
+            context["gameplay_failure"] = self.journal.gameplay_failure_context(
+                &self.journal.get("goal_revision")?.unwrap_or_default(),
+            )?;
             context["decision_session"] = json!({
                 "role":if develop {"sol"} else {"luna"},
                 "requested_model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},

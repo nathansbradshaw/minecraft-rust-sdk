@@ -226,6 +226,15 @@ Ordinary gameplay failure, death or a blocked route is feedback. Respawn normall
 observe fresh bindings, change approach and continue. Do not reset the world,
 invent items/recipes, claim success from dispatch, or mistake uptime for progress.
 When a step fails unchanged, investigate instead of repeatedly issuing it.
+gameplay_failure retains the latest failed direct SDK intention separately from
+older program experiments. For placement it includes exact historical clicked
+and adjacent cells from the receipt, even if general world history is omitted.
+Place.block is the clicked support, not the requested destination. Face 1 means
+the space above it. Inspect replaceability, held item and collision; an occupied
+nonreplaceable adjacent cell is a reason to change the approach, not retry an
+identical click with a new ID. Some items merge or replace the clicked cell, so
+these samples explain context, not a universal placement legality rule. Missing
+samples are unknown. Use fresh observations when historical facts may have changed.
 Completed tool activity persists beyond the short recent transcript. Use its
 actual receipts, commands and results to track what has already happened; do not
 repeat a successful goal step just because it is absent from the recent window.

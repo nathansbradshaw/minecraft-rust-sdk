@@ -130,6 +130,14 @@ gateway journal before a later interaction takes its slot. Movement, looking,
 conversation and observation remain available. The container brain flushes terminal
 interaction receipts and can cancel held item use before urgent movement.
 
+`place.block` identifies the clicked cell and `face` its protocol face, not a
+destination coordinate. The adjacent candidate is down/up/north/south/west/east
+for faces 0/1/2/3/4/5. Item-specific replacement and merging remain server rules.
+Failed-placement feedback retains bounded initial/final receipt samples for both
+cells, including runtime block state, replaceability and permission observations.
+These historical samples survive general history compaction; absent cells stay
+unknown. They neither certify current legality nor authorize uncertain replay.
+
 `start_use_item` accepts `hand` and positive `max_ticks`, bounded by the deployment's
 finite-control limit. Native game ticks measure active held use; a wall deadline
 of twice that tick budget plus two seconds bounds stalled execution. Legacy
@@ -200,6 +208,15 @@ finite program control, resumes queued work when safe, and performs ordinary
 respawn. This initial policy is experimental: eating, combat effectiveness,
 fluids, complex navigation and general Survival strength require further native
 evidence. Health, shelter and threats do not gate model reasoning or conversation.
+
+Bounded diagnosis includes the latest failed direct SDK intention and its outcome
+or error code, independently of an older generated-program experiment. Selecting
+a different held inventory slot changes relevant gameplay facts. Fresh receipt
+IDs, error wording, aiming jitter and subcell waypoint jitter do not replenish a
+failure's allowance; cancellation target IDs retain their semantic identity.
+Persisted failure context is historical client feedback, never effect proof or
+permission to replay an uncertain mutation. Unchanged exhausted diagnoses remain
+bounded across restart, and provider allowances remain unchanged.
 
 The body can attempt cooldown-ready defense against a visible hostile within
 three blocks while its finite escape continues. It does not pursue targets or

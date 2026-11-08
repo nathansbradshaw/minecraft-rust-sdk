@@ -34,7 +34,7 @@ pub fn environment_signature(observed: &crate::Observation) -> String {
         .flatten()
         .map(|b| json!({"position":b["position"],"block":b["block"],"state":b["state"]}))
         .collect();
-    crate::digest(json!({"dimension":p["dimension"],"position":position,"health":p["health"],"food":p["food"],"inventory":p["inventory"],"blocks":blocks,"menu":observed.menu}).to_string().as_bytes())
+    crate::digest(json!({"dimension":p["dimension"],"position":position,"health":p["health"],"food":p["food"],"inventory":p["inventory"],"selected":p["selected"],"blocks":blocks,"menu":observed.menu}).to_string().as_bytes())
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Investigation {
