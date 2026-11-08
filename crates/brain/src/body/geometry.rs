@@ -518,6 +518,9 @@ pub(super) fn evade_with_native(
                     && supported(&cells, *p, &obstacles)
                     && clear(&cells, *p, &obstacles)
             })
+            // Compute coverage margins only once per admitted floor centre,
+            // rather than repeating polygon unions for every route candidate.
+            .map(|p| (p, super::aerial::margin(p, &obstacles)))
             .collect()
     } else {
         Vec::new()
@@ -587,11 +590,18 @@ pub(super) fn evade_with_native(
         let refuge = if seek_refuge && refuge_safe {
             let approach = refuges
                 .iter()
-                .map(|q| (6. - (p[0] - q[0]).hypot(p[2] - q[2])).max(0.) * 4.)
+                .map(|(q, _)| (6. - (p[0] - q[0]).hypot(p[2] - q[2])).max(0.) * 4.)
+                .fold(0., f64::max);
+            // Translated square footprints retain at least this much of the
+            // sampled margin. A different floor height cannot inherit it.
+            let interior = refuges
+                .iter()
+                .filter(|(q, _)| (p[1] - q[1]).abs() < 0.001)
+                .map(|(q, margin)| (margin - (p[0] - q[0]).abs().max((p[2] - q[2]).abs())).max(0.))
                 .fold(0., f64::max);
             approach
                 + if super::aerial::roofed(p, &obstacles) {
-                    60.
+                    60. + interior * 24.
                 } else {
                     0.
                 }
@@ -781,6 +791,29 @@ mod tests {
         assert!(
             evade(&o).unwrap().target.x > 0.5,
             "roof reward must not lead into an observed melee threat"
+        );
+    }
+    #[test]
+    fn sheltered_body_prefers_interior_over_distance_chasing_at_the_edge() {
+        let mut o = world();
+        o.player = json!({"position":[-0.5,1.,-0.5],"on_ground":true});
+        o.world["entities"] = json!([{"entity_id":9,"type":"minecraft:phantom","visible":true,"hostile":true,"position":[12.,1.5,0.5]}]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&b["position"]).unwrap();
+            if p[1] == 3. && (-1.0..=1.0).contains(&p[0]) && (-1.0..=1.0).contains(&p[2]) {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let route = evade(&o).unwrap();
+        assert!(
+            (route.target.x - 0.5).abs() < 0.01 && (route.target.z - 0.5).abs() < 0.01,
+            "prefer roof interior: {route:?}"
+        );
+        o.player["position"] = json!([0.5, 1., 0.5]);
+        assert!(
+            evade(&o).is_none(),
+            "do not chase the circling flyer back to a roof edge"
         );
     }
     fn pool() -> Observation {

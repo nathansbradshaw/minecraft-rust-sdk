@@ -256,6 +256,10 @@ body policy rather than the ordinary 10-block melee radius. The body prefers
 approaching observed low collision roofs over increasing open-ground distance.
 Refuge candidates require known clear, supported floor and solid cover over the
 player footprint; unseen shelter and foliage without collision do not qualify.
+Observed extra horizontal roof coverage adds an interior preference, capped at
+one block and computed from continuous collision cover. A covered corner and
+roof interior are not equally protective. This remains a client heuristic:
+flyers may enter from the side, and a roof does not establish invulnerability.
 This preference is disabled for incoming projectiles, primed blasts and burning,
 and cannot reward a landing within 4.5 blocks of another visible melee threat.
 A roof is a route preference, not an immunity or survival guarantee. Normal
