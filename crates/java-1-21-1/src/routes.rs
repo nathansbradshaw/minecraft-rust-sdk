@@ -12,11 +12,17 @@ pub(super) const INTERVAL_MS: u64 = 250;
 struct Input {
     #[serde(default)]
     offset: usize,
+    #[serde(default = "default_limit")]
+    limit: usize,
     target: Option<[f64; 3]>,
+}
+fn default_limit() -> usize {
+    64
 }
 fn parse(input: &Value) -> AnyResult<Input> {
     let input: Input = serde_json::from_value(input.clone())?;
     if input.offset > 1024
+        || !(1..=64).contains(&input.limit)
         || input
             .target
             .is_some_and(|p| p.iter().any(|n| !n.is_finite()))
@@ -29,7 +35,7 @@ pub(super) fn validate(input: &Value) -> AnyResult<()> {
     parse(input).map(|_| ())
 }
 pub(super) fn schema() -> Value {
-    json!({"description":"Read-only locally reachable grounded waypoints using this adapter's collision/gravity admission. Predictions are not game effects. Follow pagination only while scene and origin match.","input_schema":{"type":"object","additionalProperties":false,"properties":{"offset":{"type":"integer","minimum":0,"maximum":1024},"target":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}},"max_evaluations":64,"min_interval_ms":INTERVAL_MS})
+    json!({"description":"Read-only locally reachable grounded waypoints using this adapter's collision/gravity admission. Predictions are not game effects. Use limit for small diagnostic pages; follow pagination only while scene and origin match.","input_schema":{"type":"object","additionalProperties":false,"properties":{"offset":{"type":"integer","minimum":0,"maximum":1024},"limit":{"type":"integer","minimum":1,"maximum":64,"default":64},"target":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}},"max_evaluations":64,"min_interval_ms":INTERVAL_MS})
 }
 fn body_cells(p: [f64; 3]) -> impl Iterator<Item = [i32; 3]> {
     let lo = [
@@ -137,7 +143,7 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
     let mut end = input.offset.min(candidates.len());
     let started = Instant::now();
     let mut options = Vec::new();
-    for target in candidates.iter().skip(input.offset).take(64) {
+    for target in candidates.iter().skip(input.offset).take(input.limit) {
         if end > input.offset && started.elapsed() >= Duration::from_millis(40) {
             break;
         }
@@ -216,6 +222,33 @@ mod tests {
                 .iter()
                 .any(|r| r["target"][0].as_f64().unwrap() > 1.)
         );
+    }
+    #[test]
+    fn small_diagnostic_pages_preserve_scene_and_do_not_skip_candidates() {
+        let o = room(false);
+        let expected = all(&o);
+        let mut actual = Vec::new();
+        let mut offset = 0;
+        let mut scene = None;
+        loop {
+            let p = page(&o, &json!({"offset":offset,"limit":1}), 100).unwrap();
+            assert!(p["options"].as_array().unwrap().len() <= 1);
+            if let Some(old) = &scene {
+                assert_eq!(old, &p["scene"]);
+            }
+            scene = Some(p["scene"].clone());
+            actual.extend(p["options"].as_array().unwrap().iter().cloned());
+            if p["complete"] == true {
+                break;
+            }
+            let next = p["next_offset"].as_u64().unwrap();
+            assert_eq!(next, offset + 1);
+            offset = next;
+        }
+        assert_eq!(actual, expected);
+        for limit in [json!(0), json!(65), json!(-1), json!(1.5)] {
+            assert!(page(&o, &json!({"limit":limit}), 100).is_err());
+        }
     }
     #[test]
     fn an_uphill_prediction_must_declare_its_jump_input() {
