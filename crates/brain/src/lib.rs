@@ -7,6 +7,7 @@ pub mod body;
 mod completion;
 pub mod containers;
 pub mod conversation;
+mod diagnostics;
 mod discovery;
 pub mod feedback;
 pub mod memory;
@@ -152,6 +153,7 @@ impl Journal {
         db.busy_timeout(Duration::from_secs(3))?;
         db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA max_page_count=16384;CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL);CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL);CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS investigations(subject TEXT PRIMARY KEY,remaining INTEGER NOT NULL);")?;
         memory::initialize(&db)?;
+        diagnostics::initialize(&db)?;
         Ok(Self { db })
     }
     pub fn event(&self, kind: &str, data: Value) -> Result<i64> {
@@ -494,7 +496,13 @@ impl Journal {
         )))
     }
     fn diagnosis_subject(&self, source: &str, revision: &str, environment: &str) -> Result<String> {
-        Ok(digest(json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.get("experiment_signature")?,"context_contract":self.get("context_contract")?,"discovery_revision":self.get("discovery_revision")?,"decision_worker_revision":self.get("decision_worker_revision")?}).to_string().as_bytes()))
+        self.admit_diagnostic_feedback(source, revision)?;
+        let mut subject = json!({"source":source,"goal_revision":revision,"environment":environment,"experiment":self.get("experiment_signature")?,"context_contract":self.get("context_contract")?,"discovery_revision":self.get("discovery_revision")?,"decision_worker_revision":self.get("decision_worker_revision")?});
+        // Preserve existing subject identities when there is no new feedback.
+        if let Some(notice) = self.get("diagnostic_feedback_revision")? {
+            subject["diagnostic_feedback_revision"] = json!(notice);
+        }
+        Ok(digest(subject.to_string().as_bytes()))
     }
     fn investigation_spent(&self, subject: &str, finished: bool) -> Result<()> {
         self.db.execute("UPDATE investigations SET remaining=CASE WHEN ?2 THEN 0 ELSE max(remaining-1,0) END WHERE subject=?1",params![subject,finished])?;
@@ -1193,7 +1201,7 @@ impl Brain {
                         self.journal.set("development_request", "Investigate the last tool failure using its error and current observation. Do not repeat an unchanged rejected action; repair its precondition or the program first.")?;
                     }
                     self.journal
-                        .event("tool_result", json!({"tool":choice.tool,"result":value}))?;
+                        .event("tool_result", json!({"tool":choice.tool,"goal_revision":requested_revision,"result":value}))?;
                 }
                 Err(e) => {
                     if !goal_changed {
@@ -1201,7 +1209,7 @@ impl Brain {
                     }
                     self.journal.event(
                         "tool_result",
-                        json!({"tool":choice.tool,"error":e.to_string()}),
+                        json!({"tool":choice.tool,"goal_revision":requested_revision,"error":e.to_string()}),
                     )?;
                     if !develop {
                         self.journal.request_development()?;
@@ -1502,6 +1510,67 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_turn_read_failure_gets_one_persistent_feedback_opportunity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite");
+        let j = Journal::open(&path).unwrap();
+        let revision = j
+            .select_goal("obtain wood", "fixture", json!({}), None)
+            .unwrap()
+            .to_string();
+        j.set("needs_investigation", "true").unwrap();
+        let subject = j
+            .diagnosis_subject("source", &revision, "same-world")
+            .unwrap();
+        j.investigation_budget(&subject, 1, &revision).unwrap();
+        // This is the actual failure ordering: the last allowed diagnostic
+        // returns new feedback after spending its final investigation turn.
+        j.investigation_spent(&subject, false).unwrap();
+        j.event("tool_result", json!({"tool":"query","error":"Capability response exceeds the model view budget; use an SDK program"})).unwrap();
+        let repaired = j
+            .diagnosis_subject("source", &revision, "same-world")
+            .unwrap();
+        assert_ne!(
+            repaired, subject,
+            "New feedback must reach a decision before the loop stalls"
+        );
+        assert_eq!(
+            j.investigation_budget(&repaired, 1, &revision).unwrap(),
+            Some((progress::Investigation::Start, 1))
+        );
+        assert!(
+            j.last_result().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("model view budget")
+        );
+        j.investigation_spent(&repaired, false).unwrap();
+        // Repeating that error, changing the read tool, or reopening the
+        // process cannot create another opportunity for the same experiment.
+        j.event("tool_result", json!({"tool":"query","error":"Capability response exceeds the model view budget; use an SDK program"})).unwrap();
+        assert_eq!(
+            j.diagnosis_subject("source", &revision, "same-world")
+                .unwrap(),
+            repaired
+        );
+        j.event(
+            "tool_result",
+            json!({"tool":"read","error":"Another diagnostic failed"}),
+        )
+        .unwrap();
+        drop(j);
+        let j = Journal::open(&path).unwrap();
+        assert_eq!(
+            j.diagnosis_subject("source", &revision, "same-world")
+                .unwrap(),
+            repaired
+        );
+        assert_eq!(
+            j.investigation_budget(&repaired, 8, &revision).unwrap(),
+            Some((progress::Investigation::Exhausted, 0))
+        );
+    }
     #[test]
     fn investigation_gets_a_finite_sol_session_without_restart_renewal() {
         let dir = tempfile::tempdir().unwrap();

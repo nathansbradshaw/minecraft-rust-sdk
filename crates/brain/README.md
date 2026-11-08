@@ -410,9 +410,18 @@ reverted or a controller restarts. Receipt IDs, elapsed time and printed clocks
 do not make a repeated failure novel. Changed code, meaningful game facts, a
 changed interface contract or a new task can open a different subject. Exhausted
 unchanged diagnosis records a defect boundary and stops polling that subject;
-body/chat and unrelated tasks continue. Source fingerprints exclude compiler
+body and chat continue, and a changed task remains available. Source fingerprints exclude compiler
 caches. These cost hints are not evidence of useful gameplay; native evidence
 still decides gates.
+
+A previously unseen read-only tool error can arrive on the final diagnostic
+turn. Before stalling, the journal permits one further finite investigation for
+that feedback per source/experiment/task/interface contract. It does not renew
+provider allowances or replay gameplay. Restart, different read tools, changed
+error text and position changes cannot replenish this opportunity. Errors already
+followed by a model decision, stale-task feedback and mutation errors cannot
+obtain it. The notice is client diagnostic evidence, not a new world fact or
+task success.
 ## Recovery during coding
 
 The resident body can eat ordinary prepared food from the hotbar or offhand
