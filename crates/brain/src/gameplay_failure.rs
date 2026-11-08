@@ -23,6 +23,45 @@ fn intention(action: &Action) -> Result<Value> {
     Ok(value)
 }
 
+/// Retain the cells actually sampled for this action, even when general history
+/// projection removes the large world arrays. Missing cells stay unknown.
+fn placement_context(action: &Action, receipt: &Receipt) -> Value {
+    let Action::Place { block, face, .. } = action else {
+        return Value::Null;
+    };
+    let clicked = [i64::from(block.x), i64::from(block.y), i64::from(block.z)];
+    let mut adjacent = clicked;
+    match face {
+        0 => adjacent[1] -= 1,
+        1 => adjacent[1] += 1,
+        2 => adjacent[2] -= 1,
+        3 => adjacent[2] += 1,
+        4 => adjacent[0] -= 1,
+        5 => adjacent[0] += 1,
+        _ => return Value::Null,
+    }
+    let sample = |phase: &str| {
+        let observed = &receipt.evidence[phase];
+        let cell = |position: [i64; 3]| {
+            let row = observed["world"]["blocks"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["position"] == json!(position)));
+            match row {
+                Some(row) => json!({"position":position,"observed":true,
+                    "block":row["block"].as_str().map(|s|s.chars().take(256).collect::<String>()),
+                    "state":row["state"].as_str().map(|s|s.chars().take(512).collect::<String>()),
+                    "replaceable":row["replaceable"].as_bool(),
+                    "may_interact":row["may_interact"].as_bool()}),
+                None => json!({"position":position,"observed":false}),
+            }
+        };
+        json!({"game_time":observed["world"]["game_time"].as_i64(),
+            "clicked_cell":cell(clicked),"adjacent_candidate":cell(adjacent)})
+    };
+    json!({"initial_sample":sample("before"),"final_sample":sample("after"),
+        "meaning":"Historical receipt samples. Place.block is the clicked cell; face selects an adjacent candidate (0 down, 1 up, 2 north, 3 south, 4 west, 5 east). Check replaceability, held item, player collision and permissions using fresh facts. Some items replace or merge the clicked cell; the server decides. Expiry is not proof of an effect or permission to replay uncertainty."})
+}
+
 impl Journal {
     pub(crate) fn note_gameplay_failure(
         &self,
@@ -54,6 +93,7 @@ impl Journal {
         let witness = json!({"goal_revision":revision,"action":request,
             "action_id":receipt.action_id,"outcome":receipt.outcome,
             "error":error,"selected_before":before.player["selected"].as_i64(),
+            "placement_context":placement_context(action,receipt),
             "scope":"Historical direct SDK failure, not a current world fact or effect proof. Inspect/reconcile uncertain IDs; do not replay them under a new ID."});
         self.set("gameplay_failure_context", &witness.to_string())?;
         // Refresh the status/reconciliation reference even when this diagnosis
@@ -102,6 +142,54 @@ mod tests {
             adapter_version: "fixture".into(),
             evidence: json!({}),
             error: None,
+        }
+    }
+    #[test]
+    fn failed_placement_retains_exact_cells_through_history_projection() {
+        let mut receipt = expired("blocked");
+        receipt.evidence = json!({"before":{"world":{"game_time":99,"blocks":[
+            {"position":[1,63,0],"block":"minecraft:dirt","state":"dirt","replaceable":false,"may_interact":true},
+            {"position":[1,64,0],"block":"minecraft:oak_log","state":"log","replaceable":false,"may_interact":true},
+            {"position":[2,64,0],"block":"unrelated","replaceable":true}
+        ]}}});
+        let context = placement_context(&action(1), &receipt);
+        let mut projected = context.clone();
+        crate::compact_history(&mut projected);
+        assert_eq!(projected, context);
+        assert_eq!(
+            projected["initial_sample"]["adjacent_candidate"]["block"],
+            "minecraft:oak_log"
+        );
+        assert_eq!(
+            projected["initial_sample"]["clicked_cell"]["may_interact"],
+            true
+        );
+        assert_eq!(
+            projected["final_sample"]["adjacent_candidate"]["observed"],
+            false
+        );
+        assert!(
+            projected["final_sample"]["adjacent_candidate"]
+                .get("replaceable")
+                .is_none()
+        );
+        assert!(!projected.to_string().contains("unrelated"));
+        // Every face uses its ordinary protocol direction, including negatives.
+        for (face, expected) in [
+            (0, [1, 62, 0]),
+            (1, [1, 64, 0]),
+            (2, [1, 63, -1]),
+            (3, [1, 63, 1]),
+            (4, [0, 63, 0]),
+            (5, [2, 63, 0]),
+        ] {
+            let mut request = serde_json::to_value(action(1)).unwrap();
+            request["face"] = json!(face);
+            let request: Action = serde_json::from_value(request).unwrap();
+            assert_eq!(
+                placement_context(&request, &receipt)["initial_sample"]["adjacent_candidate"]["position"],
+                json!(expected)
+            );
         }
     }
     #[test]

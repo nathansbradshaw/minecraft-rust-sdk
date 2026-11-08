@@ -130,6 +130,14 @@ gateway journal before a later interaction takes its slot. Movement, looking,
 conversation and observation remain available. The container brain flushes terminal
 interaction receipts and can cancel held item use before urgent movement.
 
+`place.block` identifies the clicked cell and `face` its protocol face, not a
+destination coordinate. The adjacent candidate is down/up/north/south/west/east
+for faces 0/1/2/3/4/5. Item-specific replacement and merging remain server rules.
+Failed-placement feedback retains bounded initial/final receipt samples for both
+cells, including runtime block state, replaceability and permission observations.
+These historical samples survive general history compaction; absent cells stay
+unknown. They neither certify current legality nor authorize uncertain replay.
+
 `start_use_item` accepts `hand` and positive `max_ticks`, bounded by the deployment's
 finite-control limit. Native game ticks measure active held use; a wall deadline
 of twice that tick budget plus two seconds bounds stalled execution. Legacy
