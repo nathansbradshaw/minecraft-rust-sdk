@@ -45,9 +45,18 @@ impl Journal {
             return Ok(false);
         }
         self.set("gameplay_failure_revision", &key)?;
-        let witness = json!({"goal_revision":revision,"action":action,
+        let action_value = serde_json::to_value(action)?;
+        let action_bytes = serde_json::to_vec(&action_value)?;
+        let request = if action_bytes.len() <= 2048 {
+            action_value
+        } else {
+            json!({"kind":action_value["kind"],"sha256":digest(&action_bytes),"bytes":action_bytes.len(),"omitted":"Large intention retained in action_intent event; inspect it from the private journal"})
+        };
+        let error = receipt.error.as_ref().map(|e| json!({"code":e.code,
+            "message":e.message.chars().take(512).collect::<String>(),"message_complete":e.message.chars().count()<=512}));
+        let witness = json!({"goal_revision":revision,"action":request,
             "action_id":receipt.action_id,"outcome":receipt.outcome,
-            "error":receipt.error,"selected_before":before.player["selected"],
+            "error":error,"selected_before":before.player["selected"].as_i64(),
             "scope":"Historical direct SDK failure, not a current world fact or effect proof. Inspect/reconcile uncertain IDs; do not replay them under a new ID."});
         self.set("gameplay_failure_context", &witness.to_string())?;
         self.event("gameplay_failure_scoped",json!({"revision":key,"action_id":receipt.action_id,
@@ -164,6 +173,34 @@ mod tests {
             progress::environment_signature(&o),
             initial,
             "repairing the held item changes a genuine placement precondition"
+        );
+    }
+    #[test]
+    fn verbose_failure_feedback_is_bounded_and_wording_does_not_renew_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(&dir.path().join("journal.sqlite")).unwrap();
+        let revision = j
+            .select_goal("build", "fixture", json!({}), None)
+            .unwrap()
+            .to_string();
+        let mut receipt = expired("failed");
+        receipt.error = Some(minecraft_sdk::ApiError::new(
+            minecraft_sdk::ErrorCode::NotReady,
+            "診断".repeat(10000),
+        ));
+        j.note_gameplay_failure(&action(1), &receipt, &scene())
+            .unwrap();
+        assert!(
+            j.gameplay_failure_context(&revision)
+                .unwrap()
+                .to_string()
+                .len()
+                < 8192
+        );
+        receipt.error.as_mut().unwrap().message = "different wording".into();
+        assert!(
+            !j.note_gameplay_failure(&action(1), &receipt, &scene())
+                .unwrap()
         );
     }
     #[test]
