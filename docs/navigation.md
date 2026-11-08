@@ -14,6 +14,12 @@ only while origin and scene match. A candidate may yield no waypoint, so an
 empty page does not imply completion. Smaller pages bound output, not a new
 movement capability or evidence that the goal is reachable.
 
+The adapter excludes endpoints that necessarily intersect solid terrain before
+running trajectory search. The test accounts for arrival tolerance and keeps
+grazing contacts that might still admit a nearby legal pose. Diagnostic fields
+`total_candidates` and `pruned_blocked_endpoints` describe this read work; neither
+is evidence of movement or task completion.
+
 Completed prediction pages are saved in the client's bounded navigation journal
 when a wall-time budget expires. A later invocation validates a small current
 page before resuming its saved cursor. Actor life, clock, pose, physical state

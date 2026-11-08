@@ -169,7 +169,7 @@ fn number(o: &Value, key: &str, min: f64, max: f64) -> AnyResult<f64> {
         .filter(|n| n.is_finite() && *n >= min && *n <= max)
         .ok_or_else(|| format!("Invalid native physics fact: {key}").into())
 }
-fn parameters(o: &Observation) -> AnyResult<Parameters> {
+pub(super) fn parameters(o: &Observation) -> AnyResult<Parameters> {
     let p = &o.player["physics"];
     if p["format"] != "java767-physics-v1" {
         return Err("Matching native physics facts required".into());

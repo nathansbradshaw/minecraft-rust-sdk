@@ -1,5 +1,6 @@
 //! Read-only, bounded predictions using the same admission planner as controls.
 use super::*;
+use minecraft_sdk_java_1_21_1::physics;
 use std::{
     collections::{BTreeSet, HashMap},
     hash::{Hash, Hasher},
@@ -53,11 +54,42 @@ fn body_cells(p: [f64; 3]) -> impl Iterator<Item = [i32; 3]> {
     })
 }
 pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyResult<Value> {
+    page_with_pruning(before, input, max_ticks, true)
+}
+// A common interior belongs to every player box within the arrival tolerance.
+// If it intersects solid terrain, no admissible end pose can occupy the target.
+// Keep grazing contacts: a nearby legal pose may still satisfy the tolerance.
+fn definitely_blocked(target: [f64; 3], p: physics::Parameters, boxes: &[[f64; 6]]) -> bool {
+    let radius = p.width / 2. - MOVEMENT_TARGET_TOLERANCE;
+    if radius <= 0. || p.height <= 2. * MOVEMENT_TARGET_TOLERANCE {
+        return false;
+    }
+    let low = [
+        target[0] - radius,
+        target[1] + MOVEMENT_TARGET_TOLERANCE,
+        target[2] - radius,
+    ];
+    let high = [
+        target[0] + radius,
+        target[1] + p.height - MOVEMENT_TARGET_TOLERANCE,
+        target[2] + radius,
+    ];
+    boxes
+        .iter()
+        .any(|b| (0..3).all(|i| high[i] > b[i] + 1e-7 && low[i] < b[i + 3] - 1e-7))
+}
+fn page_with_pruning(
+    before: &Observation,
+    input: &Value,
+    max_ticks: u16,
+    prune: bool,
+) -> AnyResult<Value> {
     let input = parse(input)?;
     if before.player["on_ground"] != true && before.player["in_water"] != true {
         return Err("Movement options require grounded or water-supported observations; wait for the finite control to release".into());
     }
     let start = position(before)?;
+    let physical = motion::parameters(before)?;
     let boxes = collision_boxes(before)?;
     if boxes.len() > 2048 {
         return Err("Movement option collision budget exceeded".into());
@@ -164,10 +196,15 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
     if candidates.len() > 1024 {
         return Err("Movement option surface budget exceeded".into());
     }
+    let raw_candidates = candidates.len();
+    if prune {
+        candidates.retain(|target| !definitely_blocked(*target, physical, &boxes));
+    }
+    let pruned_candidates = raw_candidates - candidates.len();
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     // A changed control contract invalidates failed edges from old predictions
     // even if their terrain and endpoints are unchanged.
-    "java767-input-preview-v4".hash(&mut hash);
+    "java767-input-preview-v5".hash(&mut hash);
     // Ordering and predictions depend on the precise start and physical
     // state, including across separately resumed client invocations.
     start.map(f64::to_bits).hash(&mut hash);
@@ -178,6 +215,9 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
         .hash(&mut hash);
     for field in ["physics", "velocity", "on_ground", "sprinting", "in_water"] {
         before.player[field].to_string().hash(&mut hash);
+    }
+    if before.player["sprinting"] == true {
+        before.player["yaw"].to_string().hash(&mut hash);
     }
     input.target.map(|p| p.map(f64::to_bits)).hash(&mut hash);
     before.player["dimension"].to_string().hash(&mut hash);
@@ -224,7 +264,7 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
         }
     }
     Ok(
-        json!({"format":"minecraft-movement-options-v1","origin":{"position":start,"dimension":before.player["dimension"]},"scene":format!("{:016x}",hash.finish()),"options":options,"complete":end==candidates.len(),"next_offset":if end<candidates.len(){Some(end)}else{None},"retry_after_ms":INTERVAL_MS,"prediction_not_effect_proof":true}),
+        json!({"format":"minecraft-movement-options-v1","origin":{"position":start,"dimension":before.player["dimension"]},"scene":format!("{:016x}",hash.finish()),"options":options,"complete":end==candidates.len(),"next_offset":if end<candidates.len(){Some(end)}else{None},"retry_after_ms":INTERVAL_MS,"total_candidates":candidates.len(),"pruned_blocked_endpoints":pruned_candidates,"prediction_not_effect_proof":true}),
     )
 }
 
@@ -249,10 +289,13 @@ mod tests {
         }
     }
     fn all(o: &Observation) -> Vec<Value> {
+        all_with_pruning(o, true)
+    }
+    fn all_with_pruning(o: &Observation, prune: bool) -> Vec<Value> {
         let mut offset = 0;
         let mut rows = Vec::new();
         loop {
-            let result = page(o, &json!({"offset":offset}), 100).unwrap();
+            let result = page_with_pruning(o, &json!({"offset":offset}), 100, prune).unwrap();
             rows.extend(result["options"].as_array().unwrap().iter().cloned());
             if result["complete"] == true {
                 break;
@@ -260,6 +303,50 @@ mod tests {
             offset = result["next_offset"].as_u64().unwrap() as usize;
         }
         rows
+    }
+    #[test]
+    fn endpoint_pruning_keeps_tolerated_contacts_and_removes_only_certain_overlap() {
+        let p = physics::Parameters::default();
+        let ground = [[0., 0., 0., 1., 1., 1.]];
+        assert!(definitely_blocked([0.5, 0., 0.5], p, &ground));
+        assert!(!definitely_blocked([0.5, 1., 0.5], p, &ground));
+        // A near-wall target can still have a legal arrival within tolerance.
+        assert!(!definitely_blocked(
+            [0.75, 1., 0.5],
+            p,
+            &[[1., 0., 0., 2., 4., 1.]]
+        ));
+        // Likewise a slight ceiling overlap is not necessarily impossible.
+        assert!(!definitely_blocked(
+            [0.5, 1.3, 0.5],
+            p,
+            &[[0., 3., 0., 1., 4., 1.]]
+        ));
+        assert!(!definitely_blocked(
+            [0.5, 0., 0.5],
+            physics::Parameters { width: 0.2, ..p },
+            &ground
+        ));
+    }
+    #[test]
+    fn pruning_buried_surfaces_preserves_the_admission_planners_actual_routes() {
+        for wall in [false, true] {
+            let mut o = room(wall);
+            for row in o.world["blocks"].as_array_mut().unwrap() {
+                if row["position"][1] == -1 {
+                    row["block"] = json!("fixture:buried_solid");
+                    row["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+                }
+            }
+            let expected = all_with_pruning(&o, false);
+            let actual = all(&o);
+            assert_eq!(
+                actual, expected,
+                "Pruning must not drop a route admitted by the same planner"
+            );
+            let result = page(&o, &json!({"limit":1}), 100).unwrap();
+            assert!(result["pruned_blocked_endpoints"].as_u64().unwrap() > 0);
+        }
     }
     #[test]
     fn predicts_flat_waypoints_without_clipping_a_wall_or_claiming_an_effect() {
