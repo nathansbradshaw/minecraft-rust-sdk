@@ -109,6 +109,13 @@ pub struct Escape {
     pub jump: bool,
     pub reason: String,
 }
+/// A bounded prediction returned by the installed movement adapter. It still
+/// needs fresh action admission and observed completion, like every movement.
+#[derive(Clone, Debug)]
+pub(super) struct Admitted {
+    pub target: [f64; 3],
+    pub jump: bool,
+}
 /// Client behavior only: ranged actors must not be declared safe at melee range.
 pub fn threat_radius(entity: &Value) -> f64 {
     if entity["ranged_attack"] == true {
@@ -419,6 +426,16 @@ pub(super) fn evade_with_limits(
     recent_retreat: &[[f64; 3]],
     waypoint_axis: f64,
 ) -> Option<Escape> {
+    evade_with_native(o, blocked, stationary, recent_retreat, waypoint_axis, &[])
+}
+pub(super) fn evade_with_native(
+    o: &Observation,
+    blocked: &[[i32; 3]],
+    stationary: &[String],
+    recent_retreat: &[[f64; 3]],
+    waypoint_axis: f64,
+    admitted: &[Admitted],
+) -> Option<Escape> {
     if water_danger(o) {
         return water_escape(o, blocked);
     }
@@ -579,20 +596,37 @@ pub(super) fn evade_with_limits(
             }
         }
     }
-    for p in candidates {
+    for (p, native_jump) in candidates
+        .into_iter()
+        .map(|p| (p, None))
+        .chain(admitted.iter().map(|r| (r.target, Some(r.jump))))
+    {
         let dy = p[1] - start[1];
         let length = ((p[0] - start[0]).powi(2) + (p[2] - start[2]).powi(2)).sqrt();
         for jump in [false, true] {
-            if (dy > 0.1 && !jump) || (jump && o.player["on_ground"] == false) {
+            if native_jump.is_some_and(|j| j != jump) {
+                continue;
+            }
+            if (native_jump.is_none() && dy > 0.1 && !jump)
+                || (jump && o.player["on_ground"] == false)
+            {
                 continue;
             }
             if blocked.contains(&target_key(p)) {
                 continue;
             }
-            if !supported(&cells, p, &obstacles) || !clear(&cells, p, &obstacles) {
+            if native_jump.is_none()
+                && (!supported(&cells, p, &obstacles) || !clear(&cells, p, &obstacles))
+            {
                 continue;
             }
-            let route = if dy < 0. && !jump {
+            // The quick geometric arc is deliberately conservative. A fresh
+            // native prediction can establish a path it misses (for example
+            // a step jump whose head clips a low ceiling). Do not run that
+            // same approximate arc over the admitted prediction again.
+            let route = if native_jump.is_some() {
+                true
+            } else if dy < 0. && !jump {
                 descending_route(&cells, start, p, &obstacles)
             } else {
                 (0..=20).all(|i| {
@@ -633,7 +667,9 @@ pub(super) fn evade_with_limits(
                         z: p[2],
                     },
                     jump,
-                    reason: if blast_escape {
+                    reason: if native_jump.is_some() {
+                        "native-predicted retreat after stalled local avoidance"
+                    } else if blast_escape {
                         "leave the primed blast radius on one observed route"
                     } else if projectile_danger {
                         "evade incoming projectile"

@@ -1,5 +1,141 @@
 use super::*;
 #[tokio::test]
+async fn stalled_native_query_does_not_stop_observation_or_close_threat_defense() {
+    // Deliberately motionless transport fixture; this does not certify game
+    // movement. Hold the query socket open, then introduce an urgent threat.
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", http.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let upstream = tokio::spawn(async move {
+        let mut blocks = Vec::new();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                for y in -1..=4 {
+                    blocks.push(json!({"position":[x,y,z],"block":if y==0{"minecraft:stone"}else{"minecraft:air"},
+                "collision":if y==0{json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+                }
+            }
+        }
+        let mut tick = 0;
+        let mut held_queries = Vec::new();
+        let mut observed_after_query = 0;
+        let mut moved_after_query = false;
+        let mut control = json!({});
+        loop {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let first = header.lines().next().unwrap();
+            let size = header
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(size < 8192);
+            let mut bytes = vec![0; size];
+            socket.read_exact(&mut bytes).await.unwrap();
+            if first.starts_with("POST /v1/bots/own/observations/query ") {
+                held_queries.push(socket);
+                continue;
+            }
+            let mut finished = false;
+            let response = if first.starts_with("GET /v1/bots/own/observations ") {
+                tick += 5;
+                if !held_queries.is_empty() {
+                    observed_after_query += 1;
+                }
+                json!({"revision":tick.to_string(),"player":{"uuid":"own","entity_id":1,
+                    "dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,
+                    "sprinting":true,"on_ground":true,"attack_strength":1.,"control":control},
+                    "world":{"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,
+                        "entities":[{"entity_id":9,"visible":true,"hostile":true,
+                            "position":[if held_queries.is_empty(){6.5}else{2.5},1.,0.5]}]},"menu":{}})
+            } else {
+                assert!(first.starts_with("POST /v1/bots/own/actions "), "{first}");
+                let request: ActionRequest = serde_json::from_slice(&bytes).unwrap();
+                let mut outcome = "observed";
+                match request.action {
+                    Action::StartMove { target, .. } => {
+                        if !held_queries.is_empty() {
+                            moved_after_query = true;
+                        }
+                        control = json!({"action_id":request.action_id,"outcome":"observed","target":[target.x,target.y,target.z]});
+                        outcome = "running";
+                    }
+                    Action::Attack { entity } => {
+                        assert_eq!(entity, 9);
+                        assert!(!held_queries.is_empty());
+                        finished = true;
+                    }
+                    other => panic!("Unexpected control {other:?}"),
+                }
+                json!({"action_id":request.action_id,"outcome":outcome,"adapter_version":"fixture","evidence":{},"error":null})
+            };
+            let body = response.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            if finished {
+                stopped.store(true, Ordering::Release);
+                break;
+            }
+        }
+        assert_eq!(held_queries.len(), 1);
+        assert!(observed_after_query > 0);
+        assert!(moved_after_query);
+    });
+    let shared = Arc::new(Shared {
+        mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
+        feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
+        emergency: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        latest: Mutex::new(None),
+        reason: Mutex::new(String::new()),
+        failed: tokio::sync::Notify::new(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller(
+            client,
+            Config {
+                enabled: true,
+                period_ms: 50,
+            },
+            shared,
+            stop,
+            &j,
+            3.5,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    upstream.await.unwrap();
+}
+#[tokio::test]
 async fn planning_refresh_waits_for_a_fresh_retry_without_admitting_stale_state() {
     let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");
     let mut observed = brain.observed.clone();

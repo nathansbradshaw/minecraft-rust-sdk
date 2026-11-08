@@ -1,5 +1,6 @@
 //! Replaceable container-local safety behavior, independent of model/terminal work.
 pub mod geometry;
+mod recovery;
 mod tactics;
 #[cfg(test)]
 mod tests;
@@ -405,6 +406,8 @@ async fn controller(
     let mut progress = tactics::Progress::default();
     let mut projectiles = tactics::Projectiles::default();
     let mut retreat_trail = tactics::RetreatTrail::default();
+    let mut retreat_progress = recovery::Progress::default();
+    let mut native_escape = recovery::Discovery::default();
     let mut last_meal = None;
     let mut owned_meal: Option<(String, tactics::Meal)> = None;
     loop {
@@ -476,22 +479,46 @@ async fn controller(
             .is_some_and(|n| n > 0);
         let threatened = geometry::threatened(&observed);
         let trail = retreat_trail.update(&observed, threatened || incoming);
-        let escape = if active["outcome"] != "running" {
-            geometry::evade_with_limits(
+        let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
+        let water_emergency = geometry::water_danger(&observed);
+        let stalled = retreat_progress.stalled(&observed, threatened);
+        let urgent = dead
+            || water_emergency
+            || incoming
+            || burning
+            || nearby.is_some_and(|(_, distance)| distance < 4.5)
+            || observed.world["entities"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| e["visible"] == true && geometry::primed_blast(e).is_some());
+        let discover = stalled
+            && !urgent
+            && threatened
+            && observed.player["on_ground"] == true
+            && active["outcome"] != "running";
+        let admitted = native_escape
+            .tick(client.clone(), &observed, discover, finite_waypoint_axis, j)
+            .await?;
+        // Finish the old finite input before discovery. During the short
+        // read-only query keep observing and defending; any new urgent danger
+        // immediately restores the fast route without waiting for the query.
+        let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
+        let escape = if active["outcome"] != "running" && !awaiting_native {
+            geometry::evade_with_native(
                 &observed,
                 &rejected_routes,
                 &stationary_projectiles,
                 &trail,
                 finite_waypoint_axis,
+                &admitted,
             )
         } else {
             None
         };
-        let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
         if dead {
             last_meal = None;
         }
-        let water_emergency = geometry::water_danger(&observed);
         if cycles.is_multiple_of(10) || observed.player["health"] != previous_health {
             j.event("body_native_sample",json!({"revision":observed.revision,"health":observed.player["health"],"food":observed.player["food"],"air":observed.player["air"],"max_air":observed.player["max_air"],"in_water":observed.player["in_water"],"eyes_in_water":observed.player["eyes_in_water"],"water_emergency":water_emergency,"in_lava":observed.player["in_lava"],"position":p,"control":active,"nearest_hostile":nearby.map(|(e,d)|json!({"entity_id":e["entity_id"],"type":e["type"],"position":e["position"],"distance":d})),"incoming_projectile":incoming,"incoming_projectile_ids":incoming_projectiles,"stationary_projectile_ids":stationary_projectiles,"stationary_scope":"client inference from advancing native positions, not a server flight flag or future guarantee"}))?;
             previous_health = observed.player["health"].clone();

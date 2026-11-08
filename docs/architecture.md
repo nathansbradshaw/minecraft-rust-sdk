@@ -215,6 +215,25 @@ a new incoming identity, movement toward a nearby threat or native evidence of a
 stuck route can trigger replanning. Diagnostic samples retain these identities
 and the cancellation reason so motion and reaction can be checked separately.
 
+If defensive movement makes less than two blocks of displacement over 80
+advancing native ticks, the body can request small `minecraft:movement_options`
+pages in a background task. This covers short oscillations that individually
+complete their controls. Each read has a 750 ms deadline; observation and urgent
+defense continue independently. Close threats, incoming projectiles, active
+fuses, fire and water emergencies retain the fast policy. A quiet stalled body
+can briefly hold its completed input while a prediction arrives.
+
+Predictions are fenced by actor life, dimension, native clock, pose and terrain.
+Changed scenes restart pagination; malformed, stale, hazardous or out-of-range
+candidates cannot become controls. The body ranks admissible candidates using
+its current threat/cover policy. A native prediction can supply a low-clearance
+step that the fast geometric arc rejects, but still requires ordinary fresh
+action admission and observed completion. There is one gameplay controller;
+this fallback grants no competing model control or extra model allowance.
+`body-probe` exercises blocked-reasoning and actual-compilation diagnostics;
+`body-probe inspect-observation` replays only the fast policy without acting.
+These diagnostics do not establish general Survival competence.
+
 Generated SDK programs inherit `MC_SDK_ARBITER`, a private same-UID Unix socket.
 It accepts bounded typed actions and no credentials/actor override. Urgent body
 control defers ordinary program actions; conversation remains available. Stalled,
