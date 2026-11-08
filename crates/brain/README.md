@@ -111,6 +111,10 @@ refusals and model JSON/schema errors do not receive this transport retry.
 allocated inference capability without connecting a character or executing a
 returned tool. Record its actual admission and outcome; it proves inference,
 not gameplay intelligence. The key stays in its private local file.
+Usage also retains the inference service's `provider_model` revision when
+reported. This distinguishes a deployment's explicit provider mapping from the
+requested model role and its unchanged allocation ceiling; missing metadata is
+recorded as unknown.
 Append a private mode-600 context file to replay a saved bounded context with the
 same prompt and schema. Returned commands remain data and are not executed by
 this diagnostic. Disclose changed contexts and prompts in comparisons.
