@@ -83,6 +83,12 @@ own-player commands and respawn. Runtime recipe/block/item IDs remain namespaced
 strings. Mod menus use ordinary server-defined menu IDs and slot rules;
 specialized operations require an installed namespaced capability adapter.
 
+The Java adapter models the one-time sprint takeoff impulse along the observed
+camera yaw. Movement targets do not turn the camera: look in the intended
+takeoff direction before a forward sprint jump. Cancellation releases input
+while gravity and momentum continue. Native trajectory calibration is separate
+from surviving a particular hazard or fuse.
+
 Every mutation needs a stable unique action ID. The same ID with the same action
 returns its original receipt. Reusing it for another action is an error.
 `observed` means the adapter obtained action-specific native evidence.
