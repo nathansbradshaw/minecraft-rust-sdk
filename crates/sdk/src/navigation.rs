@@ -168,6 +168,23 @@ struct Attempt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     arrival_verification: Option<serde_json::Value>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+struct Expansion {
+    origin: Origin,
+    scene: String,
+    next_offset: usize,
+    routes: Vec<Route>,
+    basis: serde_json::Value,
+    #[serde(default)]
+    ready_after_unix_ms: u64,
+}
+fn unix_ms() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(local)?
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64)
+}
 #[derive(Serialize, Deserialize)]
 struct State {
     version: u32,
@@ -181,6 +198,8 @@ struct State {
     pending: Option<Attempt>,
     history: Vec<Attempt>,
     position: [f64; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expansion: Option<Expansion>,
 }
 struct Journal {
     path: PathBuf,
@@ -261,6 +280,7 @@ impl Journal {
                 pending: None,
                 history: Vec::new(),
                 position: p,
+                expansion: None,
             }
         };
         let j = Self {
@@ -424,7 +444,7 @@ pub async fn navigate(
         Ok(result) => result,
         Err(_) => {
             journal.save()?;
-            Ok(journal.report("budget_exhausted","Operation deadline reached; inspect the preserved pending ID before any new intention. Finite controls retain their server expiry."))
+            Ok(journal.report("budget_exhausted","Operation deadline reached; completed read pages can resume after fresh scene validation. Inspect the preserved pending ID before any new intention. Finite controls retain their server expiry."))
         }
     }?;
     report.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -500,6 +520,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 ));
             }
             j.state.history.push(attempt);
+            j.state.expansion = None;
             if let Some((actual, false)) = arrival {
                 j.state.position = actual;
                 j.save()?;
@@ -535,8 +556,38 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
         let mut origin: Option<Origin> = None;
         let mut scene = String::new();
         let mut routes = Vec::new();
+        if let Some(saved) = &j.state.expansion {
+            let wait = saved.ready_after_unix_ms.saturating_sub(unix_ms()?);
+            // Honor the last page's interval across process boundaries. A
+            // large wall-clock reversal must not impose an unbounded wait.
+            if wait <= 5000 {
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+        }
+        let basis = serde_json::json!({"entity":observation.player["entity_id"],
+            "clock":observation.world["sample_clock"]["epoch"],
+            "physics":observation.player["physics"],"velocity":observation.player["velocity"],
+            "on_ground":observation.player["on_ground"],"speed":observation.player["movement_speed"],
+            "sneaking":observation.player["sneaking"],"sprinting":observation.player["sprinting"],
+            "adapter":client.session.as_ref().map(|s|s.adapter_version.as_str())});
+        let mut resume = j.state.expansion.clone().filter(|saved| {
+            saved.basis == basis
+                && saved.origin.dimension == pose.dimension
+                && saved.origin.position == pose.position
+                && saved.routes.len() <= 1024
+                && (1..=1024).contains(&saved.next_offset)
+        });
+        if resume.is_none() && j.state.expansion.is_some() {
+            j.state.expansion = None;
+            j.save()?;
+        }
         loop {
             let mut input = serde_json::json!({"offset":offset});
+            if resume.is_some() {
+                // Never trust a persisted offset without checking the current
+                // scene. A small first page is a read-only validation probe.
+                input["limit"] = serde_json::json!(1);
+            }
             if let Goal::Position { target, .. } = j.state.goal {
                 input["target"] = serde_json::json!(target);
             }
@@ -552,10 +603,25 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                     "Movement option schema is incompatible",
                 )
             })?;
-            if page.format != "minecraft-movement-options-v1" {
+            if page.format != "minecraft-movement-options-v1"
+                || page.scene.is_empty()
+                || page.scene.len() > 128
+                || page.options.len() > 64
+            {
                 return Err(error(
                     ErrorCode::UnsupportedVersion,
                     "Movement option version is incompatible",
+                ));
+            }
+            if page.options.iter().any(|r| {
+                !r.target.iter().all(|n| n.is_finite())
+                    || r.max_ticks == 0
+                    || r.duration_ticks == 0
+                    || r.duration_ticks > u32::from(r.max_ticks)
+            }) {
+                return Err(error(
+                    ErrorCode::UnsupportedVersion,
+                    "Invalid route prediction",
                 ));
             }
             let Some(now) = page.origin else {
@@ -565,11 +631,31 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
             };
             if now.dimension != pose.dimension || distance(now.position, pose.position) > 0.15 {
                 origin = None;
+                j.state.expansion = None;
+                j.save()?;
                 break;
+            }
+            if let Some(mut saved) = resume.take()
+                && saved.scene == page.scene
+                && saved.origin.position == now.position
+            {
+                offset = saved.next_offset;
+                scene = saved.scene.clone();
+                origin = Some(saved.origin.clone());
+                routes = saved.routes.clone();
+                saved.ready_after_unix_ms =
+                    unix_ms()?.saturating_add(page.retry_after_ms.clamp(25, 5000));
+                j.state.expansion = Some(saved);
+                j.save()?;
+                tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000)))
+                    .await;
+                continue;
             }
             if let Some(old) = &origin {
                 if distance(old.position, now.position) > 0.01 || scene != page.scene {
                     origin = None;
+                    j.state.expansion = None;
+                    j.save()?;
                     break;
                 }
             } else {
@@ -577,24 +663,17 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 origin = Some(now);
             }
             for r in page.options {
-                if !r.target.iter().all(|v| v.is_finite())
-                    || r.max_ticks == 0
-                    || r.duration_ticks == 0
-                {
-                    return Err(error(
-                        ErrorCode::UnsupportedVersion,
-                        "Invalid route prediction",
-                    ));
-                }
-                if !r
-                    .touched_blocks
-                    .iter()
-                    .any(|id| options.blocked_blocks.contains(id))
-                {
-                    routes.push(r);
-                }
+                routes.push(r);
+            }
+            if routes.len() > 1024 {
+                return Err(error(
+                    ErrorCode::UnsupportedVersion,
+                    "Movement preview exceeds the bounded route budget",
+                ));
             }
             if page.complete {
+                j.state.expansion = None;
+                j.save()?;
                 break;
             }
             let Some(next) = page.next_offset.filter(|n| *n > offset && *n <= 1024) else {
@@ -604,6 +683,18 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 ));
             };
             offset = next;
+            j.state.expansion = Some(Expansion {
+                origin: origin
+                    .as_ref()
+                    .ok_or_else(|| local("Preview origin vanished"))?
+                    .clone(),
+                scene: scene.clone(),
+                next_offset: offset,
+                routes: routes.clone(),
+                basis: basis.clone(),
+                ready_after_unix_ms: unix_ms()?.saturating_add(page.retry_after_ms.clamp(25, 5000)),
+            });
+            j.save()?;
             tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000))).await;
         }
         let Some(origin) = origin else {
@@ -620,6 +711,14 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
             edges: Vec::new(),
         });
         for r in routes {
+            // Deployment policy may change between invocations. Retain raw
+            // predictions and apply the current block policy when using them.
+            if r.touched_blocks
+                .iter()
+                .any(|id| options.blocked_blocks.contains(id))
+            {
+                continue;
+            }
             let to = key(r.target);
             if to == current
                 || j.state
@@ -758,7 +857,17 @@ mod tests {
         value: serde_json::Value,
         status: u16,
     ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (stream, _) = request(listener, expected).await;
+        reply(stream, value, status).await;
+    }
+    async fn request(
+        listener: &tokio::net::TcpListener,
+        expected: &str,
+    ) -> (
+        tokio::io::BufReader<tokio::net::TcpStream>,
+        serde_json::Value,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
         let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
             .await
             .unwrap()
@@ -768,6 +877,7 @@ mod tests {
         stream.read_line(&mut line).await.unwrap();
         assert!(line.starts_with(expected), "Unexpected request: {line}");
         let public = line.starts_with("GET /v1/server ");
+        let mut length = 0;
         loop {
             line.clear();
             stream.read_line(&mut line).await.unwrap();
@@ -777,7 +887,28 @@ mod tests {
             if public {
                 assert!(!line.to_ascii_lowercase().starts_with("authorization:"));
             }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse::<usize>().unwrap();
+            }
         }
+        assert!(length <= 8192);
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).await.unwrap();
+        let value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (stream, value)
+    }
+    async fn reply(
+        mut stream: tokio::io::BufReader<tokio::net::TcpStream>,
+        value: serde_json::Value,
+        status: u16,
+    ) {
+        use tokio::io::AsyncWriteExt;
         let body = value.to_string();
         let response = format!(
             "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -811,6 +942,257 @@ mod tests {
         })
         .unwrap()
         .without_local_arbiter()
+    }
+    #[tokio::test]
+    async fn a_navigation_deadline_preserves_completed_preview_pages() {
+        // Transport fixture only. Page zero completes, then its advertised
+        // retry interval outlasts this invocation's remaining wall budget.
+        let root = Temp::new();
+        let path = root.0.join("navigation.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+            for _ in 0..2 {
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    observation([0.5, 1., 0.5]),
+                    200,
+                )
+                .await;
+            }
+            respond(
+                &listener,
+                "POST /v1/bots/fixture/observations/query ",
+                serde_json::json!({"format":"minecraft-movement-options-v1",
+                    "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},
+                    "scene":"unchanged-scene","options":[route([1.5,1.,0.5])],
+                    "complete":false,"next_offset":8,"retry_after_ms":1000}),
+                200,
+            )
+            .await;
+            listener
+        });
+        let report = navigate(
+            &c,
+            goal(),
+            &path,
+            Options {
+                timeout_ms: 200,
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = server.await.unwrap();
+        assert_eq!(report.status, "budget_exhausted");
+        assert_eq!(report.actions, 0);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["expansion"]["next_offset"], 8,
+            "A completed read page must survive cancellation instead of restarting at zero forever"
+        );
+        assert_eq!(saved["expansion"]["routes"].as_array().unwrap().len(), 1);
+        assert!(
+            saved["pending"].is_null(),
+            "No gameplay mutation has been dispatched"
+        );
+        let server = tokio::spawn(async move {
+            respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+            for _ in 0..2 {
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    observation([0.5, 1., 0.5]),
+                    200,
+                )
+                .await;
+            }
+            let (stream, query) =
+                request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+            assert_eq!(query["input"]["offset"], 0);
+            assert_eq!(
+                query["input"]["limit"], 1,
+                "Resume first validates a small current scene page"
+            );
+            reply(stream,serde_json::json!({"format":"minecraft-movement-options-v1",
+                "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},
+                "scene":"unchanged-scene","options":[],"complete":false,"next_offset":1,"retry_after_ms":25}),200).await;
+            let (stream, query) =
+                request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+            assert_eq!(
+                query["input"]["offset"], 8,
+                "Completed read work must not restart at zero"
+            );
+            reply(stream,serde_json::json!({"format":"minecraft-movement-options-v1",
+                "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},
+                "scene":"unchanged-scene","options":[],"complete":true,"next_offset":null,"retry_after_ms":25}),200).await;
+            let (stream, value) = request(&listener, "POST /v1/bots/fixture/actions ").await;
+            let action: ActionRequest = serde_json::from_value(value).unwrap();
+            assert!(matches!(action.action,Action::StartMove {target,..} if target.x==1.5));
+            reply(
+                stream,
+                serde_json::json!({"action_id":action.action_id,"outcome":"running",
+                "adapter_version":"fixture","error":null,"evidence":{}}),
+                200,
+            )
+            .await;
+            respond(&listener,&format!("GET /v1/bots/fixture/actions/{} ",action.action_id),
+                serde_json::json!({"action_id":action.action_id,"outcome":"observed","adapter_version":"fixture",
+                    "error":null,"evidence":{"native_effect_verified":true,"after":{"player":{
+                        "uuid":"actor","dimension":"fixture:world","position":[1.5,1.,0.5]}}}}),200).await;
+            respond(
+                &listener,
+                "GET /v1/bots/fixture/observations ",
+                observation([1.5, 1., 0.5]),
+                200,
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "The resumed invocation must not replay or submit a second intention"
+            );
+        });
+        let report = navigate(
+            &c,
+            goal(),
+            &path,
+            Options {
+                timeout_ms: 2000,
+                max_steps: 1,
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(report.status, "budget_exhausted");
+        assert_eq!(report.actions, 1);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["pending"].is_null());
+        assert!(saved["expansion"].is_null());
+    }
+    #[tokio::test]
+    async fn resumed_previews_reject_changed_scenes_lives_clocks_and_block_policy() {
+        for case in ["scene", "life", "clock", "velocity", "policy"] {
+            let root = Temp::new();
+            let path = root.0.join("navigation.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+                for _ in 0..2 {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/observations ",
+                        observation([0.5, 1., 0.5]),
+                        200,
+                    )
+                    .await;
+                }
+                let mut r = route([1.5, 1., 0.5]);
+                r.touched_blocks = vec!["minecraft:stone".into()];
+                respond(&listener,"POST /v1/bots/fixture/observations/query ",
+                    serde_json::json!({"format":"minecraft-movement-options-v1",
+                        "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},"scene":"scene-a",
+                        "options":[r],"complete":false,"next_offset":8,"retry_after_ms":1000}),200).await;
+                listener
+            });
+            let first = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    timeout_ms: 200,
+                    ..Options::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.actions, 0);
+            let listener = server.await.unwrap();
+            let server = tokio::spawn(async move {
+                respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+                let mut current = observation([0.5, 1., 0.5]);
+                match case {
+                    "life" => current["player"]["entity_id"] = serde_json::json!(2),
+                    "clock" => {
+                        current["world"]["sample_clock"] =
+                            serde_json::json!({"epoch":"replacement"})
+                    }
+                    "velocity" => current["player"]["velocity"] = serde_json::json!([0.1, 0., 0.]),
+                    _ => (),
+                }
+                for _ in 0..2 {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/observations ",
+                        current.clone(),
+                        200,
+                    )
+                    .await;
+                }
+                let (stream, query) =
+                    request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                assert_eq!(query["input"]["offset"], 0);
+                let validation = matches!(case, "scene" | "policy");
+                assert_eq!(
+                    query["input"]["limit"].as_u64(),
+                    validation.then_some(1),
+                    "{case}"
+                );
+                reply(
+                    stream,
+                    serde_json::json!({"format":"minecraft-movement-options-v1",
+                    "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},
+                    "scene":if case=="scene"{"scene-b"}else{"scene-a"},"options":[],
+                    "complete":case!="policy","next_offset":if case=="policy"{Some(1)}else{None},
+                    "retry_after_ms":25}),
+                    200,
+                )
+                .await;
+                if case == "policy" {
+                    let (stream, query) =
+                        request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                    assert_eq!(query["input"]["offset"], 8);
+                    reply(stream,serde_json::json!({"format":"minecraft-movement-options-v1",
+                        "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},"scene":"scene-a",
+                        "options":[],"complete":true,"next_offset":null,"retry_after_ms":25}),200).await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "Stale or newly forbidden routes must not dispatch a mutation: {case}"
+                );
+            });
+            let report = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    timeout_ms: 2000,
+                    blocked_blocks: if case == "policy" {
+                        vec!["minecraft:stone".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Options::default()
+                },
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(report.status, "no_known_route", "{case}");
+            assert_eq!(report.actions, 0);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(saved["expansion"].is_null());
+            assert!(saved["pending"].is_null());
+        }
     }
     #[test]
     fn only_explicit_local_pre_dispatch_rejection_retires_pending_without_native_claims() {

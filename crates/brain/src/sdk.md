@@ -131,6 +131,11 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   it never mines, teleports, breaks obstacles or chooses your task.
   The brain's navigate tool composes this same helper through its body arbiter;
   use it for a bounded route rather than one model turn per local waypoint.
+  Completed read pages survive operation deadlines. Resume the same goal and
+  journal; cached pages are validated against the current scene before use.
+  A read cursor is not gameplay progress, and pending action IDs still require
+  inspection/reconciliation rather than replay. The matching adapter prunes
+  endpoints that cannot contain a legal player pose before trajectory search.
   With alpha12 minecraft:fluid_facts, the adapter predicts still-water medium
   transitions and offers observed surface-water waypoints. Fluid height/tags/flow
   come from native observations, including waterlogged cells; currents, lava or
