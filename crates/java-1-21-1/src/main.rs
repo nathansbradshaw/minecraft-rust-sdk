@@ -1210,7 +1210,7 @@ fn dispatch(
                         .map(String::from),
                 )
                 .collect(),
-                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"move_up_blocks":4,"move_down_blocks":4,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":({
+                limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"finite_move_waypoint_blocks":motion::FINITE_WAYPOINT_AXIS,"move_up_blocks":4,"move_down_blocks":4,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":({
                     let mut schemas=discovery["observation_query_schemas"].as_object().cloned().unwrap_or_default();
                     schemas.insert(routes::CAPABILITY.into(),routes::schema());
                     Value::Object(schemas)

@@ -291,7 +291,11 @@ pub(super) fn defensive_target(o: &Observation) -> Option<i32> {
     o.world["entities"]
         .as_array()?
         .iter()
-        .filter(|e| e["hostile"] == true && e["visible"] == true)
+        .filter(|e| {
+            e["hostile"] == true
+                && e["visible"] == true
+                && super::geometry::primed_blast(e).is_none()
+        })
         .filter_map(|e| {
             let q = point(&e["position"])?;
             let distance = (0..3).map(|i| (p[i] - q[i]).powi(2)).sum::<f64>();

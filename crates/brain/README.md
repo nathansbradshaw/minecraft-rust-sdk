@@ -284,6 +284,14 @@ inside the existing coding image. Reuse its per-bot Cargo target and reviewed
 vendor configuration; do not download another toolchain or dependency bundle.
 
 The default `body` configuration is `{ "enabled": true, "period_ms": 150 }`.
+Observed primed creepers prioritize distance and observed cover. The body uses
+the adapter's advertised `finite_move_waypoint_blocks` limit for a longer
+continuous retreat, falling back to the older 3.5-block limit when absent.
+The Java adapter still validates the swept body against known collision
+geometry on admission and during execution. The body skips an opportunistic
+attack on a primed creeper. These controls do not guarantee that a late fuse
+can be escaped: local native trials survived a charged 30-tick fuse from
+4.5 blocks but failed from 3 blocks. Those failures remain open work.
 Evasion candidates include observed collision-top centres and jump trajectories
 to level or one-block-lower landings, allowing retreat from narrow ledges across
 gaps. Unknown terrain, hazards and collisions remain excluded; the server still
