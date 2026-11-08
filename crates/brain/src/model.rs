@@ -151,6 +151,16 @@ pub(crate) fn validate_choice(choice: &Choice) -> Result<()> {
 pub fn schema() -> Value {
     json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, compilation, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual tool input: Rust source for write, command for terminal, binary name for run, serialized typed action for sdk."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
+fn session_schema(development: bool) -> Value {
+    let mut schema = schema();
+    if development {
+        schema["properties"]["tool"]["enum"]
+            .as_array_mut()
+            .expect("fixed tool schema")
+            .retain(|tool| tool != "develop");
+    }
+    schema
+}
 pub struct Model {
     http: reqwest::Client,
     endpoint: String,
@@ -222,7 +232,7 @@ impl Model {
                 context,
                 model,
                 if development { "develop" } else { "plan" },
-                schema(),
+                session_schema(development),
                 include_str!("system.md"),
                 4096,
             )
@@ -230,6 +240,10 @@ impl Model {
         let choice: Choice =
             serde_json::from_str(&content).map_err(|e| format!("Invalid model tool JSON: {e}"))?;
         validate_choice(&choice)?;
+        ensure(
+            !(development && choice.tool == "develop"),
+            "Coding/investigation is already active; choose an actual work command",
+        )?;
         Ok((choice, usage))
     }
     pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {
@@ -368,6 +382,45 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn active_work_rejects_a_provider_returning_the_excluded_mode_command() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(
+                !request["format"]["properties"]["tool"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == "develop")
+            );
+            let choice = json!({"tool":"develop","input":"again","path":"","summary":"Already active","notes":"","experiment":false});
+            let reply = json!({"done":true,"message":{"content":choice.to_string()}}).to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let model = Model {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint,
+        };
+        let error = model
+            .choose_for(&json!({"goal":"repair"}), false, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already active"));
+        upstream.await.unwrap();
+    }
     async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {
         use tokio::io::AsyncReadExt;
         let mut header = Vec::new();
@@ -509,6 +562,24 @@ mod tests {
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(body["model"], "gpt-6-luna");
                 assert_eq!(body["purpose"], purpose);
+                let tools = body["format"]["properties"]["tool"]["enum"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(
+                    tools.iter().any(|tool| tool == "develop"),
+                    purpose == "plan"
+                );
+                for tool in [
+                    "write",
+                    "run",
+                    "terminal",
+                    "sdk",
+                    "query",
+                    "status",
+                    "reconcile",
+                ] {
+                    assert!(tools.iter().any(|value| value == tool));
+                }
                 let answer=json!({"tool":"observe","input":"","path":"","summary":"Inspect","notes":"","experiment":false}).to_string();
                 let reply=json!({"done":true,"reasoning_effort":effort,"usage":{"input_tokens":12,"cached_input_tokens":3,"output_tokens":5,"private":"must not be copied"},"message":{"content":answer}}).to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();

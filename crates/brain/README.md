@@ -422,6 +422,18 @@ error text and position changes cannot replenish this opportunity. Errors alread
 followed by a model decision, stale-task feedback and mutation errors cannot
 obtain it. The notice is client diagnostic evidence, not a new world fact or
 task success.
+
+The active diagnostic retains its error and original bounded request across
+subsequent inspections and restart. A changed experiment or task removes it from
+the active model context; the historical record remains in the journal. Existing
+notices are restored only when their recorded experiment/task/interface epoch
+matches, without issuing another investigation allowance.
+
+`decision_session` identifies the current reasoning role, work mode and remaining
+decisions. During development/investigation the response schema excludes the
+redundant `develop` routing command. Gameplay, observation, editing, execution
+and reconciliation tools remain available. Source edits during an active session
+do not renew it, including when Luna is handling a Sol-allocation fallback.
 ## Recovery during coding
 
 The resident body can eat ordinary prepared food from the hotbar or offhand
