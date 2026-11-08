@@ -14,6 +14,16 @@ only while origin and scene match. A candidate may yield no waypoint, so an
 empty page does not imply completion. Smaller pages bound output, not a new
 movement capability or evidence that the goal is reachable.
 
+Completed prediction pages are saved in the client's bounded navigation journal
+when a wall-time budget expires. A later invocation validates a small current
+page before resuming its saved cursor. Actor life, clock, pose, physical state
+and adapter changes discard stale read work; the adapter's scene identifier also
+covers the exact start and movement physics. The advertised retry interval is
+retained across invocations. The current blocked-block policy is applied when
+using cached predictions. These are read-only caches: pending action IDs retain
+their existing inspection/reconciliation rules and are never automatically
+replayed. An old journal without cached pages remains compatible.
+
 ```json
 {"kind":"position","dimension":"example:dimension","target":[12.5,64.0,8.5],"distance":0.25}
 ```

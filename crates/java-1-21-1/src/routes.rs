@@ -167,7 +167,18 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     // A changed control contract invalidates failed edges from old predictions
     // even if their terrain and endpoints are unchanged.
-    "java767-input-preview-v3".hash(&mut hash);
+    "java767-input-preview-v4".hash(&mut hash);
+    // Ordering and predictions depend on the precise start and physical
+    // state, including across separately resumed client invocations.
+    start.map(f64::to_bits).hash(&mut hash);
+    before.player["uuid"].to_string().hash(&mut hash);
+    before.player["entity_id"].to_string().hash(&mut hash);
+    before.world["sample_clock"]["epoch"]
+        .to_string()
+        .hash(&mut hash);
+    for field in ["physics", "velocity", "on_ground", "sprinting", "in_water"] {
+        before.player[field].to_string().hash(&mut hash);
+    }
     input.target.map(|p| p.map(f64::to_bits)).hash(&mut hash);
     before.player["dimension"].to_string().hash(&mut hash);
     before.player["movement_speed"].to_string().hash(&mut hash);
@@ -262,6 +273,27 @@ mod tests {
                 .iter()
                 .any(|r| r["target"][0].as_f64().unwrap() > 1.)
         );
+    }
+    #[test]
+    fn preview_scene_fences_actor_life_precise_pose_and_physical_changes() {
+        let o = room(false);
+        let original = page(&o, &json!({"limit":1}), 100).unwrap()["scene"].clone();
+        for changed in ["pose", "physics", "velocity", "life", "clock"] {
+            let mut current = o.clone();
+            match changed {
+                "pose" => current.player["position"][0] = json!(0.51),
+                "physics" => current.player["physics"]["gravity"] = json!(0.04),
+                "velocity" => current.player["velocity"] = json!([0.1, 0., 0.]),
+                "life" => current.player["entity_id"] = json!(999),
+                "clock" => current.world["sample_clock"] = json!({"epoch":"replacement"}),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                page(&current, &json!({"limit":1}), 100).unwrap()["scene"],
+                original,
+                "{changed}"
+            );
+        }
     }
     #[test]
     fn small_diagnostic_pages_preserve_scene_and_do_not_skip_candidates() {
