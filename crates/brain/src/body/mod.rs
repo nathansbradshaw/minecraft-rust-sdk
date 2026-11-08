@@ -1,4 +1,5 @@
 //! Replaceable container-local safety behavior, independent of model/terminal work.
+mod aerial;
 pub mod geometry;
 mod recovery;
 mod tactics;
