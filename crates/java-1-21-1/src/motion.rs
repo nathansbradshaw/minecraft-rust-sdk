@@ -287,7 +287,13 @@ fn steering(
     if jump && p.medium == Medium::Air {
         *needs_jump = false;
     }
-    if p.medium != Medium::Air && target[1] > body.position[1] + 0.1 {
+    if p.medium == Medium::Water {
+        // Pulse ordinary swim-up input to approach the requested height with
+        // low momentum. Waiting for a fixed height error builds an upward
+        // impulse that overshoots on release or oscillates until expiry.
+        let desired_vertical = ((target[1] - body.position[1]) * 0.5).clamp(-0.1, 0.1);
+        jump = body.velocity[1] < desired_vertical - 0.02;
+    } else if p.medium != Medium::Air && target[1] > body.position[1] + 0.1 {
         jump = true;
     }
     Ok((change, jump))
@@ -545,6 +551,20 @@ impl Actor {
                             }
                             if let Ok(mut receipt) = d.state.lock() {
                                 receipt.evidence["server_momentum"] = d.momentum_evidence();
+                            }
+                        }
+                    }
+                    let mut p = p;
+                    if let Some(fluids) = &snapshot.scene.fluids {
+                        match fluids.medium(e.body.position, p.width, p.height) {
+                            Ok(medium) => p.medium = medium,
+                            Err(reason) => {
+                                if let Some(d) = e.drive.take() {
+                                    finish_interrupted(
+                                        d,
+                                        &format!("Fluid conditions changed: {reason}"),
+                                    );
+                                }
                             }
                         }
                     }
