@@ -677,11 +677,16 @@ impl Brain {
                 let _ = client.disconnect().await;
                 return Err("Default Survival brain requires finite controls, survival/ranged facts, pending-action inspection and session material preservation".into());
             }
-            match body::Handle::start(
+            let finite_waypoint_axis = info.limits["finite_move_waypoint_blocks"]
+                .as_f64()
+                .filter(|v| (0.9..=4.2).contains(v))
+                .unwrap_or(3.5);
+            match body::Handle::start_with_waypoint_range(
                 profile.clone(),
                 cfg.body.clone(),
                 &cfg.state,
                 observed.clone(),
+                finite_waypoint_axis,
             ) {
                 Ok(h) => Some(h),
                 Err(e) => {

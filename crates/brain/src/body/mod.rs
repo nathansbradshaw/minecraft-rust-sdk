@@ -119,6 +119,15 @@ impl Handle {
         state: &Path,
         initial: Observation,
     ) -> Result<Self> {
+        Self::start_with_waypoint_range(profile, cfg, state, initial, 3.5)
+    }
+    pub(crate) fn start_with_waypoint_range(
+        profile: Profile,
+        cfg: Config,
+        state: &Path,
+        initial: Observation,
+        finite_waypoint_axis: f64,
+    ) -> Result<Self> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         ensure((50..=1000).contains(&cfg.period_ms), "Invalid body cadence")?;
         let socket = state.join("actions.sock");
@@ -178,7 +187,7 @@ impl Handle {
                         let journal = Journal::open(&journal)?;
                         let listener = tokio::net::UnixListener::from_std(listener)?;
                         tokio::select! {
-                            r=controller(client.clone(),cfg,active.clone(),stopped,&journal)=>r,
+                            r=controller(client.clone(),cfg,active.clone(),stopped,&journal,finite_waypoint_axis)=>r,
                             r=serve(listener,client,active.clone())=>r,
                         }
                     })
@@ -370,6 +379,7 @@ async fn controller(
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     j: &Journal,
+    finite_waypoint_axis: f64,
 ) -> Result<()> {
     let mut entropy = [0u8; 16];
     std::io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut entropy)?;
@@ -467,11 +477,12 @@ async fn controller(
         let threatened = geometry::threatened(&observed);
         let trail = retreat_trail.update(&observed, threatened || incoming);
         let escape = if active["outcome"] != "running" {
-            geometry::evade_with_stationary(
+            geometry::evade_with_limits(
                 &observed,
                 &rejected_routes,
                 &stationary_projectiles,
                 &trail,
+                finite_waypoint_axis,
             )
         } else {
             None

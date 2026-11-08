@@ -6,6 +6,11 @@ use std::{
     sync::{Condvar, atomic::AtomicI32},
 };
 
+// A finite waypoint can reach the edge of the local view when swept body
+// geometry is actually known. The preview and per-frame checks still reject
+// unknown space; this scalar is only the outer request bound.
+pub(super) const FINITE_WAYPOINT_AXIS: f64 = 4.05;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Impulse {
     Set([f64; 3]),
@@ -752,8 +757,8 @@ impl Actor {
             ));
         }
         let target = [target.x, target.y, target.z];
-        if (target[0] - e.body.position[0]).abs() > 3.5
-            || (target[2] - e.body.position[2]).abs() > 3.5
+        if (target[0] - e.body.position[0]).abs() > FINITE_WAYPOINT_AXIS
+            || (target[2] - e.body.position[2]).abs() > FINITE_WAYPOINT_AXIS
             || (target[1] - e.body.position[1]).abs() > 4.
         {
             return Err(ApiError::new(
@@ -852,6 +857,27 @@ mod tests {
             player: json!({"uuid":"fixture","dimension":"minecraft:overworld","position":[0.5,1.,0.5],"velocity":[0.,0.,0.],"health":20.,"movement_speed":0.1,"on_ground":true,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
             world: json!({"blocks":blocks}),
         }
+    }
+    #[test]
+    fn longer_local_input_still_requires_observed_swept_geometry() {
+        let o = input_prediction_fixture();
+        let target = [4.45, 1.0, 4.45];
+        let frames = preview(&o, target, false).expect("known diagonal floor");
+        assert!(frames.len() < 100);
+        assert!(distance(frames.last().unwrap().0, target) < 0.08);
+        let mut unknown = o.clone();
+        unknown.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["position"][0].as_i64().unwrap() < 4);
+        assert!(preview(&unknown, target, false).is_err());
+        let mut wall = o;
+        for b in wall.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][0] == 2 && b["position"][1] == 1 {
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        assert!(preview(&wall, target, false).is_err());
     }
     fn diagonal_gap_fixture() -> Observation {
         let mut o = input_prediction_fixture();

@@ -198,6 +198,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
             shared,
             stop,
             &journal,
+            3.5,
         ),
     )
     .await

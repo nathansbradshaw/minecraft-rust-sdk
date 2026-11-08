@@ -87,18 +87,21 @@ fn supported(cells: &Cells<'_>, p: [f64; 3], obstacles: &[[f64; 6]]) -> bool {
         })
     })
 }
-fn covered(p: [f64; 3], threat: [f64; 3], obstacles: &[[f64; 6]]) -> bool {
+fn occluded(from: [f64; 3], to: [f64; 3], obstacles: &[[f64; 6]]) -> bool {
     (1..40).any(|n| {
         let t = f64::from(n) / 40.;
-        let ray = [
-            p[0] + (threat[0] - p[0]) * t,
-            p[1] + 1.6 + (threat[1] - p[1]) * t,
-            p[2] + (threat[2] - p[2]) * t,
-        ];
+        let ray: [f64; 3] = std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t);
         obstacles
             .iter()
             .any(|b| (0..3).all(|i| ray[i] > b[i] && ray[i] < b[i + 3]))
     })
+}
+fn covered(p: [f64; 3], threat: [f64; 3], obstacles: &[[f64; 6]]) -> bool {
+    occluded(
+        [p[0], p[1] + 1.6, p[2]],
+        [threat[0], threat[1] + 1.6, threat[2]],
+        obstacles,
+    )
 }
 #[derive(Clone, Debug)]
 pub struct Escape {
@@ -110,9 +113,17 @@ pub struct Escape {
 pub fn threat_radius(entity: &Value) -> f64 {
     if entity["ranged_attack"] == true {
         24.
+    } else if entity["creeper"]["powered"] == true {
+        14.
     } else {
         10.
     }
+}
+/// An observed fuse, not a countdown or a guarantee of blast exposure.
+pub(super) fn primed_blast(entity: &Value) -> Option<f64> {
+    let creeper = &entity["creeper"];
+    (creeper["ignited"] == true || creeper["swell_direction"].as_i64().is_some_and(|n| n > 0))
+        .then_some(if creeper["powered"] == true { 12. } else { 6. })
 }
 pub fn threatened(o: &Observation) -> bool {
     let Some(start) = point(&o.player["position"]) else {
@@ -389,6 +400,15 @@ pub(super) fn evade_with_stationary(
     stationary: &[String],
     recent_retreat: &[[f64; 3]],
 ) -> Option<Escape> {
+    evade_with_limits(o, blocked, stationary, recent_retreat, 3.5)
+}
+pub(super) fn evade_with_limits(
+    o: &Observation,
+    blocked: &[[i32; 3]],
+    stationary: &[String],
+    recent_retreat: &[[f64; 3]],
+    waypoint_axis: f64,
+) -> Option<Escape> {
     if water_danger(o) {
         return water_escape(o, blocked);
     }
@@ -396,6 +416,7 @@ pub(super) fn evade_with_stationary(
     let mut threats = Vec::new();
     let mut projectile_danger = false;
     let mut incoming_directions = Vec::new();
+    let mut blasts = Vec::new();
     for e in o.world["entities"].as_array().into_iter().flatten() {
         if e["visible"] != true {
             continue;
@@ -409,6 +430,12 @@ pub(super) fn evade_with_stationary(
             .sqrt();
         if e["hostile"] == true && d < threat_radius(e) {
             threats.push((p, e["ranged_attack"] == true));
+            if let Some(radius) = primed_blast(e)
+                && d <= radius + 2.
+                && blasts.len() < 4
+            {
+                blasts.push((p, radius));
+            }
         }
         if e["projectile"] == true
             && !projectile_key(e).is_some_and(|id| stationary.contains(&id))
@@ -444,6 +471,7 @@ pub(super) fn evade_with_stationary(
         .filter_map(|b| point(&b["position"]).map(|p| ([p[0] as i32, p[1] as i32, p[2] as i32], b)))
         .collect();
     let obstacles = boxes(o);
+    let blast_escape = !blasts.is_empty();
     let score = |p: [f64; 3]| -> f64 {
         let distance = threats
             .iter()
@@ -482,7 +510,27 @@ pub(super) fn evade_with_stationary(
                 }
             })
             .fold(0., f64::max);
-        distance * 2. + cover + sidestep * 8. + ranged_lateral * 2.
+        let blast_safety = blasts
+            .iter()
+            .map(|(center, radius)| {
+                let distance = (0..3)
+                    .map(|i| (p[i] - center[i]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                // Occlusion is a preference, not a promise that a block will
+                // survive the explosion. Check more than an eye-height ray.
+                let shadow = [0.15, 0.85, 1.65].iter().all(|height| {
+                    occluded(
+                        [p[0], p[1] + height, p[2]],
+                        [center[0], center[1] + 0.7, center[2]],
+                        &obstacles,
+                    )
+                });
+                (distance / radius).min(1.25) + if shadow { 0.65 } else { 0.0 }
+            })
+            .reduce(f64::min)
+            .unwrap_or(0.0);
+        distance * 2. + cover + sidestep * 8. + ranged_lateral * 2. + blast_safety * 48.0
     };
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
@@ -499,6 +547,18 @@ pub(super) fn evade_with_stationary(
     }
     for n in 0..16 {
         let a = f64::from(n) * std::f64::consts::PI / 8.;
+        if blast_escape {
+            // Use one longer admitted input lease to avoid stopping in the
+            // blast radius between the ordinary short retreat segments.
+            let longest = ((waypoint_axis - 0.10) / a.cos().abs().max(a.sin().abs())).min(5.65);
+            for scale in [1., 0.82] {
+                candidates.push([
+                    start[0] + a.cos() * longest * scale,
+                    start[1],
+                    start[2] + a.sin() * longest * scale,
+                ]);
+            }
+        }
         for length in [2.8, 1.8, 0.9] {
             for dy in [0., 1., -1.] {
                 candidates.push([
@@ -553,7 +613,7 @@ pub(super) fn evade_with_stationary(
                 .filter(|q| (q[1] - p[1]).abs() < 0.75)
                 .map(|q| (2.0 - (p[0] - q[0]).hypot(p[2] - q[2])).max(0.0))
                 .fold(0.0, f64::max);
-            let value = safety - revisit * 4.0;
+            let value = safety - if blast_escape { 0.0 } else { revisit * 4.0 };
             if value > best_score {
                 best_score = value;
                 best = Some(Escape {
@@ -563,7 +623,9 @@ pub(super) fn evade_with_stationary(
                         z: p[2],
                     },
                     jump,
-                    reason: if projectile_danger {
+                    reason: if blast_escape {
+                        "leave the primed blast radius on one observed route"
+                    } else if projectile_danger {
                         "evade incoming projectile"
                     } else if burning {
                         "leave burning terrain"
@@ -773,6 +835,23 @@ mod tests {
             lateral >= retreat * 0.5,
             "Do not wait for an already imminent arrow before moving across its firing line: {route:?}"
         );
+    }
+    #[test]
+    fn primed_charged_creeper_prefers_a_long_observed_route() {
+        let mut o = world();
+        o.player["on_ground"] = json!(true);
+        o.world["entities"][0]["position"] = json!([-2.5, 1., 0.5]);
+        o.world["entities"][0]["creeper"] = json!({
+            "ignited":true,"swell_direction":1,"powered":true
+        });
+        let route = evade_with_limits(&o, &[], &[], &[], 4.05).expect("observed retreat");
+        assert!(!route.jump);
+        assert!(route.reason.contains("primed blast"));
+        assert!((route.target.x + 2.5).hypot(route.target.z - 0.5) > 7.9);
+        let legacy = evade_with_limits(&o, &[], &[], &[], 3.5).expect("compatible retreat");
+        assert!((legacy.target.x - 0.5).abs() <= 3.5 && (legacy.target.z - 0.5).abs() <= 3.5);
+        o.world["blocks"] = json!([]);
+        assert!(evade_with_limits(&o, &[], &[], &[], 4.05).is_none());
     }
     #[test]
     fn ranged_retreat_prefers_an_alternative_to_a_recently_traversed_landing() {
