@@ -2,6 +2,7 @@ use minecraft_sdk_core::*;
 mod chat;
 mod control;
 mod effects;
+mod fluids;
 mod motion;
 mod recipes;
 mod routes;

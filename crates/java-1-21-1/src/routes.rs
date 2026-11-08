@@ -54,8 +54,8 @@ fn body_cells(p: [f64; 3]) -> impl Iterator<Item = [i32; 3]> {
 }
 pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyResult<Value> {
     let input = parse(input)?;
-    if before.player["on_ground"] != true {
-        return Err("Movement options require a grounded observation; wait for the finite control to release".into());
+    if before.player["on_ground"] != true && before.player["in_water"] != true {
+        return Err("Movement options require grounded or water-supported observations; wait for the finite control to release".into());
     }
     let start = position(before)?;
     let boxes = collision_boxes(before)?;
@@ -99,6 +99,46 @@ pub(super) fn page(before: &Observation, input: &Value, max_ticks: u16) -> AnyRe
             {
                 candidates.push(target);
             }
+        }
+    }
+    // Float only at an observed water/air boundary, never at an invented
+    // surface or in a submerged cell below another fluid volume.
+    let by_position: HashMap<[i32; 3], &Value> = rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                [
+                    r["position"][0].as_i64()? as i32,
+                    r["position"][1].as_i64()? as i32,
+                    r["position"][2].as_i64()? as i32,
+                ],
+                r,
+            ))
+        })
+        .collect();
+    for (p, row) in &by_position {
+        if row["fluid"]["water"] != true
+            || row["fluid"]["format"] != "java767-fluid-v1"
+            || by_position
+                .get(&[p[0], p[1] + 1, p[2]])
+                .is_none_or(|above| above["fluid"]["empty"] != true)
+        {
+            continue;
+        }
+        let height = row["fluid"]["height"]
+            .as_f64()
+            .ok_or("Fluid height missing")?;
+        let target = [
+            f64::from(p[0]) + 0.5,
+            f64::from(p[1]) + height - 0.4,
+            f64::from(p[2]) + 0.5,
+        ];
+        if (target[0] - start[0]).abs() <= 3.5
+            && (target[2] - start[2]).abs() <= 3.5
+            && target[1] - start[1] <= 1.25
+            && start[1] - target[1] <= 3.0
+        {
+            candidates.push(target);
         }
     }
     if let Some(target) = input.target {

@@ -1,6 +1,7 @@
 package dev.minecraftsdk;
 
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
@@ -50,6 +51,17 @@ final class NativeObservation {
                 row.put("position",List.of(pos.getX(),pos.getY(),pos.getZ()));row.put("block",BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());row.put("state",state.toString());row.put("replaceable",state.canBeReplaced());row.put("may_interact",world.mayInteract(player,pos));
                 float progress=state.getDestroyProgress(player,world,pos);row.put("destroy_progress",progress>0?Math.min(1.0f,progress):0f);
                 row.put("friction",state.getBlock().getFriction());row.put("speed_factor",state.getBlock().getSpeedFactor());
+                var fluid=state.getFluidState();var fluidRow=new LinkedHashMap<String,Object>();
+                fluidRow.put("format","java767-fluid-v1");fluidRow.put("empty",fluid.isEmpty());
+                fluidRow.put("id",BuiltInRegistries.FLUID.getKey(fluid.getType()).toString());
+                fluidRow.put("water",fluid.is(FluidTags.WATER));fluidRow.put("lava",fluid.is(FluidTags.LAVA));
+                fluidRow.put("height",fluid.isEmpty()?0f:fluid.getHeight(world,pos));
+                // Flow can inspect horizontal neighbours. Do not cause a chunk
+                // load just to predict movement at the edge of a loaded scene.
+                boolean flowKnown=fluid.isEmpty()||(world.hasChunkAt(pos.north())&&world.hasChunkAt(pos.south())&&world.hasChunkAt(pos.east())&&world.hasChunkAt(pos.west()));
+                fluidRow.put("flow_known",flowKnown);
+                if(flowKnown){var flow=fluid.isEmpty()?net.minecraft.world.phys.Vec3.ZERO:fluid.getFlow(world,pos);fluidRow.put("flow",List.of(flow.x,flow.y,flow.z));}
+                row.put("fluid",fluidRow);
                 row.put("collision",state.getCollisionShape(world,pos).toAabbs().stream().map(a->List.of(a.minX,a.minY,a.minZ,a.maxX,a.maxY,a.maxZ)).toList());blocks.add(row);
             }
         }
@@ -70,7 +82,7 @@ final class NativeObservation {
         var own=new LinkedHashMap<String,Object>();own.put("uuid",player.getUUID().toString());own.put("name",player.getGameProfile().getName());own.put("entity_id",player.getId());own.put("dimension",world.dimension().location().toString());own.put("position",List.of(player.getX(),player.getY(),player.getZ()));own.put("yaw",player.getYRot());own.put("pitch",player.getXRot());own.put("on_ground",player.onGround());own.put("sprinting",player.isSprinting());own.put("sneaking",player.isShiftKeyDown());own.put("health",player.getHealth());own.put("food",player.getFoodData().getFoodLevel());own.put("inventory",inventory);own.put("selected",player.getInventory().selected);
         own.put("native_action_effects",NativeEffects.snapshot(player));
         own.put("saturation",player.getFoodData().getSaturationLevel());own.put("air",player.getAirSupply());own.put("max_air",player.getMaxAirSupply());own.put("fire_ticks",player.getRemainingFireTicks());
-        own.put("in_water",player.isInWater());own.put("in_lava",player.isInLava());own.put("fall_distance",player.fallDistance);own.put("using_item",player.isUsingItem());
+        own.put("in_water",player.isInWater());own.put("eyes_in_water",player.isEyeInFluid(FluidTags.WATER));own.put("in_lava",player.isInLava());own.put("fall_distance",player.fallDistance);own.put("using_item",player.isUsingItem());
         own.put("use_item",stack(player.getUseItem(),player));own.put("remaining_use_ticks",player.getUseItemRemainingTicks());own.put("attack_strength",player.getAttackStrengthScale(0.5f));
         own.put("velocity",List.of(player.getDeltaMovement().x,player.getDeltaMovement().y,player.getDeltaMovement().z));
         own.put("movement_speed",player.getAttributeValue(Attributes.MOVEMENT_SPEED));own.put("attack_damage",player.getAttributeValue(Attributes.ATTACK_DAMAGE));

@@ -142,9 +142,19 @@ pub fn threatened(o: &Observation) -> bool {
                 })
         })
 }
-/// Immersion needs an independent body even before damage or a hostile appears.
+/// Submersion needs protection independently of inference. A natively confirmed
+/// breathing surface swimmer may keep its finite input; unknown facts retain
+/// the conservative escape policy. No health/shelter prerequisite gates thought.
 pub fn water_danger(o: &Observation) -> bool {
-    o.player["in_water"] == true
+    if o.player["in_water"] != true {
+        return false;
+    }
+    let breathing = o.player["eyes_in_water"] == false
+        && o.player["air"]
+            .as_i64()
+            .zip(o.player["max_air"].as_i64())
+            .is_some_and(|(air, max)| max > 0 && air >= max);
+    !breathing
 }
 
 /// Local policy, not permission or a path-completion claim. Prefer an observed
@@ -669,6 +679,19 @@ mod tests {
             }
         }
         o
+    }
+    #[test]
+    fn only_confirmed_breathing_with_full_air_allows_surface_swimming() {
+        let mut o = pool();
+        o.player["air"] = json!(300);
+        assert!(water_danger(&o), "missing eye facts retain protection");
+        o.player["eyes_in_water"] = json!(false);
+        assert!(!water_danger(&o));
+        o.player["eyes_in_water"] = json!(true);
+        assert!(water_danger(&o), "protect immediately, before air loss");
+        o.player["eyes_in_water"] = json!(false);
+        o.player["air"] = json!(280);
+        assert!(water_danger(&o), "recover air before yielding protection");
     }
     #[test]
     fn water_without_hostiles_still_requires_a_breathing_route() {

@@ -83,6 +83,7 @@ struct Scene {
     boxes: Vec<[f64; 6]>,
     cells: std::collections::HashSet<[i32; 3]>,
     surfaces: Vec<([f64; 6], f64, f64)>,
+    fluids: Option<fluids::Volumes>,
 }
 impl Scene {
     fn new(o: &Observation) -> AnyResult<Self> {
@@ -124,6 +125,7 @@ impl Scene {
             boxes,
             cells,
             surfaces,
+            fluids: fluids::Volumes::new(o.world["blocks"].as_array().ok_or("Terrain missing")?)?,
         })
     }
     fn covers(&self, from: [f64; 3], to: [f64; 3], p: Parameters) -> bool {
@@ -302,13 +304,18 @@ pub(super) fn preview(
     let mut needs_jump = jump;
     let mut frames = Vec::new();
     for _ in 0..100 {
-        if arrived(&body, target, needs_jump, params.medium) {
+        let medium = match &scene.fluids {
+            Some(v) => v.medium(body.position, params.width, params.height)?,
+            None => params.medium,
+        };
+        if arrived(&body, target, needs_jump, medium) {
             return Ok(frames);
         }
         let (friction, speed_factor) = scene.surface(&body, params.width);
         let p = Parameters {
             friction,
             speed_factor,
+            medium,
             ..params
         };
         let (acceleration, jump) = steering(&body, target, &mut needs_jump, o, p)?;
@@ -862,6 +869,41 @@ mod tests {
             player: json!({"uuid":"fixture","dimension":"minecraft:overworld","position":[0.5,1.,0.5],"velocity":[0.,0.,0.],"health":20.,"movement_speed":0.1,"on_ground":true,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
             world: json!({"blocks":blocks}),
         }
+    }
+    #[test]
+    fn still_water_entry_surface_steering_and_shore_exit_use_per_frame_medium() {
+        let mut o = input_prediction_fixture();
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            let water = row["position"][0].as_i64().unwrap() >= 1
+                && (-2..=0).contains(&row["position"][1].as_i64().unwrap());
+            row["fluid"] = json!({"format":"java767-fluid-v1","empty":!water,
+                "water":water,"lava":false,"height":if row["position"][1]==0 {0.8888889}else{1.},
+                "flow_known":true,"flow":[0,0,0]});
+            if water {
+                row["collision"] = json!([]);
+            }
+        }
+        let target = [2.5, 0.5, 0.5];
+        let entered = preview(&o, target, false).expect("dry to observed still water");
+        assert!(distance(entered.last().unwrap().0, target) < 0.08);
+        o.player["position"] = json!(target);
+        o.player["on_ground"] = json!(false);
+        o.player["in_water"] = json!(true);
+        let shore = [0.5, 1., 0.5];
+        let exited = preview(&o, shore, false).expect("observed shore exit");
+        assert!(distance(exited.last().unwrap().0, shore) < 0.08);
+        assert!(exited.last().unwrap().1);
+        let swim = preview(&o, [3.5, 0.5, 0.5], false).expect("surface swim");
+        assert!(distance(swim.last().unwrap().0, [3.5, 0.5, 0.5]) < 0.08);
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            if row["fluid"]["water"] == true {
+                row["fluid"]["flow"] = json!([0.2, 0, 0]);
+            }
+        }
+        assert!(
+            preview(&o, [3.5, 0.5, 0.5], false).is_err(),
+            "currents are explicitly unsupported"
+        );
     }
     #[test]
     fn sprint_jump_prediction_uses_native_facing_and_rejects_missing_yaw() {
