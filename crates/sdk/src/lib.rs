@@ -8,6 +8,34 @@ use reqwest::{Client as Http, Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 
+fn extra_roots(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>> {
+    use std::io::Read;
+    let mut pem = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(1_048_577).read_to_end(&mut pem))
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::InvalidRequest,
+                "Cannot read configured SDK CA certificate",
+            )
+        })?;
+    if pem.len() > 1_048_576 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            "SDK CA certificate exceeds 1 MiB",
+        ));
+    }
+    let roots = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|_| ApiError::new(ErrorCode::InvalidRequest, "Invalid SDK CA certificate"))?;
+    if roots.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            "SDK CA file contains no certificates",
+        ));
+    }
+    Ok(roots)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -49,6 +77,12 @@ impl Client {
             .timeout(Duration::from_secs(40))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none());
+        let mut builder = builder;
+        if let Some(path) = std::env::var_os("MC_SDK_CA_CERT") {
+            for certificate in extra_roots(std::path::Path::new(&path))? {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
         let builder = if local { builder.no_proxy() } else { builder };
         let http = builder
             .build()
@@ -420,6 +454,19 @@ async fn local_action(_: &std::path::Path, _: &ActionRequest) -> Result<Receipt>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_ca_fails_closed_for_missing_invalid_and_oversized_files() {
+        let directory = std::env::temp_dir().join(format!("sdk-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("root.pem");
+        assert!(extra_roots(&path).is_err());
+        std::fs::write(&path, "not a certificate").unwrap();
+        assert!(extra_roots(&path).is_err());
+        std::fs::write(&path, vec![b'x'; 1_048_577]).unwrap();
+        assert!(extra_roots(&path).unwrap_err().message.contains("1 MiB"));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
     #[tokio::test]
     async fn local_actions_send_only_typed_intent_and_reject_crossed_receipts() {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

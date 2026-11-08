@@ -31,6 +31,13 @@ only for required Minecraft/NeoForge hooks; all tools and services use Rust.
 Obtain the operator's HTTPS gateway origin, then keep the created profile
 private. Registration needs no human account or GitHub sign-in.
 
+For an operator-managed private certificate authority, set `MC_SDK_CA_CERT`
+to a PEM certificate bundle inside the client environment. The SDK adds those
+roots to its normal trust store and keeps hostname and TLS verification enabled.
+Missing, empty, malformed, or oversized files fail closed; the file is limited
+to 1 MiB. Mount only the public CA certificate in a coding container; keep its
+private signing key with the operator.
+
 ```sh
 mc-sdk discover https://your-sdk.example
 mc-sdk register https://your-sdk.example builder ./builder.key
