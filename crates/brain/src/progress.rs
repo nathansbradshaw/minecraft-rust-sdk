@@ -8,7 +8,15 @@ use std::{fs, path::Path};
 /// mutation under another ID is not a new experiment or evidence of progress.
 pub fn experiment_signature(source: &str, result: &Value) -> String {
     let actions:Vec<_>=result["local_action_feedback"]["requests"].as_array().into_iter().flatten().map(|row|json!({"action":row["request"]["action"],"outcome":row["response"]["outcome"],"error_code":row["response"]["error"]["code"],"verified":row["response"]["native_effect_verified"]})).collect();
-    crate::digest(json!({"source":source,"exit_code":result["exit_code"],"success":result["success"],"timed_out":result["timed_out"],"error":result["error"],"compiler_errors":result["compiler_diagnostics"]["errors"],"actions":actions,"inventory_delta":result["inventory_delta"]}).to_string().as_bytes())
+    let mut semantic = json!({"source":source,"exit_code":result["exit_code"],"success":result["success"],"timed_out":result["timed_out"],"error":result["error"],"compiler_errors":result["compiler_diagnostics"]["errors"],"actions":actions,"inventory_delta":result["inventory_delta"]});
+    if result["navigation"].is_object() {
+        // A different typed boundary matters. Clocks, paths, cumulative counters
+        // and radius/target jitter cannot turn a stalled call into new evidence.
+        semantic["navigation"] = json!({"status":result["navigation"]["report"]["status"],
+            "pending":result["navigation"]["report"]["pending_action"].is_string(),
+            "error_code":result["navigation"]["error"]["code"]});
+    }
+    crate::digest(semantic.to_string().as_bytes())
 }
 /// Changes to clocks, delivered chat or moving entity coordinates do not reset
 /// diagnosis. Changed terrain, owned inventory, position or needs can matter.
