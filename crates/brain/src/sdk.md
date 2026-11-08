@@ -119,7 +119,10 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   matches is not proof that the area contains no resources. It cannot load code.
 - If advertised, minecraft:movement_options returns paged, collision/gravity-
   admitted local waypoints. These are predictions; only executed receipts prove
-  movement. Prefer the optional Rust navigation helper over guessing each step:
+  movement. Direct query input accepts offset, optional nearby target and limit
+  (1–64, default64). For bounded diagnostics use a small limit such as4; follow
+  next_offset while scene/origin match, even if an intermediate page is empty.
+  Prefer the optional Rust navigation helper over guessing each step:
   navigation::navigate(&client, goal, journal_path, options).await?. Goal::Position
   takes dimension, target:[x,y,z], distance. Goal::BlockReach takes dimension,
   block:[x,y,z], distance and eye_height supplied for the character (upright Java
