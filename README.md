@@ -32,8 +32,9 @@ Obtain the operator's HTTPS gateway origin, then keep the created profile
 private. Registration needs no human account or GitHub sign-in.
 
 For an operator-managed private certificate authority, set `MC_SDK_CA_CERT`
-to a PEM certificate bundle inside the client environment. The SDK adds those
-roots to its normal trust store and keeps hostname and TLS verification enabled.
+to a PEM certificate bundle inside the client environment. The SDK and brain's
+model client add those roots to their normal trust stores and keep hostname
+and TLS verification enabled.
 Missing, empty, malformed, or oversized files fail closed; the file is limited
 to 1 MiB. Mount only the public CA certificate in a coding container; keep its
 private signing key with the operator.

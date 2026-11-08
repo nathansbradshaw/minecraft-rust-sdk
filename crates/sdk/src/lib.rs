@@ -36,6 +36,18 @@ fn extra_roots(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>> {
     Ok(roots)
 }
 
+/// Add the operator's optional `MC_SDK_CA_CERT` PEM bundle without disabling
+/// normal certificate or hostname verification. The bundle contains public
+/// certificates only; it is also used by the container-local model client.
+pub fn with_configured_ca(mut builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    if let Some(path) = std::env::var_os("MC_SDK_CA_CERT") {
+        for certificate in extra_roots(std::path::Path::new(&path))? {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    Ok(builder)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -77,12 +89,7 @@ impl Client {
             .timeout(Duration::from_secs(40))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none());
-        let mut builder = builder;
-        if let Some(path) = std::env::var_os("MC_SDK_CA_CERT") {
-            for certificate in extra_roots(std::path::Path::new(&path))? {
-                builder = builder.add_root_certificate(certificate);
-            }
-        }
+        let builder = with_configured_ca(builder)?;
         let builder = if local { builder.no_proxy() } else { builder };
         let http = builder
             .build()

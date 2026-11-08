@@ -192,14 +192,16 @@ impl Model {
         value.set_sensitive(true);
         headers.insert(reqwest::header::AUTHORIZATION, value);
         Ok(Self {
-            http: reqwest::Client::builder()
-                .default_headers(headers)
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(10))
-                // Includes the compatible broker's bounded FIFO queue and its
-                // inference deadline, rather than abandoning an admitted job.
-                .timeout(Duration::from_secs(125))
-                .build()?,
+            http: minecraft_sdk::with_configured_ca(
+                reqwest::Client::builder()
+                    .default_headers(headers)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(10))
+                    // Includes the compatible broker's bounded FIFO queue and its
+                    // inference deadline, rather than abandoning an admitted job.
+                    .timeout(Duration::from_secs(125)),
+            )?
+            .build()?,
             endpoint: endpoint.into(),
         })
     }
