@@ -249,6 +249,10 @@ action admission and observed completion. There is one gameplay controller;
 this fallback grants no competing model control or extra model allowance.
 `body-probe` exercises blocked-reasoning and actual-compilation diagnostics;
 `body-probe inspect-observation` replays only the fast policy without acting.
+`body-probe CONFIG exposed SECONDS` deliberately disables protection and samples
+native health on a bounded timer to check actual hostile pressure. Exposed
+controls never count as agent successes. Record weak exposures and timing errors;
+the presence of a hostile alone does not demonstrate a Survival challenge.
 These diagnostics do not establish general Survival competence.
 
 Visible hostile phantoms receive a 32-block warning radius in the replaceable
