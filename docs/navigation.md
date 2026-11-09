@@ -98,3 +98,13 @@ Scene/origin changes invalidate paged route accumulation. Normal server
 permissions remain authoritative when executing a route, including denials that
 arise after prediction. Client journals, graphs and reports remain editable
 client data and cannot certify benchmark success or character ownership.
+
+After a verified arrival, small residual drift (up to 0.35 blocks) can cross the
+local graph's rounding boundary. The helper expands the reached waypoint when
+the current observation matches that arrival's native entity life, dimension
+and server clock epoch. This prevents repeated corrective visits to a waypoint
+that remains marked unexplored. It does not change exact goal tolerances,
+simulate a game effect, or relax native admission. Missing/legacy lane facts,
+larger displacement, a new life, or a changed epoch use the current pose key.
+Pending intentions retain their selected source node so failed edges remain
+fenced under the same graph identity after interruption and reopening.
