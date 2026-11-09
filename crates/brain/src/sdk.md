@@ -103,6 +103,12 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   fresh observation when appropriate. The caller chooses slots and verifies effects.
   menu::item_count(&observation, item_id) counts retained player inventory only,
   excluding a prepared output or carried cursor stack. Do not print every air slot.
+  The default brain menu.non_player_stacks view preserves bounded occupied slot
+  bindings, separate from player.inventory and menu.carried. Follow its complete
+  and omitted_occupied_slots fields; absent slots are not proved empty. Inspect
+  native roles and fresh menu/state IDs before clicking. Prepare, take output,
+  and verify retained inventory before preparing a dependent recipe. A prepared
+  ingredient in the output/grid has not yet been acquired to unlock later recipes.
 - If advertised, minecraft:recipes discovers exact installed recipe IDs using
   recipe, output item or type selectors and bounded offset/limit pagination.
   The Rust recipes::Query helper builds that same read-only query. Recipe IDs
