@@ -137,11 +137,12 @@ fn main_hand_changed(action: &Action, before: &Observation, after: &Observation)
             }
     ) && before.player["selected"] != after.player["selected"]
 }
-fn proof(action: &Action, before: &Observation, after: &Observation) -> Option<Value> {
+fn proof(action: &Action, before: &Observation, after: &Observation, preparation: Option<&recipes::Preparation>) -> Option<Value> {
     if !same_lane(before, after) {
         return None;
     }
     match action {
+        Action::Craft { .. } => preparation?.proof(before, after),
         Action::Attack { .. } => new_event(action,before,after).cloned(),
         Action::UseItem { hand } | Action::StartUseItem { hand, .. } => {
             if after.player["using_item"] != false { return None; }
@@ -161,6 +162,10 @@ fn proof(action: &Action, before: &Observation, after: &Observation) -> Option<V
     }
 }
 
+pub(super) struct Baseline {
+    pub observation: Observation,
+    pub preparation: Option<recipes::Preparation>,
+}
 pub(super) struct Job {
     id: String,
     held: bool,
@@ -256,12 +261,13 @@ impl Job {
     pub fn start(
         player: &Player,
         native: Native,
-        before: Observation,
+        baseline: Baseline,
         request: &ActionRequest,
         sent: bool,
         max_ticks: u16,
         epoch: u64,
     ) -> Self {
+        let before = baseline.observation;
         let state = Arc::new(Mutex::new(Receipt {
             action_id: request.action_id.clone(),
             outcome: Outcome::Running,
@@ -274,6 +280,7 @@ impl Job {
         let ctx = Context {
             native,
             before,
+            preparation: baseline.preparation,
             request: request.clone(),
             state: state.clone(),
             latest: latest.clone(),
@@ -316,6 +323,7 @@ impl Job {
 struct Context {
     native: Native,
     before: Observation,
+    preparation: Option<recipes::Preparation>,
     request: ActionRequest,
     state: Arc<Mutex<Receipt>>,
     latest: Arc<Mutex<Option<Observation>>>,
@@ -466,7 +474,7 @@ impl Context {
                     use_start = after.world["game_time"].as_u64();
                 }
                 let released = !is_held || after.player["using_item"] == false;
-                if let Some(effect) = proof(&self.request.action, &self.before, &after) {
+                if let Some(effect) = proof(&self.request.action, &self.before, &after, self.preparation.as_ref()) {
                     self.finish(
                         Outcome::Observed,
                         Some(&after),
@@ -570,17 +578,17 @@ mod tests {
         after.player["food"] = json!(20);
         let action = Action::UseItem { hand: Hand::Main };
         assert!(
-            proof(&action, &before, &after).is_some(),
+            proof(&action, &before, &after, None).is_some(),
             "ordinary same-life held-stack change remains observable"
         );
         after.player["entity_id"] = json!(18);
         assert!(
-            proof(&action, &before, &after).is_none(),
+            proof(&action, &before, &after, None).is_none(),
             "death inventory loss cannot certify an old item-use intention"
         );
         after.player["entity_id"] = Value::Null;
         assert!(
-            proof(&action, &before, &after).is_none(),
+            proof(&action, &before, &after, None).is_none(),
             "unknown life binding is not same-life evidence"
         );
     }
@@ -595,9 +603,9 @@ mod tests {
             .unwrap()
             .push(json!({"slot":1,"item":"minecraft:iron_sword","count":1}));
         let action = Action::UseItem { hand: Hand::Main };
-        assert!(proof(&action, &before, &after).is_none());
+        assert!(proof(&action, &before, &after, None).is_none());
         after.player["native_action_effects"]["events"] = json!([{"sequence":2,"actor_uuid":"own","dimension":"minecraft:overworld","kind":"item_use_finished","item":"minecraft:apple","hand":"MAIN_HAND"}]);
-        assert!(proof(&action, &before, &after).is_some());
+        assert!(proof(&action, &before, &after, None).is_some());
     }
     #[test]
     fn damage_requires_a_new_attributed_effect_not_another_attackers_health_change() {
@@ -606,9 +614,9 @@ mod tests {
         a.world["sample_clock"]["nanos"] = json!("2");
         a.world["entities"][0]["health"] = json!(18.);
         let action = Action::Attack { entity: 7 };
-        assert!(proof(&action, &b, &a).is_none());
+        assert!(proof(&action, &b, &a, None).is_none());
         a.player["native_action_effects"]["events"] = json!([damage()]);
-        assert!(proof(&action, &b, &a).is_some());
+        assert!(proof(&action, &b, &a, None).is_some());
         for (field, value) in [
             ("actor_uuid", json!("other")),
             ("target_uuid", json!("other")),
@@ -620,12 +628,12 @@ mod tests {
             let mut wrong = a.clone();
             wrong.player["native_action_effects"]["events"][0][field] = value;
             assert!(
-                proof(&action, &b, &wrong).is_none(),
+                proof(&action, &b, &wrong, None).is_none(),
                 "accepted wrong {field}"
             );
         }
         a.player["native_action_effects"]["epoch"] = json!("new-connection");
-        assert!(proof(&action, &b, &a).is_none());
+        assert!(proof(&action, &b, &a, None).is_none());
     }
 
     struct Lab {
@@ -734,6 +742,7 @@ mod tests {
             let ctx = Context {
                 native: self.native.clone(),
                 before: self.observed.lock().unwrap().clone(),
+                preparation: None,
                 request: request.clone(),
                 state: state.clone(),
                 latest: latest.clone(),
