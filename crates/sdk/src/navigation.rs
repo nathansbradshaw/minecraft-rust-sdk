@@ -120,6 +120,9 @@ pub struct Report {
     pub position: [f64; 3],
     pub remaining_distance: f64,
     pub actions: usize,
+    /// Valid transient previews encountered by this durable navigation journal.
+    #[serde(default)]
+    pub preview_waits: u64,
     pub pending_action: Option<String>,
     pub journal: PathBuf,
     pub note: String,
@@ -193,6 +196,8 @@ struct State {
     goal: Goal,
     prefix: String,
     sequence: u64,
+    #[serde(default)]
+    preview_waits: u64,
     nodes: BTreeMap<String, Node>,
     blocked: BTreeSet<String>,
     pending: Option<Attempt>,
@@ -275,6 +280,7 @@ impl Journal {
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ),
                 sequence: 0,
+                preview_waits: 0,
                 nodes: BTreeMap::new(),
                 blocked: BTreeSet::new(),
                 pending: None,
@@ -323,6 +329,7 @@ impl Journal {
             position: self.state.position,
             remaining_distance: self.state.goal.gap(self.state.position),
             actions: self.state.history.len(),
+            preview_waits: self.state.preview_waits,
             pending_action: self
                 .state
                 .pending
@@ -604,13 +611,38 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 )
             })?;
             if page.format != "minecraft-movement-options-v1"
-                || page.scene.is_empty()
                 || page.scene.len() > 128
                 || page.options.len() > 64
             {
                 return Err(error(
                     ErrorCode::UnsupportedVersion,
                     "Movement option version is incompatible",
+                ));
+            }
+            if page.origin.is_none() {
+                // The adapter returns this envelope while a finite control or
+                // its preview interval is still active. It is read readiness,
+                // not an incompatible adapter or an uncertain mutation.
+                if !page.scene.is_empty()
+                    || !page.options.is_empty()
+                    || page.complete
+                    || page.next_offset.is_some()
+                {
+                    return Err(error(
+                        ErrorCode::UnsupportedVersion,
+                        "Invalid pending movement preview",
+                    ));
+                }
+                j.state.preview_waits = j.state.preview_waits.saturating_add(1);
+                j.save()?;
+                tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000)))
+                    .await;
+                continue;
+            }
+            if page.scene.is_empty() {
+                return Err(error(
+                    ErrorCode::UnsupportedVersion,
+                    "Ready movement preview has no scene",
                 ));
             }
             if page.options.iter().any(|r| {
@@ -624,11 +656,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                     "Invalid route prediction",
                 ));
             }
-            let Some(now) = page.origin else {
-                tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000)))
-                    .await;
-                continue;
-            };
+            let now = page.origin.expect("Validated ready movement preview");
             if now.dimension != pose.dimension || distance(now.position, pose.position) > 0.15 {
                 origin = None;
                 j.state.expansion = None;
@@ -942,6 +970,103 @@ mod tests {
         })
         .unwrap()
         .without_local_arbiter()
+    }
+    fn busy_preview() -> serde_json::Value {
+        serde_json::json!({"format":"minecraft-movement-options-v1","origin":null,
+            "scene":"","options":[],"complete":false,"next_offset":null,
+            "retry_after_ms":25,"busy":true,"prediction_not_effect_proof":true})
+    }
+    #[tokio::test]
+    async fn busy_previews_retry_without_misreporting_version_or_dispatching_a_mutation() {
+        for case in [
+            "ready",
+            "deadline",
+            "malformed",
+            "version",
+            "empty_ready_scene",
+        ] {
+            let root = Temp::new();
+            let path = root.0.join("navigation.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+                for _ in 0..2 {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/observations ",
+                        observation([0.5, 1., 0.5]),
+                        200,
+                    )
+                    .await;
+                }
+                let mut pending = busy_preview();
+                match case {
+                    "deadline" => pending["retry_after_ms"] = serde_json::json!(5000),
+                    "malformed" => pending["complete"] = serde_json::json!(true),
+                    "version" => pending["format"] = serde_json::json!("future-v2"),
+                    "empty_ready_scene" => {
+                        pending["origin"] = serde_json::json!({
+                        "position":[0.5,1.,0.5],"dimension":"fixture:world"})
+                    }
+                    _ => (),
+                }
+                respond(
+                    &listener,
+                    "POST /v1/bots/fixture/observations/query ",
+                    pending,
+                    200,
+                )
+                .await;
+                if case == "ready" {
+                    let (stream, query) =
+                        request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                    assert_eq!(query["input"]["offset"], 0);
+                    reply(
+                        stream,
+                        serde_json::json!({"format":"minecraft-movement-options-v1",
+                        "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},
+                        "scene":"ready-scene","options":[],"complete":true,
+                        "next_offset":null,"retry_after_ms":25}),
+                        200,
+                    )
+                    .await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                        .await
+                        .is_err(),
+                    "Readiness must not invent a gameplay intention"
+                );
+            });
+            let result = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    timeout_ms: 200,
+                    ..Options::default()
+                },
+            )
+            .await;
+            match case {
+                "ready" => assert_eq!(result.unwrap().status, "no_known_route"),
+                "deadline" => assert_eq!(result.unwrap().status, "budget_exhausted"),
+                _ => assert_eq!(result.unwrap_err().code, ErrorCode::UnsupportedVersion),
+            }
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(saved["pending"].is_null());
+            assert_eq!(
+                saved["preview_waits"],
+                if matches!(case, "ready" | "deadline") {
+                    1
+                } else {
+                    0
+                }
+            );
+            server.await.unwrap();
+        }
     }
     #[tokio::test]
     async fn a_navigation_deadline_preserves_completed_preview_pages() {
