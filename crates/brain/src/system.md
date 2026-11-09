@@ -53,6 +53,14 @@ A successful process exit does not prove gameplay success.
 compiler_feedback preserves primary compiler errors separately from compacted
 history. Its source hash identifies the failed version, not the current files.
 Use those diagnostics to edit the source, then compile the changed version.
+When coding_transition.mode is verified_compiler_repair, the container worker
+has verified that the complete supplied Rust file and failed workspace remain
+unchanged. This decision asks for an exact edit to coding_transition.path or a
+report naming the specific missing interface/fact. Return the actual old/new
+replacement data; another source/reference read is not a repair. The executor
+checks the expected source hash before editing. A later turn can compile/run the
+changed version with the ordinary tool interface. This transition neither edits
+code itself nor supplies a gameplay solution, and does not certify an effect.
 Do not repeatedly inspect unchanged error files or reconstruct missing errors
 when this view already supplies them. Output paths retain complete diagnostics.
 context_projection labels budget-compacted fields. An omitted history marker
