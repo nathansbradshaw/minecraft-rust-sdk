@@ -128,6 +128,7 @@ async fn stalled_native_query_does_not_stop_observation_or_close_threat_defense(
             stop,
             &j,
             3.5,
+            false,
         ),
     )
     .await
@@ -335,6 +336,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
             stop,
             &journal,
             3.5,
+            false,
         ),
     )
     .await

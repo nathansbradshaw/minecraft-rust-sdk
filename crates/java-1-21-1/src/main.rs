@@ -665,6 +665,7 @@ impl Player {
             .ok_or("Sequence exhausted; reconnect")?;
         let name = match action {
             Action::StartMove { .. }
+            | Action::StartMoveThrough { .. }
             | Action::CancelControl { .. }
             | Action::CancelUseItem { .. } => {
                 return Err("Finite controls use their own scheduler".into());
@@ -1174,6 +1175,7 @@ fn dispatch(
                     "minecraft:movement",
                     "minecraft:movement_frames",
                     "minecraft:finite_locomotion",
+                    "minecraft:waypoint_passthrough",
                     "minecraft:continuous_physics",
                     "minecraft:mining",
                     "minecraft:placement",
@@ -1388,6 +1390,7 @@ fn dispatch(
                         Action::Chat { .. }
                             | Action::Look { .. }
                             | Action::StartMove { .. }
+                            | Action::StartMoveThrough { .. }
                             | Action::Sprint { .. }
                             | Action::Sneak { .. }
                             | Action::Respawn
@@ -1410,6 +1413,7 @@ fn dispatch(
                     && matches!(
                         action.action,
                         Action::StartMove { .. }
+                            | Action::StartMoveThrough { .. }
                             | Action::Move { .. }
                             | Action::MotionFrame { .. }
                             | Action::Jump
@@ -1462,7 +1466,9 @@ fn dispatch(
                         "Character is dead; explicitly respawn before physical gameplay",
                     ));
                 }
-                if let Action::StartMove { max_ticks, .. } = &action.action {
+                if let Action::StartMove { max_ticks, .. }
+                | Action::StartMoveThrough { max_ticks, .. } = &action.action
+                {
                     if *max_ticks > config.control_max_ticks {
                         return Err(ApiError::new(
                             ErrorCode::InvalidRequest,

@@ -176,6 +176,13 @@ pub enum Action {
         jump: bool,
         max_ticks: u16,
     },
+    /// Cross a supported, level-ground waypoint without braking to rest.
+    /// Passage and released input require native evidence; passive momentum
+    /// continues after release. Discover the adapter capability before use.
+    StartMoveThrough {
+        target: Position,
+        max_ticks: u16,
+    },
     CancelControl {
         action_id: String,
     },
@@ -274,6 +281,7 @@ impl Action {
     pub fn capability(&self) -> &str {
         match self {
             Self::StartMove { .. } | Self::CancelControl { .. } => "minecraft:finite_locomotion",
+            Self::StartMoveThrough { .. } => "minecraft:waypoint_passthrough",
             Self::MotionFrame { .. } => "minecraft:movement_frames",
             Self::DropSelected { .. } => "minecraft:inventory",
             Self::Move { .. }
@@ -301,7 +309,8 @@ impl Action {
         let valid = match self {
             Self::StartMove {
                 target, max_ticks, ..
-            } => {
+            }
+            | Self::StartMoveThrough { target, max_ticks } => {
                 *max_ticks > 0
                     && [target.x, target.y, target.z]
                         .iter()
@@ -539,6 +548,23 @@ pub struct AdapterFrameResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn waypoint_passage_is_finite_capability_scoped_and_cannot_select_an_actor() {
+        let mut value = serde_json::json!({"kind":"start_move_through","target":{"x":2.5,"y":1.,"z":0.5},"max_ticks":60});
+        let action: super::Action = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(action.capability(), "minecraft:waypoint_passthrough");
+        action.validate().unwrap();
+        value["max_ticks"] = serde_json::json!(0);
+        assert!(
+            serde_json::from_value::<super::Action>(value.clone())
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        value["max_ticks"] = serde_json::json!(60);
+        value["actor"] = serde_json::json!("victim");
+        assert!(serde_json::from_value::<super::Action>(value).is_err());
+    }
     #[test]
     fn named_click_modes_have_one_numeric_intent_and_reject_unknown_inputs() {
         let names = [

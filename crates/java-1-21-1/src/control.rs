@@ -122,9 +122,10 @@ impl Job {
         request: &ActionRequest,
         epoch: u64,
     ) -> Result<Self> {
-        let Action::StartMove {
+        let (Action::StartMove {
             target, max_ticks, ..
-        } = &request.action
+        }
+        | Action::StartMoveThrough { target, max_ticks }) = &request.action
         else {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,

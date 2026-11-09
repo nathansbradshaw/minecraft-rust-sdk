@@ -684,29 +684,12 @@ impl Brain {
             return Err(error);
         }
         let body = if cfg.body.enabled {
-            if ![
-                "minecraft:finite_locomotion",
-                "minecraft:survival_facts",
-                "minecraft:ranged_observation",
-                "minecraft:pending_actions",
-                "minecraft:session_material_preservation",
-            ]
-            .iter()
-            .all(|c| info.capabilities.iter().any(|v| v == c))
-            {
-                let _ = client.disconnect().await;
-                return Err("Default Survival brain requires finite controls, survival/ranged facts, pending-action inspection and session material preservation".into());
-            }
-            let finite_waypoint_axis = info.limits["finite_move_waypoint_blocks"]
-                .as_f64()
-                .filter(|v| (0.9..=4.2).contains(v))
-                .unwrap_or(3.5);
-            match body::Handle::start_with_waypoint_range(
+            match body::Handle::start_for_server(
                 profile.clone(),
                 cfg.body.clone(),
                 &cfg.state,
                 observed.clone(),
-                finite_waypoint_axis,
+                &info,
             ) {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -814,7 +797,9 @@ impl Brain {
         self.journal.note_intention(&id, independent)?;
         let movement = matches!(
             action,
-            minecraft_sdk::Action::StartMove { .. } | minecraft_sdk::Action::CancelControl { .. }
+            minecraft_sdk::Action::StartMove { .. }
+                | minecraft_sdk::Action::StartMoveThrough { .. }
+                | minecraft_sdk::Action::CancelControl { .. }
         );
         let mut receipt = self
             .client
