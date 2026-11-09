@@ -56,7 +56,7 @@ impl Snapshot {
                 revision: o.revision.clone(),
                 player: o.player.clone(),
                 menu: Value::Null,
-                world: json!({"blocks":blocks,"entities":o.world["entities"],"game_time":o.world["game_time"],"sample_clock":o.world["sample_clock"]}),
+                world: json!({"blocks":blocks,"entities":o.world["entities"],"game_time":o.world["game_time"],"sample_clock":o.world["sample_clock"],"client_hearing":o.world["client_hearing"]}),
             },
             blocked: blocked.to_vec(),
             stationary: stationary.to_vec(),

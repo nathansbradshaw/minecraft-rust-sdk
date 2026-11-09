@@ -2,6 +2,7 @@
 mod aerial;
 pub mod decision;
 pub mod geometry;
+mod hearing;
 mod motion;
 mod perception;
 mod recovery;
@@ -164,12 +165,14 @@ impl Handle {
             "minecraft:ranged_observation",
             "minecraft:pending_actions",
             "minecraft:session_material_preservation",
+            auditory::CAPABILITY,
         ] {
             ensure(
                 server.capabilities.iter().any(|c| c == capability),
                 &format!("Default Survival brain requires {capability}"),
             )?;
         }
+        auditory::frame(&initial)?;
         let range = server.limits["finite_move_waypoint_blocks"]
             .as_f64()
             .filter(|v| (0.9..=4.2).contains(v))
@@ -477,6 +480,19 @@ async fn controller(
     let mut projectiles = tactics::Projectiles::default();
     let mut retreat_trail = tactics::RetreatTrail::default();
     let mut threat_memory = perception::RangedMemory::default();
+    let mut hearing_memory: hearing::Memory = j
+        .get("hearing_memory")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?
+        .unwrap_or_default();
+    // The public startup path requires this capability and validates the first
+    // frame. Low-level mechanics fixtures can still construct a visual-only body.
+    let hearing_enabled = shared
+        .latest
+        .lock()
+        .map_err(|_| "Body cache unavailable")?
+        .as_ref()
+        .is_some_and(|(_, o)| o.world.get("auditory").is_some());
     let mut own_motion = motion::Motion::default();
     let mut motion_predictions = 0u64;
     let mut motion_trace_samples = 0u16;
@@ -491,34 +507,48 @@ async fn controller(
         }
         let started = Instant::now();
         let observed_generation = shared.program_generation.load(Ordering::Acquire);
-        let observed = match tokio::time::timeout(Duration::from_secs(2), client.observe()).await {
-            Ok(Ok(o)) => o,
-            result => {
-                let error = match result {
-                    Ok(Err(e)) => e.to_string(),
-                    _ => "Observation deadline exceeded".into(),
-                };
-                if error != last_error {
-                    j.event("body_observation_error", json!({"error":error}))?;
-                    last_error = error;
+        let mut observed =
+            match tokio::time::timeout(Duration::from_secs(2), client.observe()).await {
+                Ok(Ok(o)) => o,
+                result => {
+                    let error = match result {
+                        Ok(Err(e)) => e.to_string(),
+                        _ => "Observation deadline exceeded".into(),
+                    };
+                    if error != last_error {
+                        j.event("body_observation_error", json!({"error":error}))?;
+                        last_error = error;
+                    }
+                    if shared
+                        .latest
+                        .lock()
+                        .ok()
+                        .and_then(|v| v.as_ref().map(|(at, _)| at.elapsed()))
+                        .is_some_and(|age| age > Duration::from_secs(3))
+                    {
+                        return Err("Body lost fresh SDK observations".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
                 }
-                if shared
-                    .latest
-                    .lock()
-                    .ok()
-                    .and_then(|v| v.as_ref().map(|(at, _)| at.elapsed()))
-                    .is_some_and(|age| age > Duration::from_secs(3))
-                {
-                    return Err("Body lost fresh SDK observations".into());
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
-            }
-        };
+            };
         last_error.clear();
         let observed_at = Instant::now();
         let observation_ms = started.elapsed().as_millis();
         cycles += 1;
+        if hearing_enabled {
+            let report = hearing_memory.update(&mut observed)?;
+            let memory = serde_json::to_string(&hearing_memory)?;
+            if j.get("hearing_memory")?.as_deref() != Some(memory.as_str()) {
+                j.set("hearing_memory", &memory)?;
+            }
+            if report["fresh"]
+                .as_array()
+                .is_some_and(|sounds| !sounds.is_empty())
+            {
+                j.event("body_heard", report)?;
+            }
+        }
         *shared.latest.lock().map_err(|_| "Body cache unavailable")? =
             Some((Instant::now(), Arc::new(observed.clone())));
         let p = geometry::point(&observed.player["position"]).ok_or("Body position missing")?;
@@ -599,11 +629,14 @@ async fn controller(
             .as_i64()
             .is_some_and(|n| n > 0);
         let threatened = geometry::threatened(&policy_observed);
+        let heard_blasts = hearing::blasts(&policy_observed);
+        let heard_danger = !heard_blasts.is_empty();
         let trail = retreat_trail.update(&observed, threatened || incoming);
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
         let water_emergency = geometry::water_danger(&observed);
         let stalled = retreat_progress.stalled(&observed, threatened);
         let urgent = dead
+            || heard_danger
             || water_emergency
             || incoming
             || burning
@@ -646,6 +679,7 @@ async fn controller(
             previous_health = observed.player["health"].clone();
         }
         let danger = dead
+            || heard_danger
             || water_emergency
             || threatened
             || escape.is_some()
@@ -720,10 +754,17 @@ async fn controller(
                             (0..3).map(|i| (t[i] - e[i]).powi(2)).sum::<f64>() < d * d
                         })
             });
+            let toward_heard_blast = geometry::point(&active["target"]).is_some_and(|target| {
+                heard_blasts.iter().any(|(origin, _)| {
+                    (0..3).map(|i| (target[i] - origin[i]).powi(2)).sum::<f64>()
+                        < (0..3).map(|i| (p[i] - origin[i]).powi(2)).sum::<f64>()
+                })
+            });
             if active["outcome"] == "running"
                 && (active["action_id"].as_str() != Some(&owned_control)
                     || new_projectile
                     || toward_threat
+                    || toward_heard_blast
                     || (water_emergency && !owned_water_control)
                     || stuck)
             {
@@ -747,7 +788,7 @@ async fn controller(
                     .await?;
                     j.event(
                         "body_preempted_program",
-                        json!({"action_id":id,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"new_projectile":new_projectile,"incoming_projectile_ids":incoming_projectiles,"previous_dodge_projectile_ids":owned_projectiles,"toward_threat":toward_threat,"stuck":stuck}),
+                        json!({"action_id":id,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"new_projectile":new_projectile,"incoming_projectile_ids":incoming_projectiles,"previous_dodge_projectile_ids":owned_projectiles,"toward_threat":toward_threat,"toward_heard_blast":toward_heard_blast,"stuck":stuck}),
                     )?;
                 }
             } else {

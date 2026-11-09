@@ -181,18 +181,19 @@ pub fn threatened(o: &Observation) -> bool {
     let Some(start) = point(&o.player["position"]) else {
         return false;
     };
-    o.world["entities"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|e| {
-            e["hostile"] == true
-                && perceived(e)
-                && point(&e["position"]).is_some_and(|p| {
-                    (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>()
-                        < threat_radius(e).powi(2)
-                })
-        })
+    !super::hearing::blasts(o).is_empty()
+        || o.world["entities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| {
+                e["hostile"] == true
+                    && perceived(e)
+                    && point(&e["position"]).is_some_and(|p| {
+                        (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>()
+                            < threat_radius(e).powi(2)
+                    })
+            })
 }
 fn perceived(entity: &Value) -> bool {
     entity["visible"] == true || entity["client_memory"]["kind"] == "last_visible_ranged_threat"
@@ -592,6 +593,11 @@ pub(super) fn evade_policy(
     let mut projectile_danger = false;
     let mut incoming_directions = Vec::new();
     let mut blasts = Vec::new();
+    let heard_blasts = super::hearing::blasts(o);
+    for (origin, radius) in &heard_blasts {
+        threats.push((*origin, false, false));
+        blasts.push((*origin, *radius));
+    }
     for e in o.world["entities"].as_array().into_iter().flatten() {
         if !perceived(e) {
             continue;
@@ -942,7 +948,11 @@ pub(super) fn evade_policy(
                     reason: if native_jump.is_some() {
                         "native-predicted retreat after stalled local avoidance"
                     } else if blast_escape {
-                        "leave the primed blast radius on one observed route"
+                        if heard_blasts.is_empty() {
+                            "leave the primed blast radius on one observed route"
+                        } else {
+                            "escape a possible blast inferred from a heard priming sound"
+                        }
                     } else if projectile_danger {
                         "evade incoming projectile"
                     } else if burning {
