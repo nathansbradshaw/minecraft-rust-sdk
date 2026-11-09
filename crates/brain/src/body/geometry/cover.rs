@@ -61,9 +61,6 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
             return None;
         }
         let p = point(&enemy["position"])?;
-        if (p[0] - start[0]).hypot(p[2] - start[2]) < 5. {
-            return None;
-        }
         enemies.push(p);
         if enemies.len() > 8 {
             return None;
@@ -87,6 +84,15 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
         return None;
     }
     let guarding = shielded(start, &enemies, &screens);
+    // A nearby archer across a solid screen does not establish an open contact
+    // route. Retain the guard only while every point stays fully occluded.
+    if !guarding
+        && enemies
+            .iter()
+            .any(|e| (e[0] - start[0]).hypot(e[2] - start[2]) < 5.)
+    {
+        return None;
+    }
     let adjacent = |p: [f64; 3]| {
         screens
             .iter()
@@ -109,6 +115,43 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
             .map(|e| (p[0] - e[0]).hypot(p[2] - e[2]))
             .fold(24., f64::min)
     };
+    // Distance from the archer alone can reward walking to the very end of a
+    // screen. Prefer room to move in either direction along its nearby face.
+    // Every sampled point must remain known, supported and occluded; this is a
+    // current geometric margin, not a prediction of the unseen enemy's pose.
+    let guard_margin = |p: [f64; 3]| {
+        let nearest = screens.iter().min_by(|a, b| {
+            let distance = |v: &&[f64; 6]| {
+                (p[0] - p[0].clamp(v[0], v[3])).hypot(p[2] - p[2].clamp(v[2], v[5]))
+            };
+            distance(a).total_cmp(&distance(b))
+        });
+        let Some(screen) = nearest else {
+            return 0.;
+        };
+        let x_gap = (p[0] - p[0].clamp(screen[0], screen[3])).abs();
+        let z_gap = (p[2] - p[2].clamp(screen[2], screen[5])).abs();
+        let axis = if x_gap > z_gap { 2 } else { 0 };
+        [-1., 1.]
+            .into_iter()
+            .map(|sign| {
+                let mut margin = 0.;
+                for n in 1..=4 {
+                    let mut next = p;
+                    next[axis] += sign * f64::from(n) * 0.5;
+                    if !clear(&cells, next, &obstacles)
+                        || !supported(&cells, next, &obstacles)
+                        || !shielded(next, &enemies, &screens)
+                    {
+                        break;
+                    }
+                    margin = f64::from(n) * 0.5;
+                }
+                margin
+            })
+            .fold(2., f64::min)
+    };
+    let guard_value = |p| guard_margin(p) * 4. + separation(p).min(8.);
     let mut nodes = vec![start];
     for x in -4..=4 {
         for z in -4..=4 {
@@ -119,9 +162,10 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
             ];
             if !blocked.contains(&target_key(p))
                 && (p[0] - start[0]).hypot(p[2] - start[2]) > 0.1
-                && enemies
-                    .iter()
-                    .all(|e| (p[0] - e[0]).hypot(p[2] - e[2]) >= 4.5)
+                && (guarding
+                    || enemies
+                        .iter()
+                        .all(|e| (p[0] - e[0]).hypot(p[2] - e[2]) >= 4.5))
                 && clear(&cells, p, &obstacles)
                 && supported(&cells, p, &obstacles)
                 && (!guarding || shielded(p, &enemies, &screens))
@@ -150,7 +194,7 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
                 break;
             }
             if guarding && adjacent(nodes[current]) {
-                let value = separation(nodes[current]) - distance[current] * 0.15;
+                let value = guard_value(nodes[current]) - distance[current] * 0.15;
                 if value > best_guard {
                     best_guard = value;
                     goal = Some(current);
@@ -165,7 +209,7 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
                 (nodes[current][0] - nodes[next][0]).hypot(nodes[current][2] - nodes[next][2]);
             if length <= 1.6
                 && distance[current] + length < distance[next]
-                && avoids_contact(nodes[current], nodes[next], &enemies)
+                && (guarding || avoids_contact(nodes[current], nodes[next], &enemies))
                 && segment(&cells, &obstacles, nodes[current], nodes[next])
                 && (!guarding || shadow_segment(nodes[current], nodes[next]))
             {
@@ -174,7 +218,7 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
             }
         }
     }
-    if guarding && adjacent(start) && best_guard <= separation(start) + 0.15 {
+    if guarding && adjacent(start) && best_guard <= guard_value(start) + 0.15 {
         return Some(Plan::Hold);
     }
     let mut at = goal?;
@@ -194,7 +238,7 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
         (p[0] - start[0]).abs() <= axis
             && (p[2] - start[2]).abs() <= axis
             && (p[0] - start[0]).hypot(p[2] - start[2]) >= 0.35
-            && avoids_contact(start, p, &enemies)
+            && (guarding || avoids_contact(start, p, &enemies))
             && segment(&cells, &obstacles, start, p)
             && (!guarding || shadow_segment(start, p))
     })?;

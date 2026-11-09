@@ -1246,11 +1246,25 @@ mod tests {
                 b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
             }
         }
-        let first = evade(&o).expect("Guard toward far end while archer is hidden");
+        let first = evade(&o).expect("Guard toward the protected wall interior");
         assert!(
-            (first.target.x + 0.5).abs() < 0.01 && first.target.z > 0.5,
+            (first.target.x + 0.5).abs() < 0.01 && first.target.z.abs() <= 0.5,
             "{first:?}"
         );
+        for direction in [-1., 1.] {
+            assert!(
+                covered(
+                    [
+                        first.target.x,
+                        first.target.y,
+                        first.target.z + direction * 1.5
+                    ],
+                    [11.5, 1., -2.8],
+                    &boxes(&o),
+                ),
+                "A guard needs covered room on both sides, rather than just the farthest endpoint"
+            );
+        }
         assert!(!first.cover_path.is_empty());
         assert!(!can_pass_waypoint(&o, &first));
         o.player["position"] = json!([first.target.x, first.target.y, first.target.z]);
@@ -1272,6 +1286,54 @@ mod tests {
         assert!(
             evade(&o).is_none(),
             "A good guard position does not submit zero-distance controls repeatedly"
+        );
+    }
+    #[test]
+    fn a_close_archer_across_a_solid_wall_does_not_invalidate_guarded_ground() {
+        let mut o = world();
+        o.player = json!({"position":[-0.5,1.,0.5],"on_ground":true});
+        o.world["entities"] = json!([{"visible":false,"hostile":true,"ranged_attack":true,
+            "position":[1.5,1.,0.5],"client_memory":{"kind":"last_visible_ranged_threat"}}]);
+        for block in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&block["position"]).unwrap();
+            if p[0] == 0. && (1. ..=3.).contains(&p[1]) && (-3. ..=3.).contains(&p[2]) {
+                block["block"] = json!("minecraft:stone");
+                block["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let plan = cover::plan(&o, &[], 3.5)
+            .expect("A solid screen can preserve guarded ground despite short Euclidean distance");
+        if let cover::Plan::Move(route) = plan {
+            assert!(
+                (route.target.x + 0.5).abs() < 0.01 && !route.jump,
+                "Stay on the protected side: {route:?}"
+            );
+            for point in route.cover_path {
+                assert!(
+                    covered([point.x, point.y, point.z], [1.5, 1., 0.5], &boxes(&o)),
+                    "Every selected point remains occluded"
+                );
+            }
+        }
+        let mut open = o.clone();
+        for block in open.world["blocks"].as_array_mut().unwrap() {
+            if block["position"][0] == 0 && block["position"][1].as_i64().unwrap() > 0 {
+                block["block"] = json!("minecraft:air");
+                block["collision"] = json!([]);
+            }
+        }
+        assert!(
+            cover::plan(&open, &[], 3.5).is_none(),
+            "A nearby unshielded shooter still requires ordinary escape"
+        );
+        o.world["entities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"visible":true,"hostile":true,
+            "ranged_attack":false,"position":[-2.5,1.,0.5]}));
+        assert!(
+            cover::plan(&o, &[], 3.5).is_none(),
+            "A close melee enemy cannot inherit ranged cover protection"
         );
     }
     #[test]

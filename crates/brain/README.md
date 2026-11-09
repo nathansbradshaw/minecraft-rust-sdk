@@ -27,6 +27,14 @@ lasted only 1.25 seconds, providing limited overlap evidence. The maneuver remai
 experimental; neither this change nor compilation establishes Survival competence.
 Decision captures retain the selected experiment setting for reproducible replay.
 
+Ranged guards distinguish proximity from an open firing route. A close archer
+does not invalidate already shielded ground while every candidate and transition
+remains known, supported and fully occluded. An unshielded close enemy or an
+observed melee threat retains ordinary escape. Guard preferences include covered
+room along the wall and bounded separation, rather than driving toward its end
+for distance alone. Recalled enemy poses remain explicitly last-seen estimates;
+this geometry does not establish their unseen current location or Survival.
+
 Luna handles routine choices. Explicit development, code writes and failed
 routine experiments can request a Sol session of at most four decisions. The
 remaining session is saved before each inference request, so restarting does not
