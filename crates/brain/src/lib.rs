@@ -15,6 +15,7 @@ mod handoff;
 pub mod memory;
 pub mod model;
 pub mod navigation;
+mod navigation_checkpoint;
 pub mod output;
 mod ownership;
 pub mod progress;
@@ -1017,6 +1018,16 @@ impl Brain {
                 .unwrap_or(json!([]));
             let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
+            context["goal_revision"] =
+                json!(self.journal.get("goal_revision")?.unwrap_or_default());
+            context["coding_checkpoint"] = self.journal.navigation_coding_checkpoint(
+                &progress::workspace_fingerprint_excluding_state(
+                    &self.cfg.workspace,
+                    &self.cfg.state,
+                )?,
+                &self.journal.get("goal_revision")?.unwrap_or_default(),
+                &self.observed,
+            )?;
             context["diagnostic_feedback"] = self
                 .journal
                 .diagnostic_context(&self.journal.get("goal_revision")?.unwrap_or_default())?;
@@ -1199,6 +1210,14 @@ impl Brain {
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
             if let Ok(value) = &result {
+                if choice.tool == "navigate" && !goal_changed {
+                    self.journal.record_navigation_stall(
+                        value,
+                        &source_after,
+                        &requested_revision,
+                        &self.observed,
+                    )?;
+                }
                 if let Err(error) = self.journal.remember_search(
                     &choice,
                     value,

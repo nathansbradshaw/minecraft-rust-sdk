@@ -41,3 +41,34 @@ The existing model allocation and shared inference/compilation budgets apply.
 The independent body and conversation continue during reasoning and development.
 `repair-probe PRIVATE_CONTEXT.json` inspects applicability without inference,
 gameplay or source writes. Native retained progress remains a separate gate.
+
+# Exhausted navigation
+
+Two exhausted routes within three blocks, with the same goal, source, anchored
+local terrain and inventory, open a coding checkpoint. The worker supplies the
+complete unchanged conventional `src/main.rs` (up to 4 KiB) for a model-authored
+edit or a specific missing-interface report. Other layouts keep ordinary tools.
+The current source is a candidate, not evidence that it caused the route failure
+or compiled. The model still chooses the method and must compile, execute and
+verify it. New goals, changed source, changed anchored terrain/inventory, leaving
+the area, or pending intentions prevent the checkpoint. This adds no model
+allowance, gameplay authority, mandatory digging policy or task-success credit.
+
+## Local development result
+
+A minimal NeoForge 1.21.1 Survival diagnostic at `3f19901` retained one newly
+mined oak log after the model escaped a locally exhausted route area. The native
+inventory gain occurred 343 seconds into the final episode. It made 35 decisions,
+three source edits and three Rust runs, with 37 Luna admissions including chat
+and zero Sol admissions. The configured backend was `gpt-5.6-luna`, with high
+development and low routine reasoning. A normal player status follow-up elicited
+an accurate inventory report. The character disconnected at the 480-second cap
+with the log saved, 20 health, and no native damage or death increments.
+
+This is an operator-attested development observation, not a public benchmark.
+Two preceding failed log diagnostics and intervening engineering deployments
+remain part of its history. Starting inventory already included a wooden pickaxe,
+crafting table, sticks, one plank, one cobblestone and two dirt blocks. No route,
+gameplay script, items, healing or rollback was supplied during the task. The
+quiet episode establishes neither empty-start progression nor hostile Survival
+competence, and does not isolate the contribution of individual changes.
