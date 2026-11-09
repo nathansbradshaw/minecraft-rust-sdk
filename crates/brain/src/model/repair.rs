@@ -58,12 +58,13 @@ fn gameplay_failure(experiment: &Value) -> Option<Value> {
     if mutations.is_empty() {
         return None;
     }
-    let failed = mutations.iter().any(|row| {
+    let failed_control = |row: &&Value| {
         matches!(
             row["response"]["outcome"].as_str(),
             Some("rejected" | "expired")
         ) || (row["response"]["outcome"].is_null() && !row["response"]["error"].is_null())
-    });
+    };
+    let failed = mutations.iter().any(failed_control);
     let historical = mutations.iter().all(|row| {
         row["response"]["gateway_delivery"]["action_id_already_recorded"] == true
             && row["response"]["gateway_delivery"]["new_intention_dispatched"] == false
@@ -71,6 +72,14 @@ fn gameplay_failure(experiment: &Value) -> Option<Value> {
     if !failed && !historical {
         return None;
     }
+    // Successful setup controls must not consume the entire bounded failure
+    // view and hide the actual rejection that needs repair.
+    mutations.sort_by_key(|row| {
+        (
+            !failed_control(row),
+            row["response"]["gateway_delivery"]["action_id_already_recorded"] != true,
+        )
+    });
     Some(
         json!({"format":"gameplay-repair-evidence-v1","definite_failure":failed,"all_mutations_historical":historical,
         "mutation_requests":mutations.len(),"requests":mutations.iter().take(4).map(|row| json!({
@@ -112,7 +121,7 @@ fn complete_gameplay_experiment(experiment: &Value) -> Option<Value> {
     }
     let journal = crate::Journal::open_read_only(&db_path).ok()?;
     let saved: String = journal.db.query_row(
-        "SELECT data FROM events WHERE kind='tool_result' AND json_extract(data,'$.result.output_files.stdout.path')=?1 AND length(data)<=1048576 ORDER BY id DESC LIMIT 1",
+        "SELECT data FROM events WHERE kind='tool_result' AND json_extract(data,'$.result.output_files.stdout.path')=?1 AND length(CAST(data AS BLOB))<=1048576 ORDER BY id DESC LIMIT 1",
         [path.to_str()?],|row|row.get(0)).ok()?;
     let saved: Value = serde_json::from_str(&saved).ok()?;
     if saved["tool"] != experiment["tool"]
@@ -614,6 +623,27 @@ mod tests {
         );
         context["last_experiment"]["signature"] = json!("foreign");
         assert!(Transition::from_context(&context).is_none());
+    }
+    #[test]
+    fn successful_setup_cannot_hide_the_later_rejection_in_the_bounded_failure_view() {
+        let (_dir, mut context) = gameplay_fixture();
+        let failed =
+            context["last_experiment"]["result"]["local_action_feedback"]["requests"][0].clone();
+        let mut success = failed.clone();
+        success["response"] = json!({"outcome":"observed","native_effect_verified":true});
+        let mut rows = vec![success; 4];
+        rows.push(failed);
+        context["last_experiment"]["result"]["local_action_feedback"]["requests"] = json!(rows);
+        context["last_experiment"]["result"]["local_action_feedback"]["through_sequence"] =
+            json!(5);
+        context["last_tool_result"]["result"] = context["last_experiment"]["result"].clone();
+        let transition = Transition::from_context(&context).unwrap();
+        let mut schema = super::super::schema();
+        transition.prepare(&mut context, &mut schema);
+        assert_eq!(
+            context["coding_transition"]["gameplay_failure"]["requests"][0]["outcome"],
+            "expired"
+        );
     }
     fn fixture() -> (tempfile::TempDir, Value) {
         let dir = tempfile::tempdir().unwrap();
