@@ -19,6 +19,7 @@ pub mod output;
 mod ownership;
 pub mod progress;
 mod routing;
+mod search_memory;
 pub mod tools;
 pub mod versions;
 pub mod views;
@@ -1061,6 +1062,9 @@ impl Brain {
             context["inspected_containers"] = self
                 .journal
                 .recalled_containers(&self.server.instance_id, &self.observed)?;
+            context["spatial_searches"] = self
+                .journal
+                .recalled_searches(&self.server.instance_id, &self.observed)?;
             context["model_availability"] = self.journal.model_availability(now())?;
             context["last_experiment"] = self
                 .journal
@@ -1215,6 +1219,16 @@ impl Brain {
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
             if let Ok(value) = &result {
+                if let Err(error) = self.journal.remember_search(
+                    &choice,
+                    value,
+                    &requested_revision,
+                    &self.server.instance_id,
+                    &self.observed,
+                ) {
+                    self.journal.event("search_memory_error",json!({"error":error.to_string(),
+                        "scope":"Local recollection failed; gameplay result retained independently"}))?;
+                }
                 if self.journal.search_discovery(
                     &choice,
                     value,
@@ -1490,6 +1504,13 @@ fn fit_context(context: &mut Value) -> Result<()> {
         let bytes = context["sdk_reference"].to_string().len();
         context["sdk_reference"] = workspace::reference_index();
         context["context_projection"]["sdk_reference"] = json!({"complete":false,"view":"retrievable_section_index","original_bytes":bytes,"retained_in":"read sdk://reference (built-in, bound to this engine)"});
+    }
+    if serde_json::to_vec(context)?.len() > 32768 && context["spatial_searches"].is_object() {
+        let bytes = context["spatial_searches"].to_string().len();
+        search_memory::compact_view(&mut context["spatial_searches"], 1500);
+        context["context_projection"]["spatial_searches"] = json!({"complete":false,
+            "view":"bounded_historical_searches","original_bytes":bytes,
+            "retained_in":"client search cache and original tool history"});
     }
     ensure(
         serde_json::to_vec(context)?.len() <= 32768,

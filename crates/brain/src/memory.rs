@@ -14,6 +14,8 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS observed_places(key TEXT PRIMARY KEY, memory_id INTEGER NOT NULL, signature TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS container_inspections(instance TEXT NOT NULL,actor TEXT NOT NULL,dimension TEXT NOT NULL,origin_key TEXT NOT NULL,action_id TEXT NOT NULL,game_time INTEGER NOT NULL,at INTEGER NOT NULL,snapshot TEXT NOT NULL,PRIMARY KEY(instance,actor,action_id));
         CREATE INDEX IF NOT EXISTS container_inspections_scope ON container_inspections(instance,actor,dimension,game_time DESC);
+        CREATE TABLE IF NOT EXISTS search_observations(id INTEGER PRIMARY KEY,key TEXT UNIQUE NOT NULL,instance TEXT NOT NULL,actor TEXT NOT NULL,dimension TEXT NOT NULL,seen_at INTEGER NOT NULL,observations INTEGER NOT NULL,fact TEXT NOT NULL,context TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS search_observations_scope ON search_observations(instance,actor,dimension,seen_at DESC);
         COMMIT;")?;
     Ok(())
 }

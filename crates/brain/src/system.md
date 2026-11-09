@@ -109,6 +109,12 @@ Tools and input:
   Results are bounded for context; request smaller pages or use a Rust program
   for larger or multi-page experiments. Queries do not mutate gameplay, grant
   authority, install plugins or count as completed work.
+  spatial_searches recalls recent query pages and reobservation counts for this
+  character/server/dimension across goals and restarts. Treat them as historical
+  visible/loaded coverage. Even a completed empty search cannot exclude occluded
+  resources. Compare origins, radius, page coverage and current terrain before
+  repeating a scan; seek a changed view, route or bounded experiment when scans
+  overlap without useful new information. Reobserve positive locations before use.
 - sdk: a JSON string containing one typed Minecraft SDK Action. The harness creates
   and journals its action ID. Fields are those of the SDK Action enum; no actor ID.
 - navigate: a typed SDK navigation goal as JSON. For distant observed targets,
