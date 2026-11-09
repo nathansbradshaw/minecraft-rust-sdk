@@ -106,6 +106,14 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   next_offset/complete and retry_after_ms. Queries do not unlock recipes, prove
   ingredients suffice or establish menu compatibility. Unknown recipe IDs and
   locked book entries are refused before dispatch by the matching integration.
+  recipes::material_summary(&observation, &recipe_row) groups runtime ingredient
+  representatives and pairs them with retained inventory counts. Exact-ID recipe
+  queries add this as client_materials when it fits the model view. Compare
+  occurrences and representative_count with inventory_count; inventory excludes
+  grid, output and cursor. Groups share supplies, alternatives may be incomplete,
+  and custom/component matching is not proved. This is planning feedback, not a
+  craftability or effect verifier. Missing inventory remains unknown. Recipe and
+  inventory samples may differ in time; reobserve before mutating.
 - Rust ClickSlot.mode remains u8; click_mode constants cover PICKUP=0,
   QUICK_MOVE=1, SWAP=2, CLONE=3, THROW=4, QUICK_CRAFT=5, PICKUP_ALL=6.
   SDK JSON also accepts the corresponding snake_case names; serialization sends
