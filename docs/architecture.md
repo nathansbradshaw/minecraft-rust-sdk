@@ -276,7 +276,9 @@ this fallback grants no competing model control or extra model allowance.
 native health on a bounded timer to check actual hostile pressure. Exposed
 controls never count as agent successes. Record weak exposures and timing errors;
 the presence of a hostile alone does not demonstrate a Survival challenge.
-These diagnostics do not establish general Survival competence.
+These diagnostics do not establish general Survival competence. For comparable
+enemy starts, use the optional [observed stimulus admission](native-body-diagnostics.md)
+barrier; an after-startup scene alone cannot prove the intended initial pressure.
 
 Visible hostile phantoms receive a 32-block warning radius in the replaceable
 body policy rather than the ordinary 10-block melee radius. The body prefers
