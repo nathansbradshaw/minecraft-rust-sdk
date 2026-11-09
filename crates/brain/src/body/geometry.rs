@@ -1,6 +1,7 @@
 use minecraft_sdk::{Observation, Position};
 use serde_json::Value;
 use std::collections::HashMap;
+mod boundary;
 mod cover;
 type Cells<'a> = HashMap<[i32; 3], &'a Value>;
 
@@ -564,6 +565,25 @@ pub(super) fn evade_with_native(
     waypoint_axis: f64,
     admitted: &[Admitted],
 ) -> Option<Escape> {
+    evade_policy(
+        o,
+        blocked,
+        stationary,
+        recent_retreat,
+        waypoint_axis,
+        admitted,
+        false,
+    )
+}
+pub(super) fn evade_policy(
+    o: &Observation,
+    blocked: &[[i32; 3]],
+    stationary: &[String],
+    recent_retreat: &[[f64; 3]],
+    waypoint_axis: f64,
+    admitted: &[Admitted],
+    boundary_enabled: bool,
+) -> Option<Escape> {
     if water_danger(o) {
         return water_escape(o, blocked);
     }
@@ -667,11 +687,38 @@ pub(super) fn evade_with_native(
     } else {
         Vec::new()
     };
+    let boundary_turn = if boundary_enabled
+        && !burning
+        && !projectile_danger
+        && !blast_escape
+        && threats
+            .iter()
+            .all(|(_, ranged, aerial)| *ranged && !*aerial)
+        && o.world["entities"].as_array().is_some_and(|entities| {
+            entities
+                .iter()
+                .any(|e| e["visible"] == true && e["hostile"] == true && e["ranged_attack"] == true)
+        }) {
+        boundary::Turn::find(
+            o,
+            recent_retreat,
+            &obstacles,
+            threats.iter().map(|(p, _, _)| *p).collect(),
+        )
+    } else {
+        None
+    };
     let score = |p: [f64; 3]| -> f64 {
-        let distance = threats
+        let mut distance = threats
             .iter()
             .map(|(e, _, _)| ((p[0] - e[0]).powi(2) + (p[2] - e[2]).powi(2)).sqrt())
             .fold(30., f64::min);
+        // At a known boundary, permit a still-separated sideways turn instead
+        // of requiring every step to increase distance and reversing the lane.
+        // Open escape, close contact and urgent hazards keep the existing score.
+        if boundary_turn.is_some() {
+            distance = distance.min(5.5);
+        }
         let cover = threats
             .iter()
             .filter(|(e, _, _)| covered(p, *e, &obstacles))
@@ -691,20 +738,25 @@ pub(super) fn evade_with_native(
         // A head-on retreat stays on an archer's firing line. Start moving
         // across that line before a close shot is already in flight, while
         // distance and cover still reward outward progress and protected routes.
-        let ranged_lateral = threats
-            .iter()
-            .filter(|(_, ranged, _)| *ranged)
-            .map(|(enemy, _, _)| {
-                let dx = start[0] - enemy[0];
-                let dz = start[2] - enemy[2];
-                let length = dx.hypot(dz);
-                if length > 0.001 {
-                    ((p[0] - start[0]) * -dz + (p[2] - start[2]) * dx).abs() / length
-                } else {
-                    0.
-                }
-            })
-            .fold(0., f64::max);
+        let ranged_lateral = boundary_turn
+            .as_ref()
+            .map(|turn| turn.lateral(start, p))
+            .unwrap_or_else(|| {
+                threats
+                    .iter()
+                    .filter(|(_, ranged, _)| *ranged)
+                    .map(|(enemy, _, _)| {
+                        let dx = start[0] - enemy[0];
+                        let dz = start[2] - enemy[2];
+                        let length = dx.hypot(dz);
+                        if length > 0.001 {
+                            ((p[0] - start[0]) * -dz + (p[2] - start[2]) * dx).abs() / length
+                        } else {
+                            0.
+                        }
+                    })
+                    .fold(0., f64::max)
+            });
         let blast_safety = blasts
             .iter()
             .map(|(center, radius)| {
@@ -858,6 +910,12 @@ pub(super) fn evade_with_native(
             if !route {
                 continue;
             }
+            if boundary_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.allows(start, p))
+            {
+                continue;
+            }
             let safety = score(p) - length * 0.1 - if jump { 0.2 } else { 0. };
             if safety <= current + 0.4 {
                 continue;
@@ -891,6 +949,8 @@ pub(super) fn evade_with_native(
                         "leave burning terrain"
                     } else if seek_refuge && !refuges.is_empty() {
                         "approach observed low-roof refuge from flying attacker"
+                    } else if boundary_turn.is_some() {
+                        "turn along observed boundary without reversing the firing lane"
                     } else {
                         "increase threat distance and seek cover"
                     }
@@ -898,6 +958,19 @@ pub(super) fn evade_with_native(
                 });
             }
         }
+    }
+    if best.is_none() && boundary_turn.is_some() {
+        // A circulation preference must not fence the only admitted way back.
+        // One fallback pass retains history and the original hazard scoring.
+        return evade_policy(
+            o,
+            blocked,
+            stationary,
+            recent_retreat,
+            waypoint_axis,
+            admitted,
+            false,
+        );
     }
     best
 }
@@ -919,6 +992,115 @@ mod tests {
             player: json!({"position":[0.5,1.,0.5]}),
             world: json!({"blocks":blocks,"entities":[{"visible":true,"hostile":true,"position":[2.5,1.,0.5]}]}),
             menu: Value::Null,
+        }
+    }
+    fn ranged_corner() -> (Observation, Vec<[f64; 3]>) {
+        let mut o = world();
+        o.player = json!({"position":[0.4971,1.,0.4886],"on_ground":true});
+        o.world["entities"] = json!([{"visible":true,"hostile":true,"ranged_attack":true,"position":[8.292,1.,-4.095]}]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&b["position"]).unwrap();
+            if (p[0] == -1. || p[2] == 1.) && (1. ..=3.).contains(&p[1]) {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        (o, vec![[0.3524, 1., -0.6502]])
+    }
+    #[test]
+    fn a_known_corner_turn_preserves_circulation_in_rotated_worlds() {
+        let (mut o, mut trail) = ranged_corner();
+        let mut desired = [1., 0.];
+        for _ in 0..4 {
+            let start = point(&o.player["position"]).unwrap();
+            let route = evade_policy(&o, &[], &[], &trail, 3.5, &[], true).unwrap();
+            assert!(!route.jump);
+            assert!(route.reason.contains("boundary"));
+            let snapshot =
+                super::super::decision::Snapshot::capture(&o, &[], &[], &trail, 3.5, &[], &route)
+                    .with_boundary_turns(true);
+            let bytes = serde_json::to_vec(&snapshot).unwrap();
+            let restored: super::super::decision::Snapshot =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored.replay()["matches_recorded_choice"], true);
+            assert_eq!(
+                restored.replay()["experimental_ranged_boundary_turns"],
+                true
+            );
+            let delta = [route.target.x - start[0], route.target.z - start[2]];
+            assert!(delta[0] * desired[0] + delta[1] * desired[1] > 2.);
+            let legacy = evade_policy(&o, &[], &[], &trail, 3.5, &[], false).unwrap();
+            let default = evade_with_stationary(&o, &[], &[], &trail).unwrap();
+            assert_eq!(
+                [default.target.x, default.target.z],
+                [legacy.target.x, legacy.target.z]
+            );
+            let old_delta = [legacy.target.x - start[0], legacy.target.z - start[2]];
+            assert!(old_delta[0] * desired[0] + old_delta[1] * desired[1] < 1.);
+            // Rotate complete voxel cells, entities and reached history, not
+            // just the waypoint. No arena coordinates enter the policy.
+            for b in o.world["blocks"].as_array_mut().unwrap() {
+                let p = point(&b["position"]).unwrap();
+                b["position"] = json!([-p[2] - 1., p[1], p[0]]);
+            }
+            o.player["position"] = json!([-start[2], start[1], start[0]]);
+            for e in o.world["entities"].as_array_mut().unwrap() {
+                let p = point(&e["position"]).unwrap();
+                e["position"] = json!([-p[2], p[1], p[0]]);
+            }
+            for p in &mut trail {
+                *p = [-p[2], p[1], p[0]];
+            }
+            desired = [-desired[1], desired[0]];
+        }
+    }
+    #[test]
+    fn boundary_preference_does_not_invent_support_or_disable_the_only_way_back() {
+        let (mut o, trail) = ranged_corner();
+        o.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["position"][0].as_f64().unwrap() < 1.);
+        let route = evade_policy(&o, &[], &[], &trail, 3.5, &[], true).unwrap();
+        assert!(route.target.x < 1.);
+        assert!(!route.reason.contains("boundary"));
+        assert!(
+            evade_policy(
+                &Observation {
+                    world: json!({"blocks":[],"entities":o.world["entities"]}),
+                    ..o.clone()
+                },
+                &[],
+                &[],
+                &trail,
+                3.5,
+                &[],
+                true
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn urgent_projectiles_and_mixed_melee_keep_existing_escape_policy() {
+        let (base, trail) = ranged_corner();
+        for mode in ["projectile", "melee", "burning"] {
+            let mut o = base.clone();
+            match mode {
+                "projectile"=>o.world["entities"].as_array_mut().unwrap().push(json!({"visible":true,"projectile":true,"position":[2.,2.,0.5],"velocity":[-1.,0.,0.]})),
+                "melee"=>o.world["entities"].as_array_mut().unwrap().push(json!({"visible":true,"hostile":true,"ranged_attack":false,"position":[3.,1.,-1.]})),
+                _=>o.player["fire_ticks"]=json!(20),
+            }
+            let actual = evade_policy(&o, &[], &[], &trail, 3.5, &[], true);
+            let legacy = evade_policy(&o, &[], &[], &trail, 3.5, &[], false);
+            assert_eq!(
+                actual
+                    .as_ref()
+                    .map(|r| ([r.target.x, r.target.y, r.target.z], r.jump)),
+                legacy
+                    .as_ref()
+                    .map(|r| ([r.target.x, r.target.y, r.target.z], r.jump)),
+                "{mode}"
+            );
         }
     }
     #[test]

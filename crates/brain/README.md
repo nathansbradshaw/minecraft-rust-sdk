@@ -16,6 +16,17 @@ tool uses this path; `minecraft-sdk-brain reconcile-pending PRIVATE_CONFIG.json`
 also performs one scoped reconciliation without inference, with normal body and
 disconnect cleanup. It requires exclusive ownership of that controller state.
 
+The opt-in body setting `experimental_ranged_boundary_turns` (default `false`)
+uses recent reached positions to preserve a separated ranged turn at a known wall
+along the boundary. This preference keeps existing collision/support checks and
+falls back when only the previous lane is viable. Immediate projectiles, mixed
+melee, fire and blast escape retain their existing scoring. Local replay is not
+a Survival result. The initial enabled candidate died in all three declared
+120-second native cover layouts (one death per character). Its real compilation
+lasted only 1.25 seconds, providing limited overlap evidence. The maneuver remains
+experimental; neither this change nor compilation establishes Survival competence.
+Decision captures retain the selected experiment setting for reproducible replay.
+
 Luna handles routine choices. Explicit development, code writes and failed
 routine experiments can request a Sol session of at most four decisions. The
 remaining session is saved before each inference request, so restarting does not
@@ -375,6 +386,12 @@ Routine Luna planning and Luna conversation share a local permit, so concurrent
 callers wait inside the container rather than colliding at that broker limit.
 Sol uses a separate permit. Waiting for either model leaves body observations
 and gameplay active; a returned error releases the permit before investigation.
+
+`fixture-workload NEW_DIRECTORY` creates ten std-only Rust binaries with 1024
+non-inlined generic instantiations each, for reproducible compiler pressure
+without copying another bot's workspace or cached executables. Record its source,
+fresh/warm target state, actual build result and overlap duration. This is a
+synthetic compiler workload, not a model-generated skill or intelligence result.
 
 `body-probe PRIVATE_CONFIG.json blocked|compile SECONDS` is a declared native
 execution diagnostic. Blocked mode injects a stalled reasoning future and calls

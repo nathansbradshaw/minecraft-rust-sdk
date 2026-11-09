@@ -38,6 +38,9 @@ pub struct Config {
     /// Opt-in diagnostic cap per body startup. Zero avoids production logging.
     #[serde(default)]
     pub decision_samples: u16,
+    /// Unproven ranged corner maneuver. Native trials have recorded deaths.
+    #[serde(default)]
+    pub experimental_ranged_boundary_turns: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -45,6 +48,7 @@ impl Default for Config {
             enabled: true,
             period_ms: period(),
             decision_samples: 0,
+            experimental_ranged_boundary_turns: false,
         }
     }
 }
@@ -622,13 +626,14 @@ async fn controller(
         // immediately restores the fast route without waiting for the query.
         let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
         let escape = if active["outcome"] != "running" && !awaiting_native {
-            geometry::evade_with_native(
+            geometry::evade_policy(
                 &policy_observed,
                 &rejected_routes,
                 &stationary_projectiles,
                 &trail,
                 finite_waypoint_axis,
                 &admitted,
+                cfg.experimental_ranged_boundary_turns,
             )
         } else {
             None
@@ -804,6 +809,7 @@ async fn controller(
                                 &admitted,
                                 &route,
                             )
+                            .with_boundary_turns(cfg.experimental_ranged_boundary_turns)
                         });
                         let mut r = send(&client, j, action).await?;
                         // A definite pre-dispatch capability refusal can use

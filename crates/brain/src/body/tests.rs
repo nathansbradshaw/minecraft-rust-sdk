@@ -1,4 +1,14 @@
 use super::*;
+
+#[test]
+fn unproved_boundary_turns_require_explicit_deployment_opt_in() {
+    assert!(!Config::default().experimental_ranged_boundary_turns);
+    let previous: Config = serde_json::from_value(json!({"enabled":true,"period_ms":150})).unwrap();
+    assert!(!previous.experimental_ranged_boundary_turns);
+    let enabled: Config =
+        serde_json::from_value(json!({"experimental_ranged_boundary_turns":true})).unwrap();
+    assert!(enabled.experimental_ranged_boundary_turns);
+}
 #[tokio::test]
 async fn stalled_native_query_does_not_stop_observation_or_close_threat_defense() {
     // Deliberately motionless transport fixture; this does not certify game
@@ -124,6 +134,7 @@ async fn stalled_native_query_does_not_stop_observation_or_close_threat_defense(
                 enabled: true,
                 period_ms: 50,
                 decision_samples: 0,
+                experimental_ranged_boundary_turns: false,
             },
             shared,
             stop,
@@ -333,6 +344,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
                 enabled: true,
                 period_ms: 50,
                 decision_samples: 0,
+                experimental_ranged_boundary_turns: false,
             },
             shared,
             stop,
