@@ -474,6 +474,8 @@ async fn controller(
     let mut retreat_trail = tactics::RetreatTrail::default();
     let mut threat_memory = perception::RangedMemory::default();
     let mut own_motion = motion::Motion::default();
+    let mut motion_predictions = 0u64;
+    let mut motion_trace_samples = 0u16;
     let mut last_motion_assessment = (Vec::new(), Vec::new());
     let mut retreat_progress = recovery::Progress::default();
     let mut native_escape = recovery::Discovery::default();
@@ -533,7 +535,23 @@ async fn controller(
         }
         let active = &observed.player["control"];
         let mut policy_observed = threat_memory.policy(&observed);
-        if let Some(prediction) = own_motion.sample(&observed, &owned_control) {
+        let trace_motion = decision_samples > 0
+            && motion_trace_samples < 8
+            && active["action_id"].as_str() == Some(owned_control.as_str())
+            && active["outcome"] == "running";
+        let previous_motion = trace_motion.then(|| own_motion.previous_sample());
+        let prediction = own_motion.sample(&observed, &owned_control);
+        if trace_motion {
+            motion_trace_samples += 1;
+            j.event("body_motion_sample",json!({"owned_control":owned_control,"previous":previous_motion,
+                "player":{"uuid":observed.player["uuid"],"dimension":observed.player["dimension"],"entity_id":observed.player["entity_id"],
+                    "position":p,"on_ground":observed.player["on_ground"],"health":observed.player["health"],
+                    "in_water":observed.player["in_water"],"in_lava":observed.player["in_lava"],"control":active},
+                "game_time":observed.world["game_time"],"sample_clock":observed.world["sample_clock"],"prediction":prediction,
+                "scope":"Bounded actual eligibility inputs for client motion estimate; not a gameplay success claim"}))?;
+        }
+        if let Some(prediction) = prediction {
+            motion_predictions += 1;
             policy_observed.to_mut().player["client_motion"] = prediction;
         }
         let stuck = progress.stuck(&observed, &owned_control);
@@ -911,7 +929,7 @@ async fn controller(
             j.event("body_reconciliation",json!({"action_id":item.receipt.action_id,"outcome":result.as_ref().ok().map(|r|&r.outcome),"error":result.as_ref().err().map(ToString::to_string)}))?;
         }
         if cycles.is_multiple_of(100) {
-            j.event("body_heartbeat",json!({"cycles":cycles,"revision":observed.revision,"observation_ms":observation_ms,"cycle_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;
+            j.event("body_heartbeat",json!({"cycles":cycles,"motion_predictions":motion_predictions,"revision":observed.revision,"observation_ms":observation_ms,"cycle_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;
         }
         let elapsed = started.elapsed();
         if elapsed < Duration::from_millis(cfg.period_ms) {

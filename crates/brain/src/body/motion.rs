@@ -7,6 +7,9 @@ pub(super) struct Motion {
     previous: Option<(String, i64, [f64; 3])>,
 }
 impl Motion {
+    pub fn previous_sample(&self) -> Option<(String, i64, [f64; 3])> {
+        self.previous.clone()
+    }
     pub fn sample(&mut self, o: &Observation, owned: &str) -> Option<Value> {
         let p = point(&o.player["position"])?;
         let tick = o.world["game_time"].as_i64()?;
