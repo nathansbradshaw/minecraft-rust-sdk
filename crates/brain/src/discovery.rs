@@ -3,7 +3,7 @@ use crate::{Journal, Result, digest, model::Choice};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-fn search_fact(choice: &Choice, value: &Value) -> Option<Value> {
+pub(crate) fn search_fact(choice: &Choice, value: &Value) -> Option<Value> {
     if choice.tool != "query" || value["capability"] != "minecraft:block_search" {
         return None;
     }

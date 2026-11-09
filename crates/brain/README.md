@@ -53,6 +53,14 @@ responses up to 5,000 bytes are retained in the model view; larger queries need
 smaller pages or a Rust SDK program. Capability errors, origin changes and
 deployment pacing remain visible. Read-only queries are inspections, not gameplay
 progress, and cannot install plugins or override the acting identity or endpoint.
+The brain retains a bounded cache of historical block-search pages across goals
+and restarts. `spatial_searches` supplies up to six recent records within 4 KiB,
+including repeat counts, page completeness, original match counts, and contextual
+life/clock/terrain bindings. Complete empty scans cover loaded, ray-visible block
+centers; they do not exclude hidden resources. Query responses and contextual
+observations are not atomic, and old locations require fresh observation.
+The 256-entry lookup cache can discard old entries while original tool history
+remains intact. Recollection grants no gameplay success or investigation credit.
 The `navigate` tool composes the existing Rust SDK navigator in a protected child
 using the current character session. It accepts the SDK's closed position or
 block-reach goal, keeps an actor/server/goal-bound route journal, and returns a
