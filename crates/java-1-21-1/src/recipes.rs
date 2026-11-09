@@ -40,6 +40,9 @@ impl Preparation {
                 "Recipe preparation verification requires a supported crafting menu and a known static result; other menus or dynamic recipes need an adapter",
             ));
         }
+        if row["serializer"] == "minecraft:crafting_shaped" {
+            shaped_menu(row, menu_type)?;
+        }
         Ok(Self {
             recipe: recipe.into(),
             menu_id,
@@ -83,6 +86,33 @@ impl Preparation {
             "scope":"Changed native crafting grid with the requested runtime item/count result ready. Output has not been taken; custom component semantics require an adapter."}),
         )
     }
+}
+/// Standard Java menu geometry belongs in this adapter. Runtime recipe-book
+/// knowledge alone does not imply that the currently open grid can hold it.
+fn shaped_menu(row: &Value, menu: &str) -> Result<()> {
+    let dimension = |key: &str| {
+        row["shape"][key]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::NotReady,
+                    "Runtime shaped recipe dimensions are missing or malformed; no crafting packet sent",
+                )
+            })
+    };
+    let width = dimension("width")?;
+    let height = dimension("height")?;
+    let capacity = if menu == "minecraft:inventory" { 2 } else { 3 };
+    if width > capacity || height > capacity {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            format!(
+                "Recipe requires a {width}x{height} grid but current {menu} provides {capacity}x{capacity}; open a compatible crafting menu before retrying. No crafting packet sent"
+            ),
+        ));
+    }
+    Ok(())
 }
 fn grid(menu: &Value) -> Option<Vec<Value>> {
     let slots = menu["slots"].as_array()?;
@@ -152,7 +182,7 @@ mod tests {
     fn lookup() -> Value {
         json!({"format":"minecraft-runtime-recipes-v1","complete":true,"unknown_recipe":false,
             "matches":[{"id":"fixture:recipe","known":true,"type":"minecraft:crafting",
-                "serializer":"minecraft:crafting_shaped","special":false,"result_known":true,"result":{"item":"fixture:result","count":4}}]})
+                "serializer":"minecraft:crafting_shaped","shape":{"width":1,"height":1},"special":false,"result_known":true,"result":{"item":"fixture:result","count":4}}]})
     }
     fn observation() -> Observation {
         Observation {
@@ -257,6 +287,56 @@ mod tests {
         );
         other.menu["type"] = json!("minecraft:crafting");
         assert!(Preparation::bind("fixture:recipe", 0, &lookup(), &other).is_ok());
+    }
+    #[test]
+    fn installed_shaped_recipe_must_fit_both_current_grid_axes() {
+        let mut before = observation();
+        for width in 1..=4 {
+            for height in 1..=4 {
+                let mut found = lookup();
+                found["matches"][0]["shape"] = json!({"width":width,"height":height});
+                for (menu, capacity) in [("minecraft:inventory", 2), ("minecraft:crafting", 3)] {
+                    before.menu["type"] = json!(menu);
+                    let result = Preparation::bind("fixture:recipe", 0, &found, &before);
+                    if width <= capacity && height <= capacity {
+                        assert!(result.is_ok(), "{width}x{height} in {menu}");
+                    } else {
+                        let error = result.err().unwrap();
+                        assert_eq!(error.code, ErrorCode::Conflict);
+                        assert!(error.message.contains("No crafting packet sent"));
+                        assert!(error.message.contains(&format!("{width}x{height}")));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn unknown_shaped_geometry_never_defaults_to_a_fitting_recipe() {
+        for shape in [
+            Value::Null,
+            json!({"width":1}),
+            json!({"width":0,"height":1}),
+            json!({"width":1,"height":-1}),
+            json!({"width":"2","height":2}),
+            json!({"width":1.5,"height":2}),
+        ] {
+            let mut found = lookup();
+            found["matches"][0]["shape"] = shape;
+            assert_eq!(
+                Preparation::bind("fixture:recipe", 0, &found, &observation())
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::NotReady
+            );
+        }
+        // Shapeless recipes do not have shaped bounding-box metadata. Their
+        // existing admission is unchanged; this check makes no ingredient-fit
+        // or material-sufficiency claim for either serializer.
+        let mut found = lookup();
+        found["matches"][0]["serializer"] = json!("minecraft:crafting_shapeless");
+        found["matches"][0].as_object_mut().unwrap().remove("shape");
+        assert!(Preparation::bind("fixture:recipe", 0, &found, &observation()).is_ok());
     }
     #[test]
     fn recipe_admission_requires_exact_installed_and_known_identity() {

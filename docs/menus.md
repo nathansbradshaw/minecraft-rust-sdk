@@ -35,6 +35,12 @@ is not yet an item retained by the character.
 
 The Java adapter binds preparation verification to the exact runtime recipe
 lookup before dispatch. For the supported Java inventory and crafting-table
+menus, shaped recipe dimensions must fit the current 2x2 or 3x3 grid on both
+axes. An oversized shape returns `conflict` with the required and available
+dimensions before a crafting packet is sent. Missing or malformed shaped
+dimensions return `not_ready`; they never default to a fitting recipe. This is
+menu compatibility admission, not a material-sufficiency check. Shapeless and
+custom ingredient semantics retain their existing limits. For the supported
 menus, a changed crafting grid must contain the expected result item and count
 in its output slot. Clearing an old recipe, picking up unrelated inventory, or
 changing only the menu revision cannot establish preparation. A prepared result
