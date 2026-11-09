@@ -45,9 +45,19 @@ async fn main() -> Result<()> {
         "scope":"Read-only SDK observations, no movement, targeting, healing, inference or Survival claim"})
     );
     let started = Instant::now();
+    let deadline = tokio::time::Instant::from_std(started + Duration::from_secs(seconds));
     let mut samples = 0;
     while started.elapsed() < Duration::from_secs(seconds) {
-        let observed = client.observe().await?;
+        let observed = match tokio::time::timeout_at(deadline, client.observe()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                println!(
+                    "{}",
+                    json!({"event":"ranged_probe_read_timeout","scope":"Declared deadline ended observation wait;no gameplay mutation"})
+                );
+                break;
+            }
+        };
         let entity = observed.world["entities"].as_array().and_then(|rows| {
             rows.iter().find(|row| {
                 row["visible"] == true && row["uuid"].as_str() == Some(args[2].as_str())
