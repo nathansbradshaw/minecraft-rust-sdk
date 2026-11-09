@@ -1,4 +1,5 @@
 use crate::{Brain, Result, ensure, model::Choice};
+use minecraft_sdk::ObservationQuery;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -299,18 +300,9 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                 "Capability response exceeds the model view budget; request a smaller page or use an SDK program for the full result",
             )?;
             let mut view = json!({"view":"capability_query","capability":query.capability,"input_sha256":crate::digest(query.input.to_string().as_bytes()),"result":result,"scope":"Read-only SDK capability result for this character; query is not a gameplay mutation or evidence of task completion"});
-            if query.capability == "minecraft:recipes"
-                && query.input["recipe"].is_string()
-                && result["matches"]
-                    .as_array()
-                    .is_some_and(|rows| rows.len() == 1)
-                && result["matches"][0]["id"] == query.input["recipe"]
-            {
+            if let Some(recipe) = material_recipe(&query, &result) {
                 brain.refresh().await?;
-                let materials = minecraft_sdk::recipes::material_summary(
-                    &brain.observed,
-                    &result["matches"][0],
-                );
+                let materials = minecraft_sdk::recipes::material_summary(&brain.observed, recipe);
                 view["client_materials"] = match materials {
                     Ok(summary) if summary.to_string().len() <= 3500 => summary,
                     Ok(_) => {
@@ -417,9 +409,51 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
         _ => Err("Unknown tool".into()),
     }
 }
+
+fn material_recipe<'a>(query: &ObservationQuery, result: &'a Value) -> Option<&'a Value> {
+    if query.capability != "minecraft:recipes" || result["format"] != "minecraft-runtime-recipes-v1"
+    {
+        return None;
+    }
+    let rows = result["matches"].as_array()?;
+    if rows.len() != 1
+        || query
+            .input
+            .get("recipe")
+            .is_some_and(|id| rows[0]["id"] != *id)
+    {
+        return None;
+    }
+    // The summary names this row only. A paged output/type search can have other
+    // candidates; one returned row is not a uniqueness or completeness proof.
+    Some(&rows[0])
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn material_feedback_covers_single_search_rows_without_inventing_uniqueness() {
+        let mut query = ObservationQuery {
+            capability: "minecraft:recipes".into(),
+            input: json!({"output":"fixture:result","limit":1}),
+        };
+        let mut result = json!({"format":"minecraft-runtime-recipes-v1","complete":false,"next_offset":7,"matches":[{"id":"fixture:recipe"}]});
+        assert_eq!(
+            material_recipe(&query, &result).unwrap()["id"],
+            "fixture:recipe"
+        );
+        query.input = json!({"recipe":"fixture:other"});
+        assert!(material_recipe(&query, &result).is_none());
+        query.input = json!({"recipe":"fixture:recipe"});
+        assert!(material_recipe(&query, &result).is_some());
+        result["matches"] = json!([{"id":"fixture:recipe"},{"id":"fixture:another"}]);
+        assert!(material_recipe(&query, &result).is_none());
+        result["matches"] = json!([]);
+        assert!(material_recipe(&query, &result).is_none());
+        result["matches"] = json!([{"id":"fixture:recipe"}]);
+        query.capability = "fixture:another_provider".into();
+        assert!(material_recipe(&query, &result).is_none());
+    }
     #[test]
     fn exact_edits_preserve_source_on_stale_ambiguous_and_escaping_requests() {
         let dir = tempfile::tempdir().unwrap();
