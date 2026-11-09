@@ -179,6 +179,10 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   completion; it does not hold position while planning. The independent body
   permits active surface swimming only with native eyes-clear/full-air facts,
   and protects a submerged character while reasoning or compilation continues.
+  The foreground navigate helper permits these native water predictions instead
+  of treating every wet boundary as impassable. Its other hazard exclusions stay
+  active. Defensive geometry retains its own water policy; drowning protection
+  can still preempt a foreground swim. Neither prediction nor dispatch proves arrival.
 - Put its journal under MC_SDK_STATE, using a distinct file per goal. Reuse that
   journal to resume; pending IDs are inspected rather than replayed. Options
   controls operation deadline, actions, nodes and caller-supplied forbidden block
