@@ -27,6 +27,16 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if args.len() == 2 && args[0] == "replay-decision" {
+        let bytes = private_read(
+            Path::new(&args[1]),
+            minecraft_sdk_brain::body::decision::MAX_BYTES as u64,
+        )?;
+        let snapshot: minecraft_sdk_brain::body::decision::Snapshot =
+            serde_json::from_slice(&bytes)?;
+        println!("{}", snapshot.replay());
+        return Ok(());
+    }
     if !((matches!(args.len(), 3 | 4)
         && matches!(args[1].as_str(), "blocked" | "compile" | "exposed"))
         || (args.len() == 4 && args[1] == "navigate"))
