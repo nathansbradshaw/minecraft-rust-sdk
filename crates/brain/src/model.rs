@@ -2,9 +2,9 @@ use crate::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub(crate) const REQUEST_CONTRACT: &str =
-    "allocated-model-work-purpose-v2/verified-compiler-repair-v1";
+    "allocated-model-work-purpose-v2/verified-gameplay-repair-v1";
 mod repair;
-/// Inspect a compiler-repair transition without inference, execution or writes.
+/// Inspect a source-bound coding repair without inference, execution or writes.
 pub fn compiler_repair_preview(context: &Value) -> Value {
     let mut preview = context.clone();
     let mut schema = schema();
