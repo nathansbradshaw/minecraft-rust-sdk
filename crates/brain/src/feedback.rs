@@ -215,6 +215,14 @@ mod tests {
         assert_eq!(feedback["errors"][0]["rendered_complete"], false);
         assert!(feedback.to_string().len() <= 4096);
         assert!(context.to_string().len() <= 32768);
+        assert_eq!(
+            context["last_experiment"]["result"]["stdout"]["view"],
+            "omitted_duplicate_compiler_preview"
+        );
+        assert_eq!(
+            context["last_experiment"]["result"]["compiler_diagnostics"]["view"],
+            "compiler_feedback"
+        );
         assert!(journal.compiler_feedback("another-goal").unwrap().is_null());
 
         let choice = crate::model::Choice {

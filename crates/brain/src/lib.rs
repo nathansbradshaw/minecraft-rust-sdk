@@ -1070,7 +1070,13 @@ impl Brain {
             context["compiler_feedback"] = self
                 .journal
                 .compiler_feedback(&self.journal.get("goal_revision")?.unwrap_or_default())?;
-            fit_context(&mut context)?;
+            if let Err(error) = fit_context(&mut context) {
+                let rejected = serde_json::to_string(&context)?;
+                if rejected.len() <= 262144 {
+                    self.journal.set("last_rejected_model_context", &rejected)?;
+                }
+                return Err(error);
+            }
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
             self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"preferred_development":preferred,"quota_fallback":preferred != develop,"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
@@ -1348,6 +1354,30 @@ fn bound_value(value: &mut Value, budget: usize) {
     }
 }
 fn fit_context(context: &mut Value) -> Result<()> {
+    // The dedicated primary-error channel is already bounded. Do not spend
+    // the context budget again on legacy compiler records and Cargo's verbose
+    // stdout preview; full output locations remain on the experiment.
+    if context["compiler_feedback"]["errors"]
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty())
+        && context["compiler_feedback"]["source_sha256"]
+            == context["last_experiment"]["source_sha256"]
+        && context["compiler_feedback"]["goal_revision"]
+            == context["last_experiment"]["goal_revision"]
+    {
+        let result = &mut context["last_experiment"]["result"];
+        if let Some(result) = result.as_object_mut() {
+            result.insert(
+                "compiler_diagnostics".into(),
+                json!({"view":"compiler_feedback","complete":false,"full_bytes":"output_files"}),
+            );
+            for field in ["stdout", "stderr"] {
+                if result.get(field).is_some_and(Value::is_string) {
+                    result.insert(field.into(), json!({"view":"omitted_duplicate_compiler_preview","full_bytes":"output_files"}));
+                }
+            }
+        }
+    }
     // Focused views have already been paged under a byte ceiling. Truncating
     // their records again would invalidate returned counts and slot bindings.
     let focused = context["last_tool_result"]["result"]["view"].is_string();
