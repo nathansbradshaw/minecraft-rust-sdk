@@ -57,8 +57,10 @@ When coding_transition.mode is verified_compiler_repair, the container worker
 has verified that the complete supplied Rust file and failed workspace remain
 unchanged. This decision asks for an exact edit to coding_transition.path or a
 report naming the specific missing interface/fact. Return the actual old/new
-replacement data; another source/reference read is not a repair. The executor
-checks the expected source hash before editing. A later turn can compile/run the
+replacement data; another source/reference read is not a repair. The worker
+can attach a bounded current file from the compiler's own source location as
+compiler_repair_source, so a compiler failure does not need another read turn.
+The executor checks the expected source hash before editing. A later turn can compile/run the
 changed version with the ordinary tool interface. This transition neither edits
 code itself nor supplies a gameplay solution, and does not certify an effect.
 Do not repeatedly inspect unchanged error files or reconstruct missing errors

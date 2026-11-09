@@ -7,6 +7,58 @@ pub(super) struct Transition {
     path: String,
     source_sha256: String,
     failed_workspace_sha256: String,
+    source: Option<Value>,
+}
+fn compiler_source(root: &Path, compiler: &Value) -> Option<Value> {
+    use std::io::Read;
+    for error in compiler["errors"].as_array()?.iter().take(4) {
+        for line in error["rendered"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .take(12)
+        {
+            let Some(location) = line.trim().strip_prefix("--> ") else {
+                continue;
+            };
+            let Some((prefix, column)) = location.rsplit_once(':') else {
+                continue;
+            };
+            let Some((path, line)) = prefix.rsplit_once(':') else {
+                continue;
+            };
+            if column.parse::<u32>().ok().is_none_or(|n| n == 0)
+                || line.parse::<u32>().ok().is_none_or(|n| n == 0)
+            {
+                continue;
+            }
+            let path = Path::new(path);
+            let file = fs::canonicalize(if path.is_absolute() {
+                path.to_owned()
+            } else {
+                root.join(path)
+            })
+            .ok()?;
+            let relative = file.strip_prefix(root).ok()?;
+            if relative.extension()? != "rs" {
+                return None;
+            }
+            let mut bytes = Vec::new();
+            fs::File::open(&file)
+                .ok()?
+                .take(4097)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() > 4096 {
+                return None;
+            }
+            let source = std::str::from_utf8(&bytes).ok()?;
+            return Some(
+                json!({"view":"file","path":file,"source_sha256":crate::digest(&bytes),"source_bytes":bytes.len(),"content_complete":true,"content":source}),
+            );
+        }
+    }
+    None
 }
 impl Transition {
     /// Incomplete, changed or foreign source keeps the ordinary tool interface.
@@ -15,7 +67,6 @@ impl Transition {
         let compiler = &context["compiler_feedback"];
         let experiment = &context["last_experiment"];
         let latest = &context["last_tool_result"];
-        let read = &latest["result"];
         if compiler["format"] != "compiler-feedback-v1"
             || compiler["success"] != false
             || compiler["errors"].as_array().is_none_or(Vec::is_empty)
@@ -24,10 +75,22 @@ impl Transition {
             || !compiler["goal_revision"].is_string()
             || compiler["goal_revision"] != experiment["goal_revision"]
             || compiler["goal_revision"] != latest["goal_revision"]
-            || latest["tool"] != "read"
         {
             return None;
         }
+        let root = fs::canonicalize(context["workspace"].as_str()?).ok()?;
+        let automatic = latest["tool"] == "run"
+            && latest["result"]["success"] == false
+            && latest["result"]["compiler_diagnostics"]["errors"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty());
+        let read = if latest["tool"] == "read" {
+            latest["result"].clone()
+        } else if automatic {
+            compiler_source(&root, compiler)?
+        } else {
+            return None;
+        };
         let complete = match read["view"].as_str()? {
             "file" => read["content_complete"] == true,
             "file_range" => {
@@ -41,7 +104,6 @@ impl Transition {
         if !complete {
             return None;
         }
-        let root = fs::canonicalize(context["workspace"].as_str()?).ok()?;
         let requested = Path::new(read["path"].as_str()?);
         let file = fs::canonicalize(if requested.is_absolute() {
             requested.to_owned()
@@ -76,14 +138,19 @@ impl Transition {
             path: relative.to_str()?.into(),
             source_sha256: hash,
             failed_workspace_sha256: fingerprint,
+            source: automatic.then_some(read),
         })
     }
     pub fn prepare(&self, context: &mut Value, schema: &mut Value) {
         context["decision_session"]["mode"] = json!("verified_compiler_repair");
         context["decision_session"]["develop_available"] = json!(false);
+        if let Some(source) = &self.source {
+            context["compiler_repair_source"] = source.clone();
+        }
         context["coding_transition"] = json!({"mode":"verified_compiler_repair",
             "path":self.path,"expected_sha256":self.source_sha256,
             "failed_workspace_sha256":self.failed_workspace_sha256,
+            "source_view":if self.source.is_some(){"compiler_repair_source"}else{"last_tool_result.result"},
             "task":"The complete unchanged failed Rust source and primary compiler errors are already supplied. Return an actual edit with exact old/new fragments, or report the specific missing fact/interface that prevents a repair. Do not reread the same source/reference. The model authors all replacement code. After editing, compile/run the changed version; compilation and gameplay remain unproved.",
             "scope":"Container-local source verification and coding workflow only. No gameplay mutation, allowance refill or inference-host execution."});
         schema["properties"]["tool"]["enum"] = json!(["edit", "report"]);
@@ -248,5 +315,31 @@ mod tests {
                 .is_some_and(|s| s.len() == 64)
         );
         server.await.unwrap();
+    }
+    #[test]
+    fn a_failed_compile_supplies_current_source_without_another_model_read() {
+        let (_dir, mut context) = fixture();
+        context["compiler_feedback"]["errors"][0]["rendered"] =
+            json!("error: missing function\n --> src/main.rs:1:12\n");
+        context["last_tool_result"] = json!({"tool":"run","goal_revision":"goal","result":{"success":false,"compiler_diagnostics":{"errors":[{"message":"missing function"}]}}});
+        let transition = Transition::from_context(&context).unwrap();
+        let mut schema = super::super::schema();
+        transition.prepare(&mut context, &mut schema);
+        assert_eq!(
+            context["compiler_repair_source"]["content"],
+            "fn main() { missing(); }\n"
+        );
+        assert_eq!(
+            context["coding_transition"]["source_view"],
+            "compiler_repair_source"
+        );
+        context["last_tool_result"]["result"]["success"] = json!(true);
+        assert!(Transition::from_context(&context).is_none());
+        context["last_tool_result"]["result"]["success"] = json!(false);
+        context["last_tool_result"]["result"]["compiler_diagnostics"]["errors"] = json!([]);
+        assert!(
+            Transition::from_context(&context).is_none(),
+            "runtime failures are not compiler repairs"
+        );
     }
 }
