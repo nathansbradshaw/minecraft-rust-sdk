@@ -572,10 +572,10 @@ pub(super) fn evade_with_native(
         recent_retreat,
         waypoint_axis,
         admitted,
-        true,
+        false,
     )
 }
-fn evade_policy(
+pub(super) fn evade_policy(
     o: &Observation,
     blocked: &[[i32; 3]],
     stationary: &[String],
@@ -949,12 +949,10 @@ fn evade_policy(
                         "leave burning terrain"
                     } else if seek_refuge && !refuges.is_empty() {
                         "approach observed low-roof refuge from flying attacker"
+                    } else if boundary_turn.is_some() {
+                        "turn along observed boundary without reversing the firing lane"
                     } else {
-                        if boundary_turn.is_some() {
-                            "turn along observed boundary without reversing the firing lane"
-                        } else {
-                            "increase threat distance and seek cover"
-                        }
+                        "increase threat distance and seek cover"
                     }
                     .into(),
                 });
@@ -1015,12 +1013,28 @@ mod tests {
         let mut desired = [1., 0.];
         for _ in 0..4 {
             let start = point(&o.player["position"]).unwrap();
-            let route = evade_with_stationary(&o, &[], &[], &trail).unwrap();
+            let route = evade_policy(&o, &[], &[], &trail, 3.5, &[], true).unwrap();
             assert!(!route.jump);
             assert!(route.reason.contains("boundary"));
+            let snapshot =
+                super::super::decision::Snapshot::capture(&o, &[], &[], &trail, 3.5, &[], &route)
+                    .with_boundary_turns(true);
+            let bytes = serde_json::to_vec(&snapshot).unwrap();
+            let restored: super::super::decision::Snapshot =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored.replay()["matches_recorded_choice"], true);
+            assert_eq!(
+                restored.replay()["experimental_ranged_boundary_turns"],
+                true
+            );
             let delta = [route.target.x - start[0], route.target.z - start[2]];
             assert!(delta[0] * desired[0] + delta[1] * desired[1] > 2.);
             let legacy = evade_policy(&o, &[], &[], &trail, 3.5, &[], false).unwrap();
+            let default = evade_with_stationary(&o, &[], &[], &trail).unwrap();
+            assert_eq!(
+                [default.target.x, default.target.z],
+                [legacy.target.x, legacy.target.z]
+            );
             let old_delta = [legacy.target.x - start[0], legacy.target.z - start[2]];
             assert!(old_delta[0] * desired[0] + old_delta[1] * desired[1] < 1.);
             // Rotate complete voxel cells, entities and reached history, not
@@ -1047,18 +1061,21 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .retain(|b| b["position"][0].as_f64().unwrap() < 1.);
-        let route = evade_with_stationary(&o, &[], &[], &trail).unwrap();
+        let route = evade_policy(&o, &[], &[], &trail, 3.5, &[], true).unwrap();
         assert!(route.target.x < 1.);
         assert!(!route.reason.contains("boundary"));
         assert!(
-            evade_with_stationary(
+            evade_policy(
                 &Observation {
                     world: json!({"blocks":[],"entities":o.world["entities"]}),
                     ..o.clone()
                 },
                 &[],
                 &[],
-                &trail
+                &trail,
+                3.5,
+                &[],
+                true
             )
             .is_none()
         );
@@ -1073,7 +1090,7 @@ mod tests {
                 "melee"=>o.world["entities"].as_array_mut().unwrap().push(json!({"visible":true,"hostile":true,"ranged_attack":false,"position":[3.,1.,-1.]})),
                 _=>o.player["fire_ticks"]=json!(20),
             }
-            let actual = evade_with_stationary(&o, &[], &[], &trail);
+            let actual = evade_policy(&o, &[], &[], &trail, 3.5, &[], true);
             let legacy = evade_policy(&o, &[], &[], &trail, 3.5, &[], false);
             assert_eq!(
                 actual

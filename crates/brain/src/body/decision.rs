@@ -34,6 +34,8 @@ pub struct Snapshot {
     waypoint_axis: f64,
     admitted: Vec<Admitted>,
     selected: Option<Choice>,
+    #[serde(default)]
+    experimental_ranged_boundary_turns: bool,
 }
 impl Snapshot {
     pub(super) fn capture(
@@ -62,22 +64,29 @@ impl Snapshot {
             waypoint_axis,
             admitted: admitted.to_vec(),
             selected: Some(route.into()),
+            experimental_ranged_boundary_turns: false,
         }
     }
+    pub(super) fn with_boundary_turns(mut self, enabled: bool) -> Self {
+        self.experimental_ranged_boundary_turns = enabled;
+        self
+    }
     pub fn replay(&self) -> Value {
-        let actual = geometry::evade_with_native(
+        let actual = geometry::evade_policy(
             &self.observation,
             &self.blocked,
             &self.stationary,
             &self.recent_retreat,
             self.waypoint_axis,
             &self.admitted,
+            self.experimental_ranged_boundary_turns,
         );
         let actual = actual.as_ref().map(Choice::from);
         let expected = serde_json::to_value(&self.selected).expect("finite captured policy choice");
         let actual = serde_json::to_value(actual).expect("finite replayed policy choice");
         json!({"matches_recorded_choice":actual==expected,"recorded":expected,"replayed":actual,
             "revision":self.observation.revision,"position":self.observation.player["position"],
+            "experimental_ranged_boundary_turns":self.experimental_ranged_boundary_turns,
             "scope":"Container-local policy replay, not native movement or Survival evidence"})
     }
 }

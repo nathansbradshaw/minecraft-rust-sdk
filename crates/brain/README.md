@@ -16,11 +16,16 @@ tool uses this path; `minecraft-sdk-brain reconcile-pending PRIVATE_CONFIG.json`
 also performs one scoped reconciliation without inference, with normal body and
 disconnect cleanup. It requires exclusive ownership of that controller state.
 
-At a known wall, recent reached positions can preserve a separated ranged turn
+The opt-in body setting `experimental_ranged_boundary_turns` (default `false`)
+uses recent reached positions to preserve a separated ranged turn at a known wall
 along the boundary. This preference keeps existing collision/support checks and
 falls back when only the previous lane is viable. Immediate projectiles, mixed
 melee, fire and blast escape retain their existing scoring. Local replay is not
-a Survival result; native trials must measure damage, deaths and retained state.
+a Survival result. The initial enabled candidate died in all three declared
+120-second native cover layouts (one death per character). Its real compilation
+lasted only 1.25 seconds, providing limited overlap evidence. The maneuver remains
+experimental; neither this change nor compilation establishes Survival competence.
+Decision captures retain the selected experiment setting for reproducible replay.
 
 Luna handles routine choices. Explicit development, code writes and failed
 routine experiments can request a Sol session of at most four decisions. The
