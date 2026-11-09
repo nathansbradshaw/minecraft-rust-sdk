@@ -148,6 +148,13 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   player:1.62; use an appropriate interaction range). Choose the block from fresh
   observations. The helper uses a persistent local graph and finite controls;
   it never mines, teleports, breaks obstacles or chooses your task.
+  After no_known_route, the brain's observe tool accepts {"view":"terrain"}.
+  This read-only view groups current observed cells around the character into
+  support, feet, head and above_head layers, with absolute positions and native
+  collision/permission facts. Missing cells remain unknown, not air or safe.
+  Follow page.next_offset while stationary. Diagnose the local constraint before
+  choosing a new method; changing distant targets cannot open the same graph.
+  This view neither chooses blocks to break nor predicts a safe passage.
   The brain's navigate tool composes this same helper through its body arbiter;
   use it for a bounded route rather than one model turn per local waypoint.
   Completed read pages survive operation deadlines. Resume the same goal and

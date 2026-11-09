@@ -134,6 +134,10 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
         Ok(response) => {
             result["navigation"] = response;
             classify_slice(&mut result, &request.goal);
+            if result["navigation"]["report"]["status"] == "no_known_route" {
+                result["recommended_observation"] = json!({"tool":"observe","input":{"view":"terrain"},
+                    "reason":"Inspect local support, foot space and headroom. Another distant target does not open an exhausted local graph. Diagnose the observed constraint before choosing a different method; this is not permission or a request to break blocks."});
+            }
         }
         Err(error) => {
             result["success"] = json!(false);

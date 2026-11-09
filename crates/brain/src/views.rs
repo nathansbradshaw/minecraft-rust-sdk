@@ -18,6 +18,89 @@ struct Query {
 fn default_limit() -> usize {
     16
 }
+fn terrain(observation: &Observation, query: &Query) -> Result<Value> {
+    ensure(
+        query.match_id.is_none(),
+        "Terrain columns do not accept match_id",
+    )?;
+    let position = &observation.player["position"];
+    let mut feet = [0i32; 3];
+    for axis in 0..3 {
+        let value = position[axis]
+            .as_f64()
+            .ok_or("Player position unavailable")?;
+        ensure(
+            value.is_finite()
+                && value.floor() >= f64::from(i32::MIN) + 2.
+                && value.floor() <= f64::from(i32::MAX) - 2.,
+            "Player position outside terrain-view bounds",
+        )?;
+        feet[axis] = value.floor() as i32;
+    }
+    let offsets = [
+        (0, 0),
+        (0, -1),
+        (1, 0),
+        (0, 1),
+        (-1, 0),
+        (-1, -1),
+        (1, -1),
+        (1, 1),
+        (-1, 1),
+    ];
+    ensure(
+        query.offset <= offsets.len(),
+        "Terrain offset exceeds snapshot; restart at zero",
+    )?;
+    let blocks: Vec<_> = observation.world["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut entries = Vec::new();
+    for (dx, dz) in offsets.iter().skip(query.offset).take(query.limit) {
+        let mut cells = serde_json::Map::new();
+        for (name, dy) in [("support", -1), ("feet", 0), ("head", 1), ("above_head", 2)] {
+            let at = json!([feet[0] + dx, feet[1] + dy, feet[2] + dz]);
+            let mut cell = blocks
+                .iter()
+                .find(|b| b["position"] == at)
+                .map(|b| {
+                    fields(
+                        b,
+                        &[
+                            "block",
+                            "state",
+                            "replaceable",
+                            "may_interact",
+                            "destroy_progress",
+                            "collision",
+                        ],
+                    )
+                })
+                .unwrap_or_else(|| json!({}));
+            cell["known"] = json!(cell["block"].is_string());
+            cell["position"] = at;
+            cells.insert(name.into(), cell);
+        }
+        entries.push(json!({"offset_xz":[dx,dz],"cells":cells}));
+        if serde_json::to_vec(&entries)?.len() > 5000 {
+            entries.pop();
+            ensure(
+                !entries.is_empty(),
+                "Terrain column exceeds focused-view budget; inspect through an SDK program",
+            )?;
+            break;
+        }
+    }
+    let next = query.offset + entries.len();
+    Ok(json!({"view":"terrain","revision":observation.revision,
+        "player":{"uuid":observation.player["uuid"],"dimension":observation.player["dimension"],"position":position},
+        "world":{"terrain_columns":entries},
+        "page":{"offset":query.offset,"returned":next-query.offset,"total_in_snapshot":offsets.len(),
+            "next_offset":(next<offsets.len()).then_some(next),"complete":next==offsets.len()},
+        "binding":"Read-only local cell facts at this revision. Layers are relative to floor(player feet Y), not predicted landing heights. Missing cells/collision data are unknown, never air or safe. Page completeness describes nine sampled columns, not observation or route completeness. Pages are live; restart after movement. Permissions and collision facts do not prove a digging ray, safe clearance or a route; ordinary native admission remains authoritative."}))
+}
 fn fields(value: &Value, names: &[&str]) -> Value {
     let mut result = serde_json::Map::new();
     for name in names {
@@ -80,13 +163,18 @@ pub fn focused(observation: &Observation, input: &str) -> Result<Value> {
             .is_none_or(|s| minecraft_sdk::registry_id(s)),
         "match_id must be an exact runtime registry ID",
     )?;
+    if query.view == "terrain" {
+        return terrain(observation, &query);
+    }
     let (rows, field, id_field): (&Value, &str, &str) = match query.view.as_str() {
         "menu" => (&observation.menu["slots"], "slots", "item"),
         "inventory" => (&observation.player["inventory"], "inventory", "item"),
         "entities" => (&observation.world["entities"], "entities", "type"),
         "blocks" => (&observation.world["blocks"], "blocks", "block"),
         _ => {
-            return Err("Unknown observation view; use menu, inventory, entities or blocks".into());
+            return Err(
+                "Unknown observation view; use menu, inventory, entities, blocks or terrain".into(),
+            );
         }
     };
     let rows: Vec<_> = rows
@@ -211,6 +299,8 @@ mod tests {
             r#"{"view":"menu","limit":33}"#,
             r#"{"view":"menu","offset":99}"#,
             r#"{"view":"entities","match_id":"../../host"}"#,
+            r#"{"view":"terrain","match_id":"minecraft:dirt"}"#,
+            r#"{"view":"terrain","offset":10}"#,
         ] {
             assert!(focused(&observation(), input).is_err(), "{input}");
         }
@@ -231,6 +321,40 @@ mod tests {
             context["last_tool_result"], before,
             "Context fitting must not silently change page counts or omit returned records"
         );
+    }
+    #[test]
+    fn terrain_distinguishes_missing_cells_from_air_and_keeps_native_shapes() {
+        let mut obs = observation();
+        obs.player["position"] = json!([-0.2, 73.0, -1.1]);
+        obs.world["blocks"] = json!([
+            {"position":[-1,72,-2],"block":"minecraft:stone","collision":[[0,0,0,1,1,1]]},
+            {"position":[-1,73,-2],"block":"minecraft:air","collision":[]},
+            {"position":[-1,74,-2],"block":"custom:slab","collision":[[0,0,0,1,0.5,1]],"may_interact":false,"destroy_progress":0.0}
+        ]);
+        let page = focused(&obs, r#"{"view":"terrain","limit":1}"#).unwrap();
+        let cells = &page["world"]["terrain_columns"][0]["cells"];
+        assert_eq!(cells["support"]["position"], json!([-1, 72, -2]));
+        assert_eq!(cells["feet"]["known"], true);
+        assert_eq!(cells["feet"]["block"], "minecraft:air");
+        assert_eq!(cells["head"]["collision"], json!([[0, 0, 0, 1, 0.5, 1]]));
+        assert_eq!(cells["head"]["may_interact"], false);
+        assert_eq!(cells["above_head"]["known"], false);
+        assert!(cells["above_head"].get("block").is_none());
+        assert_eq!(page["page"]["next_offset"], 1);
+        let next = focused(&obs, r#"{"view":"terrain","offset":1,"limit":1}"#).unwrap();
+        assert_eq!(
+            next["world"]["terrain_columns"][0]["cells"]["head"]["position"],
+            json!([-1, 74, -3])
+        );
+        assert_eq!(
+            next["world"]["terrain_columns"][0]["cells"]["head"]["known"],
+            false
+        );
+        assert!(page.to_string().len() < 7000);
+        for position in [json!(null), json!([1e30, 73, 0]), json!([0, "bad", 0])] {
+            obs.player["position"] = position;
+            assert!(focused(&obs, r#"{"view":"terrain"}"#).is_err());
+        }
     }
     #[test]
     fn runtime_material_feedback_survives_history_compaction_without_becoming_a_craftability_claim()

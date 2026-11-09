@@ -804,7 +804,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
         );
         let Some(route) = choose(&j.state, &current) else {
             j.save()?;
-            return Ok(j.report("no_known_route","No reachable unexplored frontier remains. This is not proof that the world has no route; inspect interaction, terrain and goal constraints."));
+            return Ok(j.report("no_known_route","No reachable unexplored frontier remains. Inspect local support, foot space, headroom and goal constraints before selecting another distant target. This is not proof that the world has no route, or permission to change terrain."));
         };
         j.state.sequence = j
             .state
