@@ -27,6 +27,12 @@ lasted only 1.25 seconds, providing limited overlap evidence. The maneuver remai
 experimental; neither this change nor compilation establishes Survival competence.
 Decision captures retain the selected experiment setting for reproducible replay.
 
+While guarding observed ranged cover, the client scores known, supported covered
+room in both directions along the nearby wall face. Separation reward saturates
+at eight blocks, so distance alone does not keep driving it toward a screen's end.
+This geometric margin uses current observations and last-seen threat facts; it
+does not predict an unseen enemy's location or establish native Survival.
+
 Luna handles routine choices. Explicit development, code writes and failed
 routine experiments can request a Sol session of at most four decisions. The
 remaining session is saved before each inference request, so restarting does not

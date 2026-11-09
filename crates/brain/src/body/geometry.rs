@@ -1246,11 +1246,25 @@ mod tests {
                 b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
             }
         }
-        let first = evade(&o).expect("Guard toward far end while archer is hidden");
+        let first = evade(&o).expect("Guard toward the protected wall interior");
         assert!(
-            (first.target.x + 0.5).abs() < 0.01 && first.target.z > 0.5,
+            (first.target.x + 0.5).abs() < 0.01 && first.target.z.abs() <= 0.5,
             "{first:?}"
         );
+        for direction in [-1., 1.] {
+            assert!(
+                covered(
+                    [
+                        first.target.x,
+                        first.target.y,
+                        first.target.z + direction * 1.5
+                    ],
+                    [11.5, 1., -2.8],
+                    &boxes(&o),
+                ),
+                "A guard needs covered room on both sides, rather than just the farthest endpoint"
+            );
+        }
         assert!(!first.cover_path.is_empty());
         assert!(!can_pass_waypoint(&o, &first));
         o.player["position"] = json!([first.target.x, first.target.y, first.target.z]);
