@@ -64,3 +64,29 @@ calling this an exact replay. Replays are client policy evidence; bind their
 action IDs to trusted native receipts and scenes for gameplay conclusions.
 The diagnostic adds bounded recording overhead and does not change the policy
 or grant additional observations or gameplay authority.
+
+Cover approach searches only nearby currently known dry support and collision
+geometry. Its goal is predicted occlusion, not a claim of permanent protection.
+Approach segments retain precise stops. A last-visible ranged threat can remain
+in client policy memory for at most160 native ticks after losing sight. Recalled
+entries keep `visible:false` and an explicit `client_memory` origin/age; they do
+not use an invisible entity's current position. Native observations, attacks and
+authoritative action verification keep their actual current actor facts. Death,
+respawn, dimension/identity/clock changes and expiry invalidate the memory.
+
+For the body's own grounded finite movement, recent native feet samples can
+support a short client motion estimate. The arrow classifier tests both movement
+toward that input's endpoint and stopping there. It preserves input only with a
+wide predicted horizontal clearance; shots leading the moving player still
+trigger defense. Releasing/foreign input, airborne motion, changed lives, stale
+samples and unknown projectiles retain conservative handling. Prediction
+differences are recorded as `body_motion_projectile_assessment`, with sample
+poses/ticks and the active action ID. They are hypotheses, not native immunity
+or a guarantee of future movement.
+
+Ranged escape scoring also considers recent grounded displacement when choosing
+between otherwise safe waypoints. This avoids discarding speed on repeated
+sharp turns. Fresh collision/support, cover approach and urgent hazard policies
+retain priority; observed movement is a preference, not permission to enter
+unknown terrain. Decision snapshots retain this client-derived motion separately
+from the server's impulse velocity.

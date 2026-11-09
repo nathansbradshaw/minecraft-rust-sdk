@@ -1,6 +1,7 @@
 use minecraft_sdk::{Observation, Position};
 use serde_json::Value;
 use std::collections::HashMap;
+mod cover;
 type Cells<'a> = HashMap<[i32; 3], &'a Value>;
 
 pub fn point(v: &Value) -> Option<[f64; 3]> {
@@ -108,11 +109,14 @@ pub struct Escape {
     pub target: Position,
     pub jump: bool,
     pub reason: String,
+    /// Remaining currently observed route toward predicted ballistic cover.
+    pub cover_path: Vec<Position>,
 }
 /// A defensive pass-through may carry passive momentum beyond its waypoint.
 /// Require a fully observed, supported, level continuation; unknown is unsafe.
 pub fn can_pass_waypoint(o: &Observation, route: &Escape) -> bool {
-    if route.jump
+    if !route.cover_path.is_empty()
+        || route.jump
         || o.player["on_ground"] != true
         || o.player["in_water"] == true
         || o.player["in_lava"] == true
@@ -182,12 +186,15 @@ pub fn threatened(o: &Observation) -> bool {
         .flatten()
         .any(|e| {
             e["hostile"] == true
-                && e["visible"] == true
+                && perceived(e)
                 && point(&e["position"]).is_some_and(|p| {
                     (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>()
                         < threat_radius(e).powi(2)
                 })
         })
+}
+fn perceived(entity: &Value) -> bool {
+    entity["visible"] == true || entity["client_memory"]["kind"] == "last_visible_ranged_threat"
 }
 /// Submersion needs protection independently of inference. A natively confirmed
 /// breathing surface swimmer may keep its finite input; unknown facts retain
@@ -314,6 +321,7 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
                     // Upward water steering holds swim input; a ground-jump request
                     // must not persist into the next grounded phase.
                     jump: false,
+                    cover_path: Vec::new(),
                     reason: if dry {
                         "leave water for observed dry support"
                     } else if breathable {
@@ -434,13 +442,93 @@ pub(super) fn incoming_with_stationary(o: &Observation, stationary: &[String]) -
                 .map(|i| (p[i] + v[i] * t - start[i] - if i == 1 { 0.9 } else { 0. }).powi(2))
                 .sum::<f64>()
                 .sqrt();
-            (0.0..=12.).contains(&t) && miss < 1.5
+            ongoing_input_arrow_danger(o, e).unwrap_or((0.0..=12.).contains(&t) && miss < 1.5)
         })
         .map(|e| projectile_key(e).unwrap_or_else(|| "unidentified-projectile".into()))
         .collect();
     ids.sort();
     ids.dedup();
     ids
+}
+fn ongoing_input_arrow_danger(o: &Observation, arrow: &Value) -> Option<bool> {
+    if !matches!(
+        arrow["type"].as_str(),
+        Some("minecraft:arrow" | "minecraft:spectral_arrow")
+    ) {
+        return None;
+    }
+    let motion = &o.player["client_motion"];
+    if motion["kind"] != "finite_input_extrapolation" {
+        return None;
+    }
+    let start = point(&o.player["position"])?;
+    let target = point(&motion["target"])?;
+    let velocity = point(&motion["velocity_per_tick"])?;
+    let p = point(&arrow["position"])?;
+    let v = point(&arrow["velocity"])?;
+    let speed = velocity[0].hypot(velocity[2]);
+    let length = (target[0] - start[0]).hypot(target[2] - start[2]);
+    if !(0.05..=0.9).contains(&speed) || length < 0.6 {
+        return None;
+    }
+    let duration = length / speed;
+    let body_v = [
+        (target[0] - start[0]) / duration,
+        0.,
+        (target[2] - start[2]) / duration,
+    ];
+    let closest = |d: [f64; 3], v: [f64; 3], lo: f64, hi: f64, horizontal: bool| {
+        let axes = |i: usize| !horizontal || i != 1;
+        let vv = (0..3)
+            .filter(|&i| axes(i))
+            .map(|i| v[i] * v[i])
+            .sum::<f64>();
+        let t = if vv > 1e-9 {
+            -(0..3)
+                .filter(|&i| axes(i))
+                .map(|i| d[i] * v[i])
+                .sum::<f64>()
+                / vv
+        } else {
+            lo
+        }
+        .clamp(lo, hi);
+        (0..3)
+            .filter(|&i| axes(i))
+            .map(|i| (d[i] + v[i] * t).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let relative = std::array::from_fn(|i| v[i] - body_v[i]);
+    let d = std::array::from_fn(|i| p[i] - start[i]);
+    let mut clearance = closest(d, relative, 0., duration.min(12.), true);
+    let centre = std::array::from_fn(|i| d[i] - if i == 1 { 0.9 } else { 0. });
+    let mut collision = closest(centre, relative, 0., duration.min(12.), false);
+    if duration < 12. {
+        clearance = clearance.min(closest(
+            std::array::from_fn(|i| p[i] - target[i]),
+            v,
+            duration,
+            12.,
+            true,
+        ));
+        collision = collision.min(closest(
+            std::array::from_fn(|i| p[i] - target[i] - if i == 1 { 0.9 } else { 0. }),
+            v,
+            duration,
+            12.,
+            false,
+        ));
+    }
+    // Larger than the ordinary danger corridor to allow prediction error.
+    // Unknown projectiles and missing/short/releasing input retain old defense.
+    if clearance >= 2. {
+        Some(false)
+    } else if collision < 1.5 {
+        Some(true)
+    } else {
+        None
+    }
 }
 pub fn target_key(p: [f64; 3]) -> [i32; 3] {
     p.map(|v| (v * 10.).round() as i32)
@@ -485,7 +573,7 @@ pub(super) fn evade_with_native(
     let mut incoming_directions = Vec::new();
     let mut blasts = Vec::new();
     for e in o.world["entities"].as_array().into_iter().flatten() {
-        if e["visible"] != true {
+        if !perceived(e) {
             continue;
         }
         let Some(p) = point(&e["position"]) else {
@@ -518,7 +606,9 @@ pub(super) fn evade_with_native(
                     .map(|i| (p[i] + v[i] * t - start[i] - if i == 1 { 0.9 } else { 0. }).powi(2))
                     .sum::<f64>()
                     .sqrt();
-                if (0.0..=12.).contains(&t) && miss < 1.5 {
+                if ongoing_input_arrow_danger(o, e)
+                    .unwrap_or((0.0..=12.).contains(&t) && miss < 1.5)
+                {
                     projectile_danger = true;
                     threats.push((p, true, false));
                     incoming_directions.push(v);
@@ -539,6 +629,16 @@ pub(super) fn evade_with_native(
         .collect();
     let obstacles = boxes(o);
     let blast_escape = !blasts.is_empty();
+    if !burning
+        && !projectile_danger
+        && !blast_escape
+        && let Some(plan) = cover::plan(o, blocked, waypoint_axis)
+    {
+        return match plan {
+            cover::Plan::Move(route) => Some(route),
+            cover::Plan::Hold => None,
+        };
+    }
     // Begin approaching observed refuge before a dive reaches melee range.
     // Only safe, supported floor centres participate; no unseen shelter is invented.
     let seek_refuge = threats.iter().any(|(_, _, aerial)| *aerial)
@@ -650,7 +750,27 @@ pub(super) fn evade_with_native(
         } else {
             0.
         };
+        let turn_cost = if !burning && !blast_escape && threats.iter().all(|(_, ranged, _)| *ranged)
+        {
+            point(&o.player["client_ground_motion"]["velocity_per_tick"])
+                .map(|v| {
+                    let speed = v[0].hypot(v[2]);
+                    let dx = p[0] - start[0];
+                    let dz = p[2] - start[2];
+                    let length = dx.hypot(dz);
+                    if speed > 0.05 && length > 0.2 {
+                        let alignment = ((v[0] * dx + v[2] * dz) / (speed * length)).clamp(-1., 1.);
+                        4. * (speed / 0.28).min(1.) * (1. - alignment)
+                    } else {
+                        0.
+                    }
+                })
+                .unwrap_or(0.)
+        } else {
+            0.
+        };
         distance * 2. + cover + sidestep * 8. + ranged_lateral * 2. + blast_safety * 48.0 + refuge
+            - turn_cost
     };
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
@@ -760,6 +880,7 @@ pub(super) fn evade_with_native(
                         z: p[2],
                     },
                     jump,
+                    cover_path: Vec::new(),
                     reason: if native_jump.is_some() {
                         "native-predicted retreat after stalled local avoidance"
                     } else if blast_escape {
@@ -881,6 +1002,152 @@ mod tests {
         }
     }
     #[test]
+    fn cover_approach_turns_around_known_obstacle_without_blind_or_mixed_threat_routes() {
+        let mut o = world();
+        o.player = json!({"position":[0.06898744264365,1.,-0.289612793940735],"on_ground":true});
+        o.world["entities"] = json!([{"visible":true,"hostile":true,"ranged_attack":true,
+            "position":[11.2047145447027,1.,0.12051863731968064]}]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&b["position"]).unwrap();
+            if p[0] == -2. && (1. ..=3.).contains(&p[1]) && (-2. ..=2.).contains(&p[2]) {
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+                b["block"] = json!("minecraft:stone_bricks");
+            }
+        }
+        let route = evade(&o).expect("Known corner route");
+        assert!(
+            route.target.z < -2.3,
+            "Approach nearer end of the wall: {route:?}"
+        );
+        let goal = route
+            .cover_path
+            .last()
+            .expect("Retained planned cover goal");
+        assert!(covered(
+            [goal.x, goal.y, goal.z],
+            point(&o.world["entities"][0]["position"]).unwrap(),
+            &boxes(&o)
+        ));
+        assert!(
+            !can_pass_waypoint(&o, &route),
+            "Corner approach requires a precise stop"
+        );
+        let mut unknown = o.clone();
+        unknown.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["position"][0].as_i64().unwrap() >= -2);
+        assert!(
+            cover::plan(&unknown, &[], 3.5).is_none(),
+            "Unknown space behind wall is not a cover route"
+        );
+        o.world["entities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"visible":true,"hostile":true,
+            "ranged_attack":false,"position":[2.5,1.,0.5]}));
+        assert!(
+            cover::plan(&o, &[], 3.5).is_none(),
+            "Mixed melee threat retains urgent evasion"
+        );
+    }
+    #[test]
+    fn guarded_retreat_stays_beside_the_wall_and_settles_without_repeated_actions() {
+        let mut o = world();
+        o.player = json!({"position":[-0.5,1.,-1.5],"on_ground":true});
+        o.world["entities"] = json!([{"visible":false,"hostile":true,"ranged_attack":true,
+            "position":[11.5,1.,-2.8],"client_memory":{"kind":"last_visible_ranged_threat"}}]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&b["position"]).unwrap();
+            if p[0] == 0. && (1. ..=3.).contains(&p[1]) && (-2. ..=2.).contains(&p[2]) {
+                b["block"] = json!("minecraft:stone_bricks");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let first = evade(&o).expect("Guard toward far end while archer is hidden");
+        assert!(
+            (first.target.x + 0.5).abs() < 0.01 && first.target.z > 0.5,
+            "{first:?}"
+        );
+        assert!(!first.cover_path.is_empty());
+        assert!(!can_pass_waypoint(&o, &first));
+        o.player["position"] = json!([first.target.x, first.target.y, first.target.z]);
+        for _ in 0..3 {
+            let Some(route) = evade(&o) else {
+                break;
+            };
+            assert!(
+                (route.target.x + 0.5).abs() < 0.01,
+                "Do not drift away from cover: {route:?}"
+            );
+            assert!(covered(
+                [route.target.x, route.target.y, route.target.z],
+                [11.5, 1., -2.8],
+                &boxes(&o)
+            ));
+            o.player["position"] = json!([route.target.x, route.target.y, route.target.z]);
+        }
+        assert!(
+            evade(&o).is_none(),
+            "A good guard position does not submit zero-distance controls repeatedly"
+        );
+    }
+    #[test]
+    fn continuing_owned_strafe_is_not_interrupted_for_a_shot_it_already_clears() {
+        let mut o = world();
+        o.player["position"] = json!([0.5, 1., 0.5]);
+        o.world["entities"] = json!([{"uuid":"shot","visible":true,"projectile":true,"type":"minecraft:arrow",
+            "position":[12.5,1.9,0.5],"velocity":[-1.5,0.,0.]}]);
+        assert!(incoming(&o));
+        o.player["client_motion"] = json!({"kind":"finite_input_extrapolation","velocity_per_tick":[0.,0.,0.3],"target":[0.5,1.,3.5]});
+        assert!(
+            !incoming(&o),
+            "Continue a strafe with at least2m predicted clearance"
+        );
+        o.player["client_motion"]["target"] = json!([0.5, 1., 1.2]);
+        assert!(
+            incoming(&o),
+            "Stopping early must retain danger after the input ends"
+        );
+        o.player["client_motion"]["target"] = json!([0.5, 1., 3.5]);
+        o.world["entities"][0]["velocity"] = json!([-1.5, 0., 0.3]);
+        assert!(
+            incoming(&o),
+            "A shot leading the moving body still needs defense"
+        );
+        o.world["entities"][0]["velocity"] = json!([-1.5, 0., 0.]);
+        o.world["entities"][0]["type"] = json!("some_mod:unknown_projectile");
+        assert!(
+            incoming(&o),
+            "Unknown projectile dynamics keep conservative handling"
+        );
+    }
+    #[test]
+    fn ranged_escape_keeps_observed_momentum_when_both_sides_are_safe() {
+        let mut o = world();
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            b["position"][2] = json!(b["position"][2].as_i64().unwrap() - 2);
+        }
+        let start = [0.4335514763727, 1., -1.6993455708818217];
+        let v = [-0.075306516797016, -0., -0.225919550391046];
+        o.player = json!({"position":start,"on_ground":true,
+            "client_ground_motion":{"velocity_per_tick":v}});
+        o.world["entities"] =
+            json!([{"position":[9.,1.,0.5],"visible":true,"hostile":true,"ranged_attack":true}]);
+        let route = evade(&o).unwrap();
+        let dx = route.target.x - start[0];
+        let dz = route.target.z - start[2];
+        let alignment = (dx * v[0] + dz * v[2]) / (dx.hypot(dz) * v[0].hypot(v[2]));
+        assert!(
+            alignment > 0.7,
+            "Avoid a sharp reversal with equally safe forward support: {route:?}"
+        );
+        assert!(
+            (route.target.x - 9.).hypot(route.target.z - 0.5)
+                > (start[0] - 9.).hypot(start[2] - 0.5)
+        );
+    }
+    #[test]
     fn passage_needs_known_safe_ground_beyond_an_otherwise_valid_waypoint() {
         let mut o = world();
         o.player["on_ground"] = json!(true);
@@ -892,6 +1159,7 @@ mod tests {
             },
             jump: false,
             reason: "fixture".into(),
+            cover_path: Vec::new(),
         };
         assert!(can_pass_waypoint(&o, &route));
         for kind in ["wall", "hole", "fire", "unknown"] {

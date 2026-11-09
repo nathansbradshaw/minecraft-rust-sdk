@@ -2,6 +2,8 @@
 mod aerial;
 pub mod decision;
 pub mod geometry;
+mod motion;
+mod perception;
 mod recovery;
 mod tactics;
 #[cfg(test)]
@@ -470,6 +472,11 @@ async fn controller(
     let mut progress = tactics::Progress::default();
     let mut projectiles = tactics::Projectiles::default();
     let mut retreat_trail = tactics::RetreatTrail::default();
+    let mut threat_memory = perception::RangedMemory::default();
+    let mut own_motion = motion::Motion::default();
+    let mut motion_predictions = 0u64;
+    let mut motion_trace_samples = 0u16;
+    let mut last_motion_assessment = (Vec::new(), Vec::new());
     let mut retreat_progress = recovery::Progress::default();
     let mut native_escape = recovery::Discovery::default();
     let mut last_meal = None;
@@ -527,10 +534,56 @@ async fn controller(
             conditions = changed;
         }
         let active = &observed.player["control"];
+        let mut policy_observed = threat_memory.policy(&observed);
+        let trace_motion = decision_samples > 0
+            && motion_trace_samples < 8
+            && active["action_id"].as_str() == Some(owned_control.as_str())
+            && active["outcome"] == "running";
+        let previous_motion = trace_motion.then(|| own_motion.previous_sample());
+        let prediction = own_motion.sample(&observed, &owned_control);
+        if active["outcome"] != "running"
+            && let Some(ground) = own_motion.ground_motion()
+        {
+            policy_observed.to_mut().player["client_ground_motion"] = ground.clone();
+        }
+        if trace_motion {
+            motion_trace_samples += 1;
+            j.event("body_motion_sample",json!({"owned_control":owned_control,"previous":previous_motion,
+                "player":{"uuid":observed.player["uuid"],"dimension":observed.player["dimension"],"entity_id":observed.player["entity_id"],
+                    "position":p,"on_ground":observed.player["on_ground"],"health":observed.player["health"],
+                    "in_water":observed.player["in_water"],"in_lava":observed.player["in_lava"],"control":active},
+                "game_time":observed.world["game_time"],"sample_clock":observed.world["sample_clock"],"prediction":prediction,
+                "scope":"Bounded actual eligibility inputs for client motion estimate; not a gameplay success claim"}))?;
+        }
+        if let Some(prediction) = prediction {
+            motion_predictions += 1;
+            policy_observed.to_mut().player["client_motion"] = prediction;
+        }
         let stuck = progress.stuck(&observed, &owned_control);
         let stationary_projectiles = projectiles.stationary(&observed);
         let incoming_projectiles =
+            geometry::incoming_with_stationary(&policy_observed, &stationary_projectiles);
+        let stationary_incoming =
             geometry::incoming_with_stationary(&observed, &stationary_projectiles);
+        let cleared: Vec<_> = stationary_incoming
+            .iter()
+            .filter(|id| !incoming_projectiles.contains(id))
+            .cloned()
+            .collect();
+        let leading: Vec<_> = incoming_projectiles
+            .iter()
+            .filter(|id| !stationary_incoming.contains(id))
+            .cloned()
+            .collect();
+        let assessment = (cleared, leading);
+        if assessment != last_motion_assessment {
+            if !assessment.0.is_empty() || !assessment.1.is_empty() {
+                j.event("body_motion_projectile_assessment",json!({"action_id":active["action_id"],"cleared":assessment.0,"leading":assessment.1,
+                    "prediction":policy_observed.player["client_motion"],"sample_clock":observed.world["sample_clock"],
+                    "scope":"Client prediction preserves existing input; native health/movement determine the actual result"}))?;
+            }
+            last_motion_assessment = assessment;
+        }
         let incoming = !incoming_projectiles.is_empty();
         let new_projectile = incoming_projectiles
             .iter()
@@ -541,7 +594,7 @@ async fn controller(
         let burning = observed.player["fire_ticks"]
             .as_i64()
             .is_some_and(|n| n > 0);
-        let threatened = geometry::threatened(&observed);
+        let threatened = geometry::threatened(&policy_observed);
         let trail = retreat_trail.update(&observed, threatened || incoming);
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
         let water_emergency = geometry::water_danger(&observed);
@@ -570,7 +623,7 @@ async fn controller(
         let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
         let escape = if active["outcome"] != "running" && !awaiting_native {
             geometry::evade_with_native(
-                &observed,
+                &policy_observed,
                 &rejected_routes,
                 &stationary_projectiles,
                 &trail,
@@ -743,7 +796,7 @@ async fn controller(
                         };
                         let decision = (decision_samples > 0).then(|| {
                             decision::Snapshot::capture(
-                                &observed,
+                                &policy_observed,
                                 &rejected_routes,
                                 &stationary_projectiles,
                                 &trail,
@@ -791,7 +844,7 @@ async fn controller(
                             rejected_routes.push(key);
                             j.event("body_route_failure",json!({"target":key,"outcome":r.outcome,"error":r.error,"next_action":"try a different observed route; investigate if none works"}))?;
                         }
-                        j.event("body_reaction",json!({"reason":route.reason,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"policy_ms":policy_ms,"dispatch_ms":dispatch_started.elapsed().as_millis(),"observation_ms":observation_ms,"gateway_dispatch_timing":r.evidence["gateway_dispatch_timing"],"adapter_dispatch_timing":r.evidence["adapter_dispatch_timing"],"outcome":r.outcome,"action_id":dispatched_id,"revision":observed.revision,"sample_clock":observed.world["sample_clock"],"recent_retreat_points":trail.len()}))?;
+                        j.event("body_reaction",json!({"reason":route.reason,"planned_cover_path":route.cover_path,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"policy_ms":policy_ms,"dispatch_ms":dispatch_started.elapsed().as_millis(),"observation_ms":observation_ms,"gateway_dispatch_timing":r.evidence["gateway_dispatch_timing"],"adapter_dispatch_timing":r.evidence["adapter_dispatch_timing"],"outcome":r.outcome,"action_id":dispatched_id,"revision":observed.revision,"sample_clock":observed.world["sample_clock"],"recent_retreat_points":trail.len()}))?;
                         // Start displacement before waiting on the optional
                         // sprint modifier's effect verification. This first
                         // trajectory uses its observed walking speed; the next
@@ -881,7 +934,7 @@ async fn controller(
             j.event("body_reconciliation",json!({"action_id":item.receipt.action_id,"outcome":result.as_ref().ok().map(|r|&r.outcome),"error":result.as_ref().err().map(ToString::to_string)}))?;
         }
         if cycles.is_multiple_of(100) {
-            j.event("body_heartbeat",json!({"cycles":cycles,"revision":observed.revision,"observation_ms":observation_ms,"cycle_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;
+            j.event("body_heartbeat",json!({"cycles":cycles,"motion_predictions":motion_predictions,"revision":observed.revision,"observation_ms":observation_ms,"cycle_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;
         }
         let elapsed = started.elapsed();
         if elapsed < Duration::from_millis(cfg.period_ms) {
