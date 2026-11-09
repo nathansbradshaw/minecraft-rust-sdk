@@ -504,6 +504,10 @@ pub(super) fn evade_with_native(
     // Begin approaching observed refuge before a dive reaches melee range.
     // Only safe, supported floor centres participate; no unseen shelter is invented.
     let seek_refuge = threats.iter().any(|(_, _, aerial)| *aerial)
+        // A visible flyer already within contact range can enter from a side.
+        // Do not let a roof reward pin the body in place during that intrusion.
+        && !threats.iter().any(|(enemy, _, aerial)| *aerial &&
+            (0..3).map(|i|(start[i]-enemy[i]).powi(2)).sum::<f64>() < 4.5_f64.powi(2))
         && !blast_escape
         && !projectile_danger
         && !burning;
@@ -814,6 +818,13 @@ mod tests {
         assert!(
             evade(&o).is_none(),
             "do not chase the circling flyer back to a roof edge"
+        );
+        o.world["entities"][0]["position"] = json!([2., 1.5, 0.5]);
+        let urgent = evade(&o).expect("a close visible flyer can enter under the roof");
+        let distance = (urgent.target.x - 2.).hypot(urgent.target.z - 0.5);
+        assert!(
+            distance > 2.,
+            "roof preference must not suppress contact-range escape: {urgent:?}"
         );
     }
     fn pool() -> Observation {

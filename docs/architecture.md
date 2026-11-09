@@ -264,6 +264,9 @@ Observed extra horizontal roof coverage adds an interior preference, capped at
 one block and computed from continuous collision cover. A covered corner and
 roof interior are not equally protective. This remains a client heuristic:
 flyers may enter from the side, and a roof does not establish invulnerability.
+A visible flyer within 4.5 blocks disables the refuge bonus so it cannot pin the
+body in place during contact-range intrusion. Ordinary supported retreat and
+cooldown-ready defense remain available.
 This preference is disabled for incoming projectiles, primed blasts and burning,
 and cannot reward a landing within 4.5 blocks of another visible melee threat.
 A roof is a route preference, not an immunity or survival guarantee. Normal
