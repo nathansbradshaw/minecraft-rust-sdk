@@ -79,6 +79,60 @@ fn gameplay_failure(experiment: &Value) -> Option<Value> {
         "scope":"Client diagnostic evidence, not authoritative effects. Process exit zero does not establish gameplay success. Pending/uncertain mutations must be inspected or reconciled, never replayed."}),
     )
 }
+/// Context compaction may omit diagnostic rows. Recover only the exact saved
+/// experiment, never infer absent outcomes or weaken uncertainty admission.
+fn complete_gameplay_experiment(experiment: &Value) -> Option<Value> {
+    if !matches!(experiment["tool"].as_str(), Some("run" | "terminal")) {
+        return None;
+    }
+    let trace = &experiment["result"]["local_action_feedback"];
+    let retained = trace["requests"].as_array()?.len() as u64;
+    if trace["through_sequence"]
+        .as_u64()?
+        .checked_sub(trace["from_sequence"].as_u64()?)?
+        == retained
+    {
+        return Some(experiment.clone());
+    }
+    let output = &experiment["result"]["output_files"]["stdout"];
+    let path = Path::new(output["path"].as_str()?);
+    if path.parent()?.file_name()?.to_str()? != "terminal-output"
+        || !path.file_name()?.to_str()?.ends_with(".stdout.txt")
+    {
+        return None;
+    }
+    let db_path = path.parent()?.parent()?.join("brain.sqlite");
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(&db_path).ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return None;
+    }
+    let journal = crate::Journal::open_read_only(&db_path).ok()?;
+    let saved: String = journal.db.query_row(
+        "SELECT data FROM events WHERE kind='tool_result' AND json_extract(data,'$.result.output_files.stdout.path')=?1 AND length(data)<=1048576 ORDER BY id DESC LIMIT 1",
+        [path.to_str()?],|row|row.get(0)).ok()?;
+    let saved: Value = serde_json::from_str(&saved).ok()?;
+    if saved["tool"] != experiment["tool"]
+        || saved["goal_revision"] != experiment["goal_revision"]
+        || saved["result"]["output_files"]["stdout"]["sha256"] != output["sha256"]
+    {
+        return None;
+    }
+    let signature = crate::progress::experiment_signature(
+        experiment["source_sha256"].as_str()?,
+        &saved["result"],
+    );
+    if experiment["signature"] != signature {
+        return None;
+    }
+    let mut full = experiment.clone();
+    full["result"] = saved["result"].clone();
+    full["trace_recovered_from_private_journal"] = json!(true);
+    Some(full)
+}
 fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
     let bin = experiment["command"].as_str()?;
     if experiment["tool"] != "terminal"
@@ -199,7 +253,8 @@ impl Transition {
     /// Files are read by the container-local worker, never the inference host.
     pub fn from_context(context: &Value) -> Option<Self> {
         let compiler = &context["compiler_feedback"];
-        let experiment = &context["last_experiment"];
+        let recovered = complete_gameplay_experiment(&context["last_experiment"]);
+        let experiment = recovered.as_ref().unwrap_or(&context["last_experiment"]);
         let latest = &context["last_tool_result"];
         let compiler_failed = compiler["format"] == "compiler-feedback-v1"
             && compiler["success"] == false
@@ -241,8 +296,10 @@ impl Transition {
         } else if automatic {
             if gameplay.is_some() {
                 if latest["tool"] == "run"
-                    && latest["result"]["local_action_feedback"]
-                        != experiment["result"]["local_action_feedback"]
+                    && (latest["result"]["output_files"]["stdout"]["sha256"]
+                        != experiment["result"]["output_files"]["stdout"]["sha256"]
+                        || latest["result"]["output_files"]["stdout"]["path"]
+                            != experiment["result"]["output_files"]["stdout"]["path"])
                 {
                     return None;
                 }
@@ -297,7 +354,11 @@ impl Transition {
             return None;
         }
         Some(Self {
-            gameplay,
+            gameplay: gameplay.map(|mut evidence| {
+                evidence["trace_recovered_from_private_journal"] =
+                    experiment["trace_recovered_from_private_journal"].clone();
+                evidence
+            }),
             path: relative.to_str()?.into(),
             source_sha256: hash,
             failed_workspace_sha256: fingerprint,
@@ -514,6 +575,45 @@ mod tests {
             json!("CARGO_BUILD_JOBS=1 cargo run --offline --bin candidate");
         context["last_tool_result"]["tool"] = json!("terminal");
         assert!(Transition::from_context(&context).is_some());
+    }
+    #[test]
+    fn context_truncation_recovers_exact_goal_source_and_output_bound_journal_trace() {
+        let (dir, mut context) = gameplay_fixture();
+        let mut result = context["last_experiment"]["result"].clone();
+        let row = result["local_action_feedback"]["requests"][0].clone();
+        result["local_action_feedback"]["requests"]
+            .as_array_mut()
+            .unwrap()
+            .push(row);
+        result["local_action_feedback"]["through_sequence"] = json!(2);
+        let journal = crate::Journal::open(&dir.path().join("target/brain.sqlite")).unwrap();
+        journal
+            .event(
+                "tool_result",
+                json!({"tool":"run","goal_revision":"goal","result":result}),
+            )
+            .unwrap();
+        context["last_experiment"]["signature"] = json!(crate::progress::experiment_signature(
+            context["last_experiment"]["source_sha256"]
+                .as_str()
+                .unwrap(),
+            &result
+        ));
+        context["last_experiment"]["result"] = result.clone();
+        context["last_experiment"]["result"]["local_action_feedback"]["requests"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        context["last_tool_result"]["result"] = context["last_experiment"]["result"].clone();
+        let transition = Transition::from_context(&context).unwrap();
+        let mut schema = super::super::schema();
+        transition.prepare(&mut context, &mut schema);
+        assert_eq!(
+            context["coding_transition"]["gameplay_failure"]["trace_recovered_from_private_journal"],
+            true
+        );
+        context["last_experiment"]["signature"] = json!("foreign");
+        assert!(Transition::from_context(&context).is_none());
     }
     fn fixture() -> (tempfile::TempDir, Value) {
         let dir = tempfile::tempdir().unwrap();
