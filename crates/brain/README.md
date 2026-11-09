@@ -109,6 +109,10 @@ create duplicate caches for each command. Model credentials must be a separately
 allocated per-bot key accepted by a compatible HTTPS inference proxy. SDK public
 registration does not grant model access.
 
+An explicit configured goal receives a durable task revision before inference.
+Restarting preserves the active task and revision. With `await_chat_goal: true`,
+configuration does not activate work: the controller waits for a player request.
+
 New player tasks start with Luna; it can escalate to Sol through `develop`.
 The proxy remains authoritative for daily allowances. Its operator usage report
 must include legacy admissions whose model identity is unknown; these are charged
