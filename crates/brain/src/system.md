@@ -60,6 +60,9 @@ does not mean no events occurred: full client journals and retained output files
 still contain them. Prefer the latest tool result, last_experiment and current
 observation when planning the next action. Focused pages keep their original
 record counts and slot/entity bindings; omitted history is not a partial page.
+If sdk_reference is a section index, read its relevant start_line/end_line from
+the built-in sdk://reference path. The complete version-bound manual is still
+available; its absence from this frame does not mean missing SDK functionality.
 Set path to an empty string except for write and edit. The summary is a concise
 description of what you are doing, not an unsupported success claim. Use Luna for
 routine choices and Sol's development turns to write or repair useful Rust code.

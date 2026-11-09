@@ -1486,6 +1486,11 @@ fn fit_context(context: &mut Value) -> Result<()> {
             .len();
         context["last_experiment"]["result"]["stdout"] = json!({"omitted_for_context_budget":true,"original_preview_bytes":original_bytes,"retained_in":"last_experiment.result.output_files.stdout"});
     }
+    if serde_json::to_vec(context)?.len() > 32768 && context["sdk_reference"].is_string() {
+        let bytes = context["sdk_reference"].to_string().len();
+        context["sdk_reference"] = workspace::reference_index();
+        context["context_projection"]["sdk_reference"] = json!({"complete":false,"view":"retrievable_section_index","original_bytes":bytes,"retained_in":"read sdk://reference (built-in, bound to this engine)"});
+    }
     ensure(
         serde_json::to_vec(context)?.len() <= 32768,
         "Context budget exceeded",
@@ -1763,6 +1768,17 @@ mod tests {
             context["last_experiment"]["result"]["stdout"]["omitted_for_context_budget"],
             true
         );
+    }
+    #[test]
+    fn reference_index_keeps_large_current_pages_available_for_reasoning() {
+        let page = json!({"view":"blocks","revision":"live","page":{"returned":2,"next_offset":2,"complete":false},"world":{"blocks":[{"position":[3,64,1]},{"position":[3,65,1]}]}});
+        let mut context = json!({"goal":"investigate placement","sdk_reference":include_str!("sdk.md"),"last_tool_result":{"result":page}});
+        context["deployment_instructions"] = json!("p".repeat(35000 - context.to_string().len()));
+        fit_context(&mut context).unwrap();
+        assert_eq!(context["last_tool_result"]["result"], page);
+        assert_eq!(context["sdk_reference"]["view"], "sdk_reference_index");
+        assert_eq!(context["sdk_reference"]["path"], "sdk://reference");
+        assert!(context.to_string().len() <= 32768);
     }
     #[test]
     fn diagnostic_journal_refuses_creation_and_writes() {

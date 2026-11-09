@@ -7,6 +7,18 @@ use std::{
     path::{Path, PathBuf},
 };
 const BUDGET: usize = 5000;
+const SDK_REFERENCE: &str = "sdk://reference";
+pub(crate) fn reference_index() -> Value {
+    let source = include_str!("sdk.md");
+    let lines: Vec<_> = source.lines().collect();
+    let starts: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(n, line)| line.starts_with("- ").then_some(n))
+        .collect();
+    let sections:Vec<_>=starts.iter().enumerate().map(|(n,start)|json!({"start_line":start+1,"end_line":starts.get(n+1).copied().unwrap_or(lines.len()),"title":lines[*start].chars().take(96).collect::<String>()})).collect();
+    json!({"view":"sdk_reference_index","path":SDK_REFERENCE,"source_sha256":crate::digest(source.as_bytes()),"source_bytes":source.len(),"sections":sections,"note":"Full SDK documentation remains available through read input JSON {path: sdk://reference, start_line: N, end_line: M}. This is a read-only built-in resource. Read the relevant section, then act; it is not necessary to load the entire manual. Existing connected Profile is in MC_SDK_PROFILE; generated programs must not connect/disconnect the harness character. Use unique action IDs and inspect uncertainty without replay."})
+}
 fn target(root: &Path, input: &str) -> Result<(PathBuf, PathBuf)> {
     let root = fs::canonicalize(root)?;
     ensure(
@@ -21,6 +33,12 @@ fn target(root: &Path, input: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((root, path))
 }
 pub fn read(root: &Path, input: &str) -> Result<Value> {
+    if input == SDK_REFERENCE {
+        return read_range(
+            root,
+            &json!({"path":SDK_REFERENCE,"start_line":1,"end_line":200}).to_string(),
+        );
+    }
     if input.trim_start().starts_with('{') {
         return read_range(root, input);
     }
@@ -79,16 +97,20 @@ fn read_range(root: &Path, input: &str) -> Result<Value> {
             && range.end_line - range.start_line < 200,
         "Read 1–200 lines using 1-based inclusive start_line/end_line",
     )?;
-    let (_, path) = target(root, &range.path)?;
-    let file = fs::File::open(&path)?;
-    ensure(
-        file.metadata()?.is_file() && file.metadata()?.len() <= 65536,
-        "Bounded regular source file required",
-    )?;
-    let mut bytes = Vec::new();
-    file.take(65537).read_to_end(&mut bytes)?;
-    ensure(bytes.len() <= 65536, "File grew beyond read limit")?;
-    let source = String::from_utf8(bytes)?;
+    let (path, source) = if range.path == SDK_REFERENCE {
+        (json!(SDK_REFERENCE), include_str!("sdk.md").to_owned())
+    } else {
+        let (_, path) = target(root, &range.path)?;
+        let file = fs::File::open(&path)?;
+        ensure(
+            file.metadata()?.is_file() && file.metadata()?.len() <= 65536,
+            "Bounded regular source file required",
+        )?;
+        let mut bytes = Vec::new();
+        file.take(65537).read_to_end(&mut bytes)?;
+        ensure(bytes.len() <= 65536, "File grew beyond read limit")?;
+        (json!(path), String::from_utf8(bytes)?)
+    };
     let lines: Vec<_> = source.split_inclusive('\n').collect();
     ensure(
         range.start_line <= lines.len(),
@@ -191,6 +213,21 @@ pub fn manifest_hint(root: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_manual_is_retrievable_without_a_checkout_or_host_access() {
+        let index = reference_index();
+        assert!(index.to_string().len() < 4000);
+        for section in index["sections"].as_array().unwrap() {
+            let result=read(Path::new("/does-not-exist"),&json!({"path":SDK_REFERENCE,"start_line":section["start_line"],"end_line":section["end_line"]}).to_string()).unwrap();
+            assert!(
+                result["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(section["title"].as_str().unwrap())
+            );
+            assert_eq!(result["source_sha256"], index["source_sha256"]);
+        }
+    }
     #[test]
     fn ranged_source_reads_reach_omitted_lines_and_bind_pages_to_source_hash() {
         let dir = tempfile::tempdir().unwrap();
