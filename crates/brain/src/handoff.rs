@@ -18,9 +18,26 @@ impl std::fmt::Display for ExhaustedIntention {
 impl std::error::Error for ExhaustedIntention {}
 
 pub(crate) fn basis(observed: &Observation) -> Value {
-    json!({"environment":progress::environment_signature(observed),
+    let mut placement = observed.clone();
+    placement.menu = Value::Null; // UI state IDs do not determine empty-hand placement.
+    json!({"environment":progress::environment_signature(&placement),
+        "pose":{"position":observed.player["position"],"yaw":observed.player["yaw"],"pitch":observed.player["pitch"],"sneaking":observed.player["sneaking"],"using_item":observed.player["using_item"]},
         "actor":observed.player["uuid"].as_str(),"life":observed.player["entity_id"].as_i64(),
         "clock_epoch":observed.world["sample_clock"]["epoch"].as_str()})
+}
+
+fn empty_placement(action: &Action, observed: &Observation) -> bool {
+    matches!(
+        action,
+        Action::Place {
+            hand: minecraft_sdk::Hand::Main,
+            ..
+        }
+    ) && observed.player["inventory"].as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row["slot"] == observed.player["selected"] && row["count"].as_u64() == Some(0)
+        })
+    })
 }
 
 impl Journal {
@@ -39,8 +56,8 @@ impl Journal {
         action: &Action,
         observed: &Observation,
     ) -> Result<()> {
-        if matches!(action, Action::Chat { .. } | Action::Look { .. }) {
-            return Ok(()); // Normal chat limits and uncertainty handling still apply.
+        if !empty_placement(action, observed) {
+            return Ok(()); // Combat, item cooldowns and other controls retain normal retries.
         }
         if let Some(id) = self.get(&self.intention_fence(action, observed)?)? {
             return Err(Box::new(ExhaustedIntention(id)));
@@ -82,6 +99,7 @@ impl Journal {
             return Ok(None);
         }
         if !exists {
+            let mut fenced = false;
             tx.execute("INSERT INTO meta(key,value) VALUES(?1,'used')", [&key])?;
             let failure = self.gameplay_failure_context(revision)?;
             if matches!(
@@ -89,7 +107,7 @@ impl Journal {
                 Some("failed" | "expired" | "rejected")
             ) && failure["basis"] == basis(observed)
                 && let Ok(action) = serde_json::from_value::<Action>(failure["action"].clone())
-                && !matches!(action, Action::Chat { .. } | Action::Look { .. })
+                && empty_placement(&action, observed)
             {
                 let fence = self.intention_fence(&action, observed)?;
                 if let Some(id) = failure["action_id"].as_str() {
@@ -97,10 +115,11 @@ impl Journal {
                         "INSERT OR IGNORE INTO meta(key,value) VALUES(?1,?2)",
                         params![fence, id],
                     )?;
+                    fenced = true;
                 }
             }
-            let context = json!({"goal_revision":revision,"exhausted_subject":subject,
-                "inspection_ceiling":ceiling,"task":"The previous diagnosis is exhausted. Its unchanged failed SDK intention is fenced locally. Choose a different useful action, changed executable experiment, code repair, or goal. Do not spend this window repeating the same diagnosis. Provider/run budgets are unchanged; inspection-only loops remain bounded.",
+            let context = json!({"goal_revision":revision,"exhausted_subject":subject,"failed_intention_fenced":fenced,
+                "inspection_ceiling":ceiling,"task":"The previous diagnosis is exhausted. A matching observed empty-hand placement failure can be fenced locally; other controls retain normal retry semantics. Choose different useful work, a changed executable experiment, code repair, or goal. Do not repeat the same diagnosis. Provider/run budgets are unchanged; inspection-only loops remain bounded.",
                 "authority":"Client scheduling feedback, not native effect proof or gameplay permission"});
             for (key, value) in [
                 ("inspection_streak", "0".to_owned()),
@@ -157,7 +176,7 @@ mod tests {
         j.set("sol_daily_reset", "200").unwrap();
         let mut o = Observation {
             revision: "sample".into(),
-            player: json!({"uuid":"own","entity_id":3,"position":[0.5,1.,0.5],"selected":0}),
+            player: json!({"uuid":"own","entity_id":3,"position":[0.5,1.,0.5],"selected":0,"inventory":[{"slot":0,"item":"minecraft:air","count":0}]}),
             world: json!({"game_time":1,"sample_clock":{"epoch":"clock","nanos":"1"}}),
             menu: json!({}),
         };
@@ -207,6 +226,17 @@ mod tests {
         o.world["game_time"] = json!(1000);
         o.world["sample_clock"]["nanos"] = json!("1000");
         assert!(j.check_exhausted_intention(&a, &o).is_err());
+        o.menu = json!({"state_id":999});
+        assert!(
+            j.check_exhausted_intention(&a, &o).is_err(),
+            "UI revision alone cannot make empty-hand placement valid"
+        );
+        o.player["yaw"] = json!(90.);
+        assert!(
+            j.check_exhausted_intention(&a, &o).is_ok(),
+            "changed orientation is a real interaction precondition"
+        );
+        o.player.as_object_mut().unwrap().remove("yaw");
         let mut distinct = serde_json::to_value(&a).unwrap();
         distinct["hit"] = json!([0.5, 0.25, 0.5]);
         assert!(
@@ -248,7 +278,7 @@ mod tests {
             .to_string();
         let mut o = Observation {
             revision: "sample".into(),
-            player: json!({"uuid":"own","entity_id":3,"position":[0.5,1.,0.5],"selected":0}),
+            player: json!({"uuid":"own","entity_id":3,"position":[0.5,1.,0.5],"selected":0,"inventory":[{"slot":0,"item":"minecraft:air","count":0}]}),
             world: json!({}),
             menu: json!({}),
         };
@@ -280,5 +310,37 @@ mod tests {
             )
             .is_ok()
         );
+    }
+    #[test]
+    fn ordinary_combat_retry_is_not_fenced_by_an_exhausted_diagnosis() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(&dir.path().join("brain.sqlite")).unwrap();
+        let revision = j
+            .select_goal("defend", "fixture", json!({}), None)
+            .unwrap()
+            .to_string();
+        let mut o = Observation {
+            revision: "sample".into(),
+            player: json!({"uuid":"own","entity_id":3,"selected":0,"attack_cooldown":0.,"inventory":[{"slot":0,"count":0,"item":"minecraft:air"}]}),
+            world: json!({}),
+            menu: json!({}),
+        };
+        let a = Action::Attack { entity: 9 };
+        let receipt = minecraft_sdk::Receipt {
+            action_id: "failed-attack".into(),
+            outcome: minecraft_sdk::Outcome::Expired,
+            adapter_version: "fixture".into(),
+            evidence: json!({}),
+            error: None,
+        };
+        j.note_gameplay_failure(&a, &receipt, &o).unwrap();
+        j.alternative_window("subject", &revision, "defend", &o, 8, 8)
+            .unwrap();
+        assert_eq!(
+            j.alternative_context(&revision).unwrap()["failed_intention_fenced"],
+            false
+        );
+        o.player["attack_cooldown"] = json!(1.);
+        assert!(j.check_exhausted_intention(&a, &o).is_ok());
     }
 }

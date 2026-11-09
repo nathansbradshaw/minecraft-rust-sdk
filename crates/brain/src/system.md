@@ -218,8 +218,9 @@ changed code, meaningful game facts or a new task can reopen it. Body and chat
 remain active throughout.
 exhausted_boundary marks a consumed diagnosis, not a ban on useful alternatives.
 One persistent, bounded routine window lets you choose different work, repair
-code or select a useful goal. Exact failed SDK intentions with unchanged relevant
-facts are fenced locally before dispatch; a new request ID cannot repair them.
+code or select a useful goal. An exact observed empty-hand placement failure with
+unchanged relevant facts can be fenced locally before dispatch. Combat, item
+cooldowns and other controls retain their ordinary retry paths.
 This does not refill their diagnosis or provider allowance. Another inspection-
 only loop exhausts the normal inspection ceiling; restarts do not renew it.
 New accepted block-search coverage, including a complete search finding no
