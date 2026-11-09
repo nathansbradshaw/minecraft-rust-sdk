@@ -11,6 +11,7 @@ mod diagnostics;
 mod discovery;
 pub mod feedback;
 mod gameplay_failure;
+mod handoff;
 pub mod memory;
 pub mod model;
 pub mod navigation;
@@ -798,6 +799,8 @@ impl Brain {
             previous.is_empty() || independent || cancelling,
             "Inspect/reconcile the recorded pending action before submitting another mutation",
         )?;
+        self.journal
+            .check_exhausted_intention(&action, &self.observed)?;
         let sequence = self.journal.event(
             "action_intent",
             json!({"action":action,"before":projection(&self.observed)}),
@@ -952,6 +955,19 @@ impl Brain {
                         }
                         progress::Investigation::Continue => investigation_left = remaining,
                         progress::Investigation::Exhausted => {
+                            if let Some(fresh) = self.journal.alternative_window(
+                                &subject,
+                                &revision,
+                                &self.goal,
+                                &self.observed,
+                                inspected,
+                                self.cfg.max_inspections_without_execution,
+                            )? {
+                                if fresh {
+                                    inspected = 0;
+                                }
+                                break;
+                            }
                             self.journal.event("investigation_exhausted",json!({"subject":subject,"goal":self.goal,"last_experiment":self.journal.get("last_experiment")?,"next_action":"Concrete defect: inspect the recorded diagnosis and missing boundary. No unchanged model polling; changed source, meaningful native facts or another task can reopen this subject.","body_and_chat":"remain active"}))?;
                             while self.journal.get("goal_revision")?.unwrap_or_default() == revision
                                 && progress::workspace_fingerprint_excluding_state(
@@ -1022,6 +1038,9 @@ impl Brain {
             context["gameplay_failure"] = self.journal.gameplay_failure_context(
                 &self.journal.get("goal_revision")?.unwrap_or_default(),
             )?;
+            context["exhausted_boundary"] = self
+                .journal
+                .alternative_context(&self.journal.get("goal_revision")?.unwrap_or_default())?;
             context["decision_session"] = json!({
                 "role":if develop {"sol"} else {"luna"},
                 "requested_model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},
@@ -1229,14 +1248,15 @@ impl Brain {
                         .event("tool_result", json!({"tool":choice.tool,"goal_revision":requested_revision,"result":value}))?;
                 }
                 Err(e) => {
-                    if !goal_changed {
+                    let fenced = e.downcast_ref::<handoff::ExhaustedIntention>().is_some();
+                    if !goal_changed && !fenced {
                         self.journal.set("needs_investigation", "true")?;
                     }
                     self.journal.event(
                         "tool_result",
                         json!({"tool":choice.tool,"goal_revision":requested_revision,"error":e.to_string()}),
                     )?;
-                    if !develop {
+                    if !develop && !fenced {
                         self.journal.request_development()?;
                     }
                 }

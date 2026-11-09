@@ -91,6 +91,7 @@ impl Journal {
         let error = receipt.error.as_ref().map(|e| json!({"code":e.code,
             "message":e.message.chars().take(512).collect::<String>(),"message_complete":e.message.chars().count()<=512}));
         let witness = json!({"goal_revision":revision,"action":request,
+            "basis":crate::handoff::basis(before),
             "action_id":receipt.action_id,"outcome":receipt.outcome,
             "error":error,"selected_before":before.player["selected"].as_i64(),
             "placement_context":placement_context(action,receipt),

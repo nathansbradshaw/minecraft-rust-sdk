@@ -216,6 +216,12 @@ equivalent source/output inspections. Explain the exact missing trusted interfac
 if client code cannot solve it. Exhausted unchanged diagnosis does not poll;
 changed code, meaningful game facts or a new task can reopen it. Body and chat
 remain active throughout.
+exhausted_boundary marks a consumed diagnosis, not a ban on useful alternatives.
+One persistent, bounded routine window lets you choose different work, repair
+code or select a useful goal. Exact failed SDK intentions with unchanged relevant
+facts are fenced locally before dispatch; a new request ID cannot repair them.
+This does not refill their diagnosis or provider allowance. Another inspection-
+only loop exhausts the normal inspection ceiling; restarts do not renew it.
 New accepted block-search coverage, including a complete search finding no
 matches, can change the diagnosis. Repeating known searches, pacing responses,
 timestamps and arbitrary input fields do not renew its budget. Search discoveries
