@@ -33,6 +33,55 @@ fn writable(root: &Path, input: &str) -> Result<PathBuf> {
     )?;
     Ok(path)
 }
+fn edit(root: &Path, path: &str, input: &str) -> Result<Value> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Edit {
+        old: String,
+        new: String,
+        expected_sha256: Option<String>,
+    }
+    ensure(
+        !path.is_empty() && input.len() <= 10000,
+        "Bounded exact edit and workspace path required",
+    )?;
+    let change: Edit = serde_json::from_str(input)?;
+    ensure(
+        !change.old.is_empty() && change.old != change.new,
+        "Edit needs a nonempty old fragment and a changed replacement",
+    )?;
+    let file = writable(root, path)?;
+    ensure(
+        fs::metadata(&file)?.is_file() && fs::metadata(&file)?.len() <= 65536,
+        "Edit an existing regular source file up to65536 bytes",
+    )?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    fs::File::open(&file)?.take(65537).read_to_end(&mut bytes)?;
+    ensure(bytes.len() <= 65536, "Source grew beyond edit limit")?;
+    let before = crate::digest(&bytes);
+    ensure(
+        change
+            .expected_sha256
+            .as_ref()
+            .is_none_or(|hash| hash == &before),
+        "Source hash changed; inspect the current range before editing",
+    )?;
+    let source = String::from_utf8(bytes)?;
+    let first = source
+        .find(&change.old)
+        .ok_or("Old edit fragment was not found; source unchanged")?;
+    ensure(
+        source.rfind(&change.old) == Some(first),
+        "Old fragment is ambiguous; include enough surrounding source to match exactly once",
+    )?;
+    let after = source.replacen(&change.old, &change.new, 1);
+    ensure(after.len() <= 65536, "Edited source exceeds65536 bytes")?;
+    fs::write(file, &after)?;
+    Ok(
+        json!({"path":path,"before":before,"sha256":crate::digest(after.as_bytes()),"bytes":after.len(),"replacements":1,"next_action":"Compile/run the changed version; an edit alone is not a successful program or gameplay outcome"}),
+    )
+}
 async fn bounded_output(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut total = 0usize;
@@ -258,6 +307,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
         "status" => Ok(serde_json::to_value(brain.inspect(&choice.input).await?)?),
         "reconcile" => brain.settle(&choice.input).await,
         "read" => crate::workspace::read(&brain.cfg.workspace, &choice.input),
+        "edit" => edit(&brain.cfg.workspace, &choice.path, &choice.input),
         "write" => {
             ensure(
                 choice.input.len() <= 32768 && !choice.path.is_empty(),
@@ -351,6 +401,44 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_edits_preserve_source_on_stale_ambiguous_and_escaping_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        let original = "fn main() { let λ = 1; }\n";
+        fs::write(&path, original).unwrap();
+        let change=json!({"old":"λ = 1","new":"λ = 2","expected_sha256":crate::digest(original.as_bytes())}).to_string();
+        let result = edit(dir.path(), "main.rs", &change).unwrap();
+        assert_eq!(result["replacements"], 1);
+        let current = fs::read(&path).unwrap();
+        assert!(
+            String::from_utf8(current.clone())
+                .unwrap()
+                .contains("λ = 2")
+        );
+        assert!(edit(dir.path(), "main.rs", &change).is_err());
+        assert!(edit(dir.path(), "../escape.rs", &change).is_err());
+        assert_eq!(fs::read(&path).unwrap(), current);
+        fs::write(&path, "aaaa").unwrap();
+        for change in [
+            json!({"old":"aa","new":"x"}),
+            json!({"old":"missing","new":"x"}),
+            json!({"old":"","new":"x"}),
+            json!({"old":"a","new":"a"}),
+        ] {
+            assert!(edit(dir.path(), "main.rs", &change.to_string()).is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"aaaa");
+        }
+        std::os::unix::fs::symlink("main.rs", dir.path().join("link.rs")).unwrap();
+        assert!(
+            edit(
+                dir.path(),
+                "link.rs",
+                &json!({"old":"aaaa","new":"x"}).to_string()
+            )
+            .is_err()
+        );
+    }
     #[tokio::test]
     async fn incomplete_reports_and_legacy_completion_cannot_finish_a_goal() {
         let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");

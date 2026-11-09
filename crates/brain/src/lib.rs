@@ -394,7 +394,7 @@ impl Journal {
         Ok(json!(out))
     }
     fn activity(&self, choice: &model::Choice, result: &Value) -> Result<()> {
-        if !["sdk", "write", "terminal", "run", "navigate"].contains(&choice.tool.as_str())
+        if !["sdk", "write", "edit", "terminal", "run", "navigate"].contains(&choice.tool.as_str())
             || tool_failed(result)
         {
             return Ok(());
@@ -408,7 +408,7 @@ impl Journal {
             excerpt = json!({"action_id":result["receipt"]["action_id"],"outcome":result["receipt"]["outcome"],"player":result["after"]["player"]});
         }
         bound_value(&mut excerpt, 1024);
-        records.push(json!({"tool":choice.tool,"input":if choice.tool=="write" { String::from("source edit; path/hash in result") } else {choice.input.clone()},"result":excerpt}));
+        records.push(json!({"tool":choice.tool,"input":if ["write","edit"].contains(&choice.tool.as_str()) { String::from("source edit; path/hash in result") } else {choice.input.clone()},"result":excerpt}));
         if records.len() > 12 {
             records.drain(..records.len() - 12);
         }
@@ -1160,6 +1160,7 @@ impl Brain {
             if !active_work
                 && (choice.tool == "develop"
                     || choice.tool == "write"
+                    || choice.tool == "edit"
                     || (choice.tool == "terminal" && choice.experiment))
             {
                 self.journal.request_development()?;
@@ -1473,6 +1474,23 @@ fn fit_context(context: &mut Value) -> Result<()> {
         projection.insert(field.into(), json!({"complete":false,"view":"elided_redundant_history","original_bytes":bytes,"original_records":records}));
         context["context_projection"] = json!(projection);
     }
+    if serde_json::to_vec(context)?.len() > 32768
+        && context["last_experiment"]["result"]["output_files"]["stdout"]["path"].is_string()
+        && context["last_experiment"]["result"]["stdout"].is_string()
+    {
+        // A complete focused page must retain its record and cursor bindings.
+        // Historical stdout is retrievable and lower priority than that page,
+        // stderr, typed outcomes, source hashes and durable action IDs.
+        let original_bytes = context["last_experiment"]["result"]["stdout"]
+            .to_string()
+            .len();
+        context["last_experiment"]["result"]["stdout"] = json!({"omitted_for_context_budget":true,"original_preview_bytes":original_bytes,"retained_in":"last_experiment.result.output_files.stdout"});
+    }
+    if serde_json::to_vec(context)?.len() > 32768 && context["sdk_reference"].is_string() {
+        let bytes = context["sdk_reference"].to_string().len();
+        context["sdk_reference"] = workspace::reference_index();
+        context["context_projection"]["sdk_reference"] = json!({"complete":false,"view":"retrievable_section_index","original_bytes":bytes,"retained_in":"read sdk://reference (built-in, bound to this engine)"});
+    }
     ensure(
         serde_json::to_vec(context)?.len() <= 32768,
         "Context budget exceeded",
@@ -1727,6 +1745,40 @@ mod tests {
             false
         );
         assert_eq!(context["goal"], "craft a tool");
+    }
+    #[test]
+    fn focused_page_outlives_retrievable_historical_stdout_under_pressure() {
+        let page = json!({"view":"blocks","revision":"current","page":{"returned":3,"complete":false,"next_offset":3},"world":{"blocks":[{"position":[1,2,3]},{"position":[1,2,4]},{"position":[1,2,5]}]}});
+        let trace = json!({"requests":[{"request":{"action_id":"durable-placement"},"response":{"outcome":"expired"}}]});
+        let mut context = json!({"goal":"repair program","sdk_reference":include_str!("sdk.md"),"last_tool_result":{"result":page},"last_experiment":{"source_sha256":"failed-source","result":{"stdout":"x".repeat(1140),"stderr":"expired placement, no effect observed","output_files":{"stdout":{"path":"saved/full-stdout.txt","sha256":"retained-hash"}},"local_action_feedback":trace}}});
+        context["deployment_instructions"] = json!("p".repeat(33100 - context.to_string().len()));
+        fit_context(&mut context).unwrap();
+        assert!(context.to_string().len() <= 32768);
+        assert_eq!(context["last_tool_result"]["result"], page);
+        assert_eq!(context["last_experiment"]["source_sha256"], "failed-source");
+        assert_eq!(
+            context["last_experiment"]["result"]["stderr"],
+            "expired placement, no effect observed"
+        );
+        assert_eq!(
+            context["last_experiment"]["result"]["local_action_feedback"],
+            trace
+        );
+        assert_eq!(
+            context["last_experiment"]["result"]["stdout"]["omitted_for_context_budget"],
+            true
+        );
+    }
+    #[test]
+    fn reference_index_keeps_large_current_pages_available_for_reasoning() {
+        let page = json!({"view":"blocks","revision":"live","page":{"returned":2,"next_offset":2,"complete":false},"world":{"blocks":[{"position":[3,64,1]},{"position":[3,65,1]}]}});
+        let mut context = json!({"goal":"investigate placement","sdk_reference":include_str!("sdk.md"),"last_tool_result":{"result":page}});
+        context["deployment_instructions"] = json!("p".repeat(35000 - context.to_string().len()));
+        fit_context(&mut context).unwrap();
+        assert_eq!(context["last_tool_result"]["result"], page);
+        assert_eq!(context["sdk_reference"]["view"], "sdk_reference_index");
+        assert_eq!(context["sdk_reference"]["path"], "sdk://reference");
+        assert!(context.to_string().len() <= 32768);
     }
     #[test]
     fn diagnostic_journal_refuses_creation_and_writes() {
