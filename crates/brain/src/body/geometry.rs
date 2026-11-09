@@ -750,7 +750,27 @@ pub(super) fn evade_with_native(
         } else {
             0.
         };
+        let turn_cost = if !burning && !blast_escape && threats.iter().all(|(_, ranged, _)| *ranged)
+        {
+            point(&o.player["client_ground_motion"]["velocity_per_tick"])
+                .map(|v| {
+                    let speed = v[0].hypot(v[2]);
+                    let dx = p[0] - start[0];
+                    let dz = p[2] - start[2];
+                    let length = dx.hypot(dz);
+                    if speed > 0.05 && length > 0.2 {
+                        let alignment = ((v[0] * dx + v[2] * dz) / (speed * length)).clamp(-1., 1.);
+                        4. * (speed / 0.28).min(1.) * (1. - alignment)
+                    } else {
+                        0.
+                    }
+                })
+                .unwrap_or(0.)
+        } else {
+            0.
+        };
         distance * 2. + cover + sidestep * 8. + ranged_lateral * 2. + blast_safety * 48.0 + refuge
+            - turn_cost
     };
     let current = score(start) - if burning { 10. } else { 0. };
     let mut best = None;
@@ -1100,6 +1120,31 @@ mod tests {
         assert!(
             incoming(&o),
             "Unknown projectile dynamics keep conservative handling"
+        );
+    }
+    #[test]
+    fn ranged_escape_keeps_observed_momentum_when_both_sides_are_safe() {
+        let mut o = world();
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            b["position"][2] = json!(b["position"][2].as_i64().unwrap() - 2);
+        }
+        let start = [0.4335514763727, 1., -1.6993455708818217];
+        let v = [-0.075306516797016, -0., -0.225919550391046];
+        o.player = json!({"position":start,"on_ground":true,
+            "client_ground_motion":{"velocity_per_tick":v}});
+        o.world["entities"] =
+            json!([{"position":[9.,1.,0.5],"visible":true,"hostile":true,"ranged_attack":true}]);
+        let route = evade(&o).unwrap();
+        let dx = route.target.x - start[0];
+        let dz = route.target.z - start[2];
+        let alignment = (dx * v[0] + dz * v[2]) / (dx.hypot(dz) * v[0].hypot(v[2]));
+        assert!(
+            alignment > 0.7,
+            "Avoid a sharp reversal with equally safe forward support: {route:?}"
+        );
+        assert!(
+            (route.target.x - 9.).hypot(route.target.z - 0.5)
+                > (start[0] - 9.).hypot(start[2] - 0.5)
         );
     }
     #[test]

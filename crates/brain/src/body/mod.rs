@@ -541,6 +541,11 @@ async fn controller(
             && active["outcome"] == "running";
         let previous_motion = trace_motion.then(|| own_motion.previous_sample());
         let prediction = own_motion.sample(&observed, &owned_control);
+        if active["outcome"] != "running"
+            && let Some(ground) = own_motion.ground_motion()
+        {
+            policy_observed.to_mut().player["client_ground_motion"] = ground.clone();
+        }
         if trace_motion {
             motion_trace_samples += 1;
             j.event("body_motion_sample",json!({"owned_control":owned_control,"previous":previous_motion,

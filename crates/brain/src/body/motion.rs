@@ -5,12 +5,17 @@ use serde_json::{Value, json};
 #[derive(Default)]
 pub(super) struct Motion {
     previous: Option<(String, i64, [f64; 3])>,
+    ground: Option<Value>,
 }
 impl Motion {
     pub fn previous_sample(&self) -> Option<(String, i64, [f64; 3])> {
         self.previous.clone()
     }
+    pub fn ground_motion(&self) -> Option<&Value> {
+        self.ground.as_ref()
+    }
     pub fn sample(&mut self, o: &Observation, owned: &str) -> Option<Value> {
+        self.ground = None;
         let p = point(&o.player["position"])?;
         let tick = o.world["game_time"].as_i64()?;
         let scope = format!(
@@ -32,6 +37,15 @@ impl Motion {
         {
             return None;
         }
+        let v: [f64; 3] = std::array::from_fn(|i| (p[i] - old[i]) / dt as f64);
+        let speed = v[0].hypot(v[2]);
+        if !(0.05..=0.9).contains(&speed) || v[1].abs() > 0.02 {
+            return None;
+        }
+        self.ground = Some(
+            json!({"velocity_per_tick":v,"sample_ticks":[old_tick,tick],"sample_positions":[old,p],
+            "scope":"Client estimate from consecutive native grounded feet poses; not native impulse velocity"}),
+        );
         let active = &o.player["control"];
         if owned.is_empty()
             || active["action_id"].as_str() != Some(owned)
@@ -42,8 +56,6 @@ impl Motion {
         {
             return None;
         }
-        let v: [f64; 3] = std::array::from_fn(|i| (p[i] - old[i]) / dt as f64);
-        let speed = v[0].hypot(v[2]);
         let target = point(&active["target"])?;
         let length = (target[0] - p[0]).hypot(target[2] - p[2]);
         let alignment = (v[0] * (target[0] - p[0]) + v[2] * (target[2] - p[2])) / (speed * length);
@@ -105,5 +117,23 @@ mod tests {
                 assert!(result.is_none(), "{mode}");
             }
         }
+    }
+    #[test]
+    fn grounded_heading_survives_input_completion_but_not_unknown_airborne_motion() {
+        let mut tracker = Motion::default();
+        tracker.sample(&scene(10, 0.5), "");
+        assert!(tracker.sample(&scene(13, 1.1), "").is_none());
+        assert!(
+            (tracker.ground_motion().unwrap()["velocity_per_tick"][0]
+                .as_f64()
+                .unwrap()
+                - 0.2)
+                .abs()
+                < 1e-9
+        );
+        let mut airborne = scene(16, 1.7);
+        airborne.player["on_ground"] = json!(false);
+        tracker.sample(&airborne, "");
+        assert!(tracker.ground_motion().is_none());
     }
 }

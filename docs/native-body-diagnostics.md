@@ -83,3 +83,10 @@ samples and unknown projectiles retain conservative handling. Prediction
 differences are recorded as `body_motion_projectile_assessment`, with sample
 poses/ticks and the active action ID. They are hypotheses, not native immunity
 or a guarantee of future movement.
+
+Ranged escape scoring also considers recent grounded displacement when choosing
+between otherwise safe waypoints. This avoids discarding speed on repeated
+sharp turns. Fresh collision/support, cover approach and urgent hazard policies
+retain priority; observed movement is a preference, not permission to enter
+unknown terrain. Decision snapshots retain this client-derived motion separately
+from the server's impulse velocity.
