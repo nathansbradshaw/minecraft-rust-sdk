@@ -10,7 +10,7 @@ pub struct Trace {
     records: VecDeque<Value>,
 }
 pub fn receipt_summary(r: &Receipt) -> Value {
-    json!({"action_id":r.action_id,"outcome":r.outcome,"native_effect_verified":r.evidence["native_effect_verified"],"error":r.error})
+    json!({"action_id":r.action_id,"outcome":r.outcome,"native_effect_verified":r.evidence["native_effect_verified"],"error":r.error,"gateway_delivery":r.evidence["gateway_delivery"]})
 }
 pub fn compiler_diagnostics(stdout: &[u8]) -> Value {
     let mut errors = Vec::new();
@@ -179,6 +179,7 @@ fn action_feedback(request: &ActionRequest, receipt: &Value) -> crate::Result<Va
     };
     let mut feedback = json!({"format":"sdk-action-feedback-v1","action_id":request.action_id,"action":bounded,
         "outcome":receipt["outcome"],"native_effect_verified":receipt["evidence"]["native_effect_verified"],
+        "gateway_delivery":receipt["evidence"]["gateway_delivery"],
         "scope":"Exact local intention bound to this receipt ID. Receipt-local facts are historical; dispatch or mining start is not item acquisition. No mutation replayed."});
     if let minecraft_sdk::Action::Dig { block, .. } = &request.action {
         let target = json!([block.x, block.y, block.z]);
@@ -272,6 +273,37 @@ pub fn inventory_delta(previous: &Value, current: &Value) -> Value {
 mod tests {
     use super::*;
     use minecraft_sdk::{Action, ApiError, ErrorCode};
+    #[test]
+    fn trace_retains_reused_receipt_delivery_without_claiming_a_new_effect() {
+        let request = ActionRequest {
+            action_id: "original-own-id".into(),
+            action: Action::Look { yaw: 1., pitch: 2. },
+        };
+        let receipt = Receipt {
+            action_id: request.action_id.clone(),
+            outcome: minecraft_sdk::Outcome::Observed,
+            adapter_version: "pinned".into(),
+            evidence: json!({"native_effect_verified":true,
+                "gateway_delivery":{"action_id_already_recorded":true,"new_intention_dispatched":false}}),
+            error: None,
+        };
+        let mut trace = Trace::default();
+        trace.record(&request, &LocalActionResponse::Receipt(receipt.clone()));
+        let rows = trace.since(0);
+        assert_eq!(
+            rows["requests"][0]["response"]["native_effect_verified"],
+            true
+        );
+        assert_eq!(
+            rows["requests"][0]["response"]["gateway_delivery"]["new_intention_dispatched"],
+            false
+        );
+        let feedback = action_feedback(&request, &serde_json::to_value(receipt).unwrap()).unwrap();
+        assert_eq!(
+            feedback["gateway_delivery"]["action_id_already_recorded"],
+            true
+        );
+    }
     #[test]
     fn legacy_receipt_keeps_its_exact_intention_and_air_target_after_history_elision() {
         let t = tempfile::tempdir().unwrap();

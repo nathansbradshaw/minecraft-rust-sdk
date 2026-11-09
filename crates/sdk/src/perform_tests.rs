@@ -4,6 +4,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn peer(
     responses: Vec<(Outcome, &'static str)>,
 ) -> (Client, tokio::task::JoinHandle<Vec<String>>) {
+    peer_with_delivery(responses, false).await
+}
+async fn peer_with_delivery(
+    responses: Vec<(Outcome, &'static str)>,
+    reused: bool,
+) -> (Client, tokio::task::JoinHandle<Vec<String>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut client = Client::new(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     client.credential = Some(Credential {
@@ -38,11 +44,16 @@ async fn peer(
                 let request: ActionRequest = serde_json::from_slice(&body).unwrap();
                 assert_eq!(request.action_id, "stable-action");
             }
+            let mut evidence =
+                serde_json::json!({"native_effect_verified":outcome==Outcome::Observed});
+            if reused && methods.len() == 1 {
+                evidence["gateway_delivery"] = serde_json::json!({"action_id_already_recorded":true,"new_intention_dispatched":false});
+            }
             let body = serde_json::to_vec(&Receipt {
                 action_id: id.into(),
                 outcome,
                 adapter_version: "fixture".into(),
-                evidence: serde_json::json!({}),
+                evidence,
                 error: None,
             })
             .unwrap();
@@ -61,6 +72,36 @@ fn action() -> ActionRequest {
             max_ticks: 80,
         },
     }
+}
+
+#[tokio::test]
+async fn reused_running_delivery_survives_status_reads_without_new_dispatch() {
+    let (client, task) = peer_with_delivery(
+        vec![
+            (Outcome::Running, "stable-action"),
+            (Outcome::Observed, "stable-action"),
+        ],
+        true,
+    )
+    .await;
+    let receipt = client
+        .perform(&action(), Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcome, Outcome::Observed);
+    assert_eq!(receipt.evidence["native_effect_verified"], true);
+    assert_eq!(
+        receipt.evidence["gateway_delivery"]["action_id_already_recorded"],
+        true
+    );
+    assert_eq!(
+        receipt.evidence["gateway_delivery"]["new_intention_dispatched"],
+        false
+    );
+    let methods = task.await.unwrap();
+    assert_eq!(methods.len(), 2);
+    assert!(methods[0].starts_with("POST "));
+    assert!(methods[1].starts_with("GET ") && methods[1].contains("/actions/stable-action "));
 }
 
 #[tokio::test]

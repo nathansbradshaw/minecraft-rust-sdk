@@ -331,6 +331,7 @@ impl Client {
         mut receipt: Receipt,
         until: tokio::time::Instant,
     ) -> Result<Receipt> {
+        let delivery = receipt.evidence.get("gateway_delivery").cloned();
         if receipt.action_id != id {
             return Err(ApiError::new(
                 ErrorCode::Conflict,
@@ -349,6 +350,12 @@ impl Client {
                     ErrorCode::Conflict,
                     "Action status identity changed",
                 ));
+            }
+            if let Some(delivery) = &delivery {
+                if !receipt.evidence.is_object() {
+                    receipt.evidence = serde_json::json!({"original_evidence":receipt.evidence});
+                }
+                receipt.evidence["gateway_delivery"] = delivery.clone();
             }
         }
         Ok(receipt)
