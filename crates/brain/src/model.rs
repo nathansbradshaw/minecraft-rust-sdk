@@ -290,7 +290,7 @@ impl Model {
             .ok_or("Model content missing")?;
         Ok((
             content.to_owned(),
-            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":crate::digest(context.as_bytes()),"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
+            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium"|"high")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":crate::digest(context.as_bytes()),"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
         ))
     }
     async fn request_transport(&self, body: &Value) -> Result<(Value, usize, u8)> {
@@ -541,7 +541,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
         let upstream = tokio::spawn(async move {
-            for (purpose, effort) in [("plan", "low"), ("develop", "medium")] {
+            for (purpose, effort) in [("plan", "low"), ("develop", "medium"), ("develop", "high")] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut header = Vec::new();
                 while !header.ends_with(b"\r\n\r\n") {
@@ -590,8 +590,11 @@ mod tests {
             http: reqwest::Client::new(),
             endpoint,
         };
-        for (development, purpose, effort) in [(false, "plan", "low"), (true, "develop", "medium")]
-        {
+        for (development, purpose, effort) in [
+            (false, "plan", "low"),
+            (true, "develop", "medium"),
+            (true, "develop", "high"),
+        ] {
             let (_, usage) = model
                 .choose_for(&json!({"goal":"same context"}), false, development)
                 .await
