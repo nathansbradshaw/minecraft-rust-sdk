@@ -442,13 +442,93 @@ pub(super) fn incoming_with_stationary(o: &Observation, stationary: &[String]) -
                 .map(|i| (p[i] + v[i] * t - start[i] - if i == 1 { 0.9 } else { 0. }).powi(2))
                 .sum::<f64>()
                 .sqrt();
-            (0.0..=12.).contains(&t) && miss < 1.5
+            ongoing_input_arrow_danger(o, e).unwrap_or((0.0..=12.).contains(&t) && miss < 1.5)
         })
         .map(|e| projectile_key(e).unwrap_or_else(|| "unidentified-projectile".into()))
         .collect();
     ids.sort();
     ids.dedup();
     ids
+}
+fn ongoing_input_arrow_danger(o: &Observation, arrow: &Value) -> Option<bool> {
+    if !matches!(
+        arrow["type"].as_str(),
+        Some("minecraft:arrow" | "minecraft:spectral_arrow")
+    ) {
+        return None;
+    }
+    let motion = &o.player["client_motion"];
+    if motion["kind"] != "finite_input_extrapolation" {
+        return None;
+    }
+    let start = point(&o.player["position"])?;
+    let target = point(&motion["target"])?;
+    let velocity = point(&motion["velocity_per_tick"])?;
+    let p = point(&arrow["position"])?;
+    let v = point(&arrow["velocity"])?;
+    let speed = velocity[0].hypot(velocity[2]);
+    let length = (target[0] - start[0]).hypot(target[2] - start[2]);
+    if !(0.05..=0.9).contains(&speed) || length < 0.6 {
+        return None;
+    }
+    let duration = length / speed;
+    let body_v = [
+        (target[0] - start[0]) / duration,
+        0.,
+        (target[2] - start[2]) / duration,
+    ];
+    let closest = |d: [f64; 3], v: [f64; 3], lo: f64, hi: f64, horizontal: bool| {
+        let axes = |i: usize| !horizontal || i != 1;
+        let vv = (0..3)
+            .filter(|&i| axes(i))
+            .map(|i| v[i] * v[i])
+            .sum::<f64>();
+        let t = if vv > 1e-9 {
+            -(0..3)
+                .filter(|&i| axes(i))
+                .map(|i| d[i] * v[i])
+                .sum::<f64>()
+                / vv
+        } else {
+            lo
+        }
+        .clamp(lo, hi);
+        (0..3)
+            .filter(|&i| axes(i))
+            .map(|i| (d[i] + v[i] * t).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let relative = std::array::from_fn(|i| v[i] - body_v[i]);
+    let d = std::array::from_fn(|i| p[i] - start[i]);
+    let mut clearance = closest(d, relative, 0., duration.min(12.), true);
+    let centre = std::array::from_fn(|i| d[i] - if i == 1 { 0.9 } else { 0. });
+    let mut collision = closest(centre, relative, 0., duration.min(12.), false);
+    if duration < 12. {
+        clearance = clearance.min(closest(
+            std::array::from_fn(|i| p[i] - target[i]),
+            v,
+            duration,
+            12.,
+            true,
+        ));
+        collision = collision.min(closest(
+            std::array::from_fn(|i| p[i] - target[i] - if i == 1 { 0.9 } else { 0. }),
+            v,
+            duration,
+            12.,
+            false,
+        ));
+    }
+    // Larger than the ordinary danger corridor to allow prediction error.
+    // Unknown projectiles and missing/short/releasing input retain old defense.
+    if clearance >= 2. {
+        Some(false)
+    } else if collision < 1.5 {
+        Some(true)
+    } else {
+        None
+    }
 }
 pub fn target_key(p: [f64; 3]) -> [i32; 3] {
     p.map(|v| (v * 10.).round() as i32)
@@ -526,7 +606,9 @@ pub(super) fn evade_with_native(
                     .map(|i| (p[i] + v[i] * t - start[i] - if i == 1 { 0.9 } else { 0. }).powi(2))
                     .sum::<f64>()
                     .sqrt();
-                if (0.0..=12.).contains(&t) && miss < 1.5 {
+                if ongoing_input_arrow_danger(o, e)
+                    .unwrap_or((0.0..=12.).contains(&t) && miss < 1.5)
+                {
                     projectile_danger = true;
                     threats.push((p, true, false));
                     incoming_directions.push(v);
@@ -988,6 +1070,36 @@ mod tests {
         assert!(
             evade(&o).is_none(),
             "A good guard position does not submit zero-distance controls repeatedly"
+        );
+    }
+    #[test]
+    fn continuing_owned_strafe_is_not_interrupted_for_a_shot_it_already_clears() {
+        let mut o = world();
+        o.player["position"] = json!([0.5, 1., 0.5]);
+        o.world["entities"] = json!([{"uuid":"shot","visible":true,"projectile":true,"type":"minecraft:arrow",
+            "position":[12.5,1.9,0.5],"velocity":[-1.5,0.,0.]}]);
+        assert!(incoming(&o));
+        o.player["client_motion"] = json!({"kind":"finite_input_extrapolation","velocity_per_tick":[0.,0.,0.3],"target":[0.5,1.,3.5]});
+        assert!(
+            !incoming(&o),
+            "Continue a strafe with at least2m predicted clearance"
+        );
+        o.player["client_motion"]["target"] = json!([0.5, 1., 1.2]);
+        assert!(
+            incoming(&o),
+            "Stopping early must retain danger after the input ends"
+        );
+        o.player["client_motion"]["target"] = json!([0.5, 1., 3.5]);
+        o.world["entities"][0]["velocity"] = json!([-1.5, 0., 0.3]);
+        assert!(
+            incoming(&o),
+            "A shot leading the moving body still needs defense"
+        );
+        o.world["entities"][0]["velocity"] = json!([-1.5, 0., 0.]);
+        o.world["entities"][0]["type"] = json!("some_mod:unknown_projectile");
+        assert!(
+            incoming(&o),
+            "Unknown projectile dynamics keep conservative handling"
         );
     }
     #[test]

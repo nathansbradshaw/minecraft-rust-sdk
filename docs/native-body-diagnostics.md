@@ -73,3 +73,13 @@ entries keep `visible:false` and an explicit `client_memory` origin/age; they do
 not use an invisible entity's current position. Native observations, attacks and
 authoritative action verification keep their actual current actor facts. Death,
 respawn, dimension/identity/clock changes and expiry invalidate the memory.
+
+For the body's own grounded finite movement, recent native feet samples can
+support a short client motion estimate. The arrow classifier tests both movement
+toward that input's endpoint and stopping there. It preserves input only with a
+wide predicted horizontal clearance; shots leading the moving player still
+trigger defense. Releasing/foreign input, airborne motion, changed lives, stale
+samples and unknown projectiles retain conservative handling. Prediction
+differences are recorded as `body_motion_projectile_assessment`, with sample
+poses/ticks and the active action ID. They are hypotheses, not native immunity
+or a guarantee of future movement.

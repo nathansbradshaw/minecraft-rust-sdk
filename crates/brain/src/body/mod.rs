@@ -2,6 +2,7 @@
 mod aerial;
 pub mod decision;
 pub mod geometry;
+mod motion;
 mod perception;
 mod recovery;
 mod tactics;
@@ -472,6 +473,8 @@ async fn controller(
     let mut projectiles = tactics::Projectiles::default();
     let mut retreat_trail = tactics::RetreatTrail::default();
     let mut threat_memory = perception::RangedMemory::default();
+    let mut own_motion = motion::Motion::default();
+    let mut last_motion_assessment = (Vec::new(), Vec::new());
     let mut retreat_progress = recovery::Progress::default();
     let mut native_escape = recovery::Discovery::default();
     let mut last_meal = None;
@@ -529,10 +532,35 @@ async fn controller(
             conditions = changed;
         }
         let active = &observed.player["control"];
+        let mut policy_observed = threat_memory.policy(&observed);
+        if let Some(prediction) = own_motion.sample(&observed, &owned_control) {
+            policy_observed.to_mut().player["client_motion"] = prediction;
+        }
         let stuck = progress.stuck(&observed, &owned_control);
         let stationary_projectiles = projectiles.stationary(&observed);
         let incoming_projectiles =
+            geometry::incoming_with_stationary(&policy_observed, &stationary_projectiles);
+        let stationary_incoming =
             geometry::incoming_with_stationary(&observed, &stationary_projectiles);
+        let cleared: Vec<_> = stationary_incoming
+            .iter()
+            .filter(|id| !incoming_projectiles.contains(id))
+            .cloned()
+            .collect();
+        let leading: Vec<_> = incoming_projectiles
+            .iter()
+            .filter(|id| !stationary_incoming.contains(id))
+            .cloned()
+            .collect();
+        let assessment = (cleared, leading);
+        if assessment != last_motion_assessment {
+            if !assessment.0.is_empty() || !assessment.1.is_empty() {
+                j.event("body_motion_projectile_assessment",json!({"action_id":active["action_id"],"cleared":assessment.0,"leading":assessment.1,
+                    "prediction":policy_observed.player["client_motion"],"sample_clock":observed.world["sample_clock"],
+                    "scope":"Client prediction preserves existing input; native health/movement determine the actual result"}))?;
+            }
+            last_motion_assessment = assessment;
+        }
         let incoming = !incoming_projectiles.is_empty();
         let new_projectile = incoming_projectiles
             .iter()
@@ -543,7 +571,6 @@ async fn controller(
         let burning = observed.player["fire_ticks"]
             .as_i64()
             .is_some_and(|n| n > 0);
-        let policy_observed = threat_memory.policy(&observed);
         let threatened = geometry::threatened(&policy_observed);
         let trail = retreat_trail.update(&observed, threatened || incoming);
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
