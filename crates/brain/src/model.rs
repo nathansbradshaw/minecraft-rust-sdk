@@ -1,7 +1,21 @@
 use crate::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v1";
+pub(crate) const REQUEST_CONTRACT: &str =
+    "allocated-model-work-purpose-v2/verified-compiler-repair-v1";
+mod repair;
+/// Inspect a compiler-repair transition without inference, execution or writes.
+pub fn compiler_repair_preview(context: &Value) -> Value {
+    let mut preview = context.clone();
+    let mut schema = schema();
+    let applicable = if let Some(repair) = repair::Transition::from_context(context) {
+        repair.prepare(&mut preview, &mut schema);
+        true
+    } else {
+        false
+    };
+    json!({"applicable":applicable,"coding_transition":preview["coding_transition"],"tools":schema["properties"]["tool"]["enum"],"models_called":0,"native_mutations":0})
+}
 use std::{path::Path, time::Duration};
 
 #[derive(Debug)]
@@ -227,24 +241,37 @@ impl Model {
         use_sol: bool,
         development: bool,
     ) -> Result<(Choice, Value)> {
+        let repair = repair::Transition::from_context(context);
+        let development = development || repair.is_some();
+        let mut context = context.clone();
+        let mut format = session_schema(development);
+        if let Some(repair) = &repair {
+            repair.prepare(&mut context, &mut format);
+            crate::fit_context(&mut context)?;
+        }
         let model = if use_sol { "gpt-6.1-sol" } else { "gpt-6-luna" };
-        let (content, usage) = self
+        let (content, mut usage) = self
             .request(
-                context,
+                &context,
                 model,
                 if development { "develop" } else { "plan" },
-                session_schema(development),
+                format,
                 include_str!("system.md"),
                 4096,
             )
             .await?;
-        let choice: Choice =
+        let mut choice: Choice =
             serde_json::from_str(&content).map_err(|e| format!("Invalid model tool JSON: {e}"))?;
         validate_choice(&choice)?;
         ensure(
             !(development && choice.tool == "develop"),
             "Coding/investigation is already active; choose an actual work command",
         )?;
+        if let Some(repair) = repair {
+            repair.guard(&mut choice)?;
+            validate_choice(&choice)?;
+            usage["coding_transition"] = context["coding_transition"].clone();
+        }
         Ok((choice, usage))
     }
     pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {
