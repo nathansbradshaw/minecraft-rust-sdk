@@ -50,9 +50,18 @@ pub async fn worker(path: &Path) -> Result<()> {
 fn quoted(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
+fn navigation_blocked_blocks() -> Vec<String> {
+    // Native fluid-aware predictions can traverse a surface or leave a wet
+    // boundary. Urgent drowning recovery remains owned by the reactive body.
+    crate::body::geometry::KNOWN_HAZARDS
+        .iter()
+        .filter(|id| **id != "minecraft:water")
+        .map(|id| (*id).to_owned())
+        .collect()
+}
 fn journal_key(instance: &str, actor: &Value, goal: &Goal) -> String {
     digest(
-        json!([instance, actor, goal, crate::body::geometry::KNOWN_HAZARDS])
+        json!([instance, actor, goal, navigation_blocked_blocks()])
             .to_string()
             .as_bytes(),
     )
@@ -110,10 +119,7 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
         result: result_file.clone(),
         options: Options {
             timeout_ms: 30000.min(brain.cfg.tool_timeout_secs.saturating_mul(1000)),
-            blocked_blocks: crate::body::geometry::KNOWN_HAZARDS
-                .iter()
-                .map(|id| (*id).to_owned())
-                .collect(),
+            blocked_blocks: navigation_blocked_blocks(),
             ..Options::default()
         },
     };
@@ -155,6 +161,32 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wet_boundary_predictions_survive_without_weakening_defense_or_reusing_old_policy() {
+        let policy = navigation_blocked_blocks();
+        let wet_route = ["minecraft:grass_block", "minecraft:water"];
+        assert!(!wet_route.iter().any(|id| policy.iter().any(|b| b == id)));
+        assert!(policy.iter().any(|id| id == "minecraft:lava"));
+        assert!(crate::body::geometry::KNOWN_HAZARDS.contains(&"minecraft:water"));
+        let goal: Goal = serde_json::from_value(json!({"kind":"position",
+            "dimension":"fixture:world","target":[1.,64.,2.],"distance":1.}))
+        .unwrap();
+        let legacy = digest(
+            json!([
+                "instance",
+                json!("own"),
+                goal,
+                crate::body::geometry::KNOWN_HAZARDS
+            ])
+            .to_string()
+            .as_bytes(),
+        );
+        assert_ne!(
+            journal_key("instance", &json!("own"), &goal),
+            legacy,
+            "A new routing policy must not reuse the exhausted water-blocked graph"
+        );
+    }
     #[test]
     fn a_finite_slice_is_resumable_without_becoming_success_or_execution_credit() {
         let goal: Goal =
