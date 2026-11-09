@@ -298,9 +298,28 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                 result.to_string().len() <= 5000,
                 "Capability response exceeds the model view budget; request a smaller page or use an SDK program for the full result",
             )?;
-            Ok(
-                json!({"view":"capability_query","capability":query.capability,"input_sha256":crate::digest(query.input.to_string().as_bytes()),"result":result,"scope":"Read-only SDK capability result for this character; query is not a gameplay mutation or evidence of task completion"}),
-            )
+            let mut view = json!({"view":"capability_query","capability":query.capability,"input_sha256":crate::digest(query.input.to_string().as_bytes()),"result":result,"scope":"Read-only SDK capability result for this character; query is not a gameplay mutation or evidence of task completion"});
+            if query.capability == "minecraft:recipes"
+                && query.input["recipe"].is_string()
+                && result["matches"]
+                    .as_array()
+                    .is_some_and(|rows| rows.len() == 1)
+                && result["matches"][0]["id"] == query.input["recipe"]
+            {
+                brain.refresh().await?;
+                let materials = minecraft_sdk::recipes::material_summary(
+                    &brain.observed,
+                    &result["matches"][0],
+                );
+                view["client_materials"] = match materials {
+                    Ok(summary) if summary.to_string().len() <= 3500 => summary,
+                    Ok(_) => {
+                        json!({"unavailable":"Material summary exceeds the model view budget; use recipes::material_summary in an SDK program for the full bounded result","craftability":"unknown"})
+                    }
+                    Err(error) => json!({"unavailable":error,"craftability":"unknown"}),
+                };
+            }
+            Ok(view)
         }
         "navigate" => crate::navigation::execute(brain, &choice.input).await,
         "sdk" => brain.act(serde_json::from_str(&choice.input)?).await,

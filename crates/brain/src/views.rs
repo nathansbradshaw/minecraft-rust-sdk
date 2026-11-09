@@ -232,4 +232,32 @@ mod tests {
             "Context fitting must not silently change page counts or omit returned records"
         );
     }
+    #[test]
+    fn runtime_material_feedback_survives_history_compaction_without_becoming_a_craftability_claim()
+    {
+        let recipe = json!({"id":"fixture:recipe","ingredients":[
+            {"matching_stacks":[{"item":"fixture:input","count":1}],"omitted_alternatives":0}],
+            "omitted_ingredient_slots":0});
+        let mut obs = observation();
+        obs.player["inventory"] = json!([]);
+        let summary = minecraft_sdk::recipes::material_summary(&obs, &recipe).unwrap();
+        let answer = json!({"tool":"query","result":{"view":"capability_query",
+            "capability":"minecraft:recipes","result":{"matches":[recipe]},"client_materials":summary}});
+        let mut context = json!({"last_tool_result":answer,"sdk_reference":include_str!("sdk.md"),
+            "server":{"description":"x".repeat(30000)},"recent":vec![json!({"text":"x".repeat(10000)});12],
+            "observation":crate::projection(&obs)});
+        crate::fit_context(&mut context).unwrap();
+        assert_eq!(context["last_tool_result"], answer);
+        assert_eq!(
+            context["last_tool_result"]["result"]["client_materials"]["groups"][0]["alternatives"]
+                [0]["inventory_count"],
+            0
+        );
+        assert!(
+            context["last_tool_result"]["result"]["client_materials"]
+                .get("craftable")
+                .is_none()
+        );
+        assert!(context.to_string().len() <= 32768);
+    }
 }

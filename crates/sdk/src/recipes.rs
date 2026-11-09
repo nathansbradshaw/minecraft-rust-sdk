@@ -1,5 +1,7 @@
 //! Optional read-only runtime recipe discovery. No recipe or material policy.
 use crate::*;
+mod materials;
+pub use materials::material_summary;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
