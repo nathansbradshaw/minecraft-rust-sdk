@@ -1,5 +1,6 @@
 //! Bounded client diagnostics, never authority for game effects.
 use minecraft_sdk::{ActionRequest, LocalActionResponse, Receipt};
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -88,6 +89,66 @@ pub fn compiler_view(experiment: &Value) -> Value {
 }
 
 impl crate::Journal {
+    /// Recover the exact resident-engine intention, including for older journals.
+    /// No SDK dispatch, inferred mutation or native authority is created here.
+    pub(crate) fn bind_latest_action(&self, value: &mut Value) -> crate::Result<()> {
+        if !matches!(value["tool"].as_str(), Some("sdk" | "status" | "reconcile")) {
+            return Ok(());
+        }
+        let result = &value["result"];
+        let receipt = result.get("receipt").unwrap_or(result);
+        let Some(id) = receipt["action_id"].as_str() else {
+            return Ok(());
+        };
+        let Some((run, sequence)) = id.strip_prefix("brain-").and_then(|s| s.rsplit_once('-'))
+        else {
+            return Ok(());
+        };
+        if run.len() != 24 || !run.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(());
+        }
+        let Ok(sequence) = sequence.parse::<i64>() else {
+            return Ok(());
+        };
+        let intent: Option<String> = self
+            .db
+            .query_row(
+                "SELECT data FROM events WHERE id=?1 AND kind='action_intent'",
+                [sequence],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(intent) = intent else {
+            return Ok(());
+        };
+        let intent: Value = serde_json::from_str(&intent)?;
+        let started: Option<String> = self.db.query_row("SELECT data FROM events WHERE id<?1 AND kind='brain_started' ORDER BY id DESC LIMIT 1",[sequence],|r|r.get(0)).optional()?;
+        let Some(started) = started else {
+            return Ok(());
+        };
+        let started: Value = serde_json::from_str(&started)?;
+        if started["run"] != run
+            || !started["uuid"].is_string()
+            || started["uuid"] != intent["before"]["player"]["uuid"]
+        {
+            return Ok(());
+        }
+        let Ok(action) = serde_json::from_value::<minecraft_sdk::Action>(intent["action"].clone())
+        else {
+            return Ok(());
+        };
+        let request = ActionRequest {
+            action_id: id.into(),
+            action,
+        };
+        let feedback = action_feedback(&request, receipt)?;
+        value["result"]
+            .as_object_mut()
+            .expect("Tool result is an object")
+            .remove("request");
+        value["result"]["action_feedback"] = feedback;
+        Ok(())
+    }
     pub(crate) fn compiler_feedback(&self, revision: &str) -> crate::Result<Value> {
         let value = if let Some(saved) = self.get("compiler_feedback")? {
             serde_json::from_str(&saved)?
@@ -106,6 +167,47 @@ impl crate::Journal {
             Value::Null
         })
     }
+}
+
+fn action_feedback(request: &ActionRequest, receipt: &Value) -> crate::Result<Value> {
+    let action = serde_json::to_value(&request.action)?;
+    let bytes = action.to_string();
+    let bounded = if bytes.len() <= 2048 {
+        action.clone()
+    } else {
+        json!({"kind":action["kind"],"omitted":true,"bytes":bytes.len(),"sha256":crate::digest(bytes.as_bytes())})
+    };
+    let mut feedback = json!({"format":"sdk-action-feedback-v1","action_id":request.action_id,"action":bounded,
+        "outcome":receipt["outcome"],"native_effect_verified":receipt["evidence"]["native_effect_verified"],
+        "scope":"Exact local intention bound to this receipt ID. Receipt-local facts are historical; dispatch or mining start is not item acquisition. No mutation replayed."});
+    if let minecraft_sdk::Action::Dig { block, .. } = &request.action {
+        let target = json!([block.x, block.y, block.z]);
+        let cell = |phase: &str| {
+            receipt["evidence"][phase]["world"]["blocks"].as_array().and_then(|rows|rows.iter().find(|b|b["position"]==target)).map(|b|json!({"position":b["position"],"block":b["block"],"state":b["state"],"destroy_progress":b["destroy_progress"],"may_interact":b["may_interact"]}))
+        };
+        // These keys deliberately survive general before/after/world elision.
+        feedback["target_at_admission"] = json!(cell("before"));
+        feedback["target_at_receipt"] = json!(cell("after"));
+        feedback["mining_at_receipt"] = receipt["evidence"]["after"]["player"]["mining"].clone();
+    }
+    if feedback.to_string().len() > 4096 {
+        let hash = crate::digest(feedback.to_string().as_bytes());
+        let object = feedback.as_object_mut().expect("Feedback is an object");
+        for key in [
+            "target_at_admission",
+            "target_at_receipt",
+            "mining_at_receipt",
+        ] {
+            object.remove(key);
+        }
+        object.insert("target_facts_omitted".into(), json!(true));
+        object.insert("full_feedback_sha256".into(), json!(hash));
+    }
+    Ok(feedback)
+}
+
+pub(crate) fn compact_action_feedback(value: &Value) -> bool {
+    value["format"] == "sdk-action-feedback-v1" && value.to_string().len() <= 4096
 }
 
 impl Trace {
@@ -170,6 +272,92 @@ pub fn inventory_delta(previous: &Value, current: &Value) -> Value {
 mod tests {
     use super::*;
     use minecraft_sdk::{Action, ApiError, ErrorCode};
+    #[test]
+    fn legacy_receipt_keeps_its_exact_intention_and_air_target_after_history_elision() {
+        let t = tempfile::tempdir().unwrap();
+        let journal = crate::Journal::open(&t.path().join("brain.sqlite")).unwrap();
+        let run = "0123456789abcdef01234567";
+        journal
+            .event("brain_started", json!({"run":run,"uuid":"actor"}))
+            .unwrap();
+        let action = json!({"kind":"dig","block":{"x":1,"y":64,"z":2},"face":1,"stage":"start"});
+        let sequence = journal
+            .event(
+                "action_intent",
+                json!({"action":action,"before":{"player":{"uuid":"actor"}}}),
+            )
+            .unwrap();
+        let id = format!("brain-{run}-{sequence}");
+        let receipt = json!({"action_id":id,"outcome":"observed","evidence":{"native_effect_verified":true,
+            "before":{"world":{"blocks":[{"position":[1,64,2],"block":"minecraft:air","state":"air"}]}},
+            "after":{"player":{"mining":{"active":true,"block":[1,64,2]}},"world":{"blocks":[{"position":[1,64,2],"block":"minecraft:air","state":"air"}]}}}});
+        journal
+            .event(
+                "tool_result",
+                json!({"tool":"sdk","result":{"receipt":receipt}}),
+            )
+            .unwrap();
+        // These are exactly the historical fields removed by last_result.
+        let result = journal.last_result().unwrap();
+        assert!(result["result"]["receipt"]["evidence"]["before"].is_null());
+        let feedback = &result["result"]["action_feedback"];
+        assert_eq!(feedback["action_id"], id);
+        assert_eq!(feedback["action"], action);
+        assert_eq!(feedback["target_at_admission"]["block"], "minecraft:air");
+        assert_eq!(feedback["target_at_receipt"]["block"], "minecraft:air");
+        assert_eq!(feedback["mining_at_receipt"]["active"], true);
+        assert_eq!(
+            feedback["outcome"], "observed",
+            "Historical bad receipts are never rewritten as corrected native evidence"
+        );
+        let mut context = json!({"goal":"gather resources","sdk_reference":include_str!("sdk.md"),"last_tool_result":result,
+            "recent":{"omitted_for_context_budget":true},"observation":{"player":{"inventory":[]}}});
+        crate::fit_context(&mut context).unwrap();
+        assert_eq!(
+            context["last_tool_result"]["result"]["action_feedback"],
+            *feedback
+        );
+        // An ID from another run cannot attach this journal's action.
+        let mut wrong = json!({"tool":"sdk","result":{"receipt":{"action_id":format!("brain-ffffffffffffffffffffffff-{sequence}")}}});
+        journal.bind_latest_action(&mut wrong).unwrap();
+        assert!(wrong["result"]["action_feedback"].is_null());
+        assert_eq!(
+            journal.last_result().unwrap()["result"]["receipt"]["outcome"],
+            "observed"
+        );
+    }
+    #[test]
+    fn large_action_feedback_is_explicitly_omitted_and_never_becomes_a_replay_request() {
+        let request = ActionRequest {
+            action_id: "large".into(),
+            action: Action::Extension {
+                capability: "fixture:operation".into(),
+                input: json!({"data":"x".repeat(8000)}),
+            },
+        };
+        let feedback = action_feedback(&request, &json!({"outcome":"uncertain"})).unwrap();
+        assert_eq!(feedback["action"]["omitted"], true);
+        assert_eq!(feedback["action"]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(feedback["outcome"], "uncertain");
+        assert!(feedback["native_effect_verified"].is_null());
+        assert!(feedback.to_string().len() < 1024);
+        let bounded = ActionRequest {
+            action_id: "bounded".into(),
+            action: Action::Extension {
+                capability: "fixture:operation".into(),
+                input: json!({"data":"x".repeat(1500)}),
+            },
+        };
+        let feedback = action_feedback(&bounded, &json!({"outcome":"uncertain"})).unwrap();
+        let mut context = json!({"action_feedback":feedback,"old_history":"z".repeat(10000)});
+        crate::compact_history(&mut context);
+        crate::shrink_value(&mut context);
+        assert_eq!(
+            context["action_feedback"]["action"],
+            serde_json::to_value(bounded.action).unwrap(),
+            "Context shrinking cannot silently alter the exact request"
+        );
+    }
     #[test]
     fn compiler_errors_survive_large_program_output() {
         let diagnostic = json!({"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"type mismatch","rendered":"expected a block position"}});

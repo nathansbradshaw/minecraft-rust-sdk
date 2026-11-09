@@ -104,7 +104,7 @@ async fn run() -> Result<()> {
         }
         println!(
             "{}",
-            Journal::open(&path)?
+            Journal::open_read_only(&path)?
                 .get("last_model_context")?
                 .ok_or("No model context recorded")?
         );

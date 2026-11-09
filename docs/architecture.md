@@ -123,6 +123,11 @@ Navigation retains a terminal, verified pose outside that target as
 without replay. Missing native proof or mismatched actor bindings stay fenced.
 
 Rust adapter alpha.13 additionally advertises `minecraft:waypoint_passthrough`.
+Rust adapter alpha.14 rejects mining starts on currently observed Java air cells
+before dispatch. Its start verifier also requires a non-air target and a newly
+observed mining transition or block change. A native active flag on air cannot
+establish block mining. Finish/cancel retain their existing interruption and
+release semantics. Core registry identifiers remain deployment independent.
 `start_move_through` takes `target` and positive `max_ticks`. It holds ordinary
 movement input until crossing the waypoint plane within a 0.35-block lateral
 corridor and 0.05-block vertical tolerance, then releases input. Fresh native

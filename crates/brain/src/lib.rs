@@ -351,6 +351,7 @@ impl Journal {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or(Value::Null);
+        self.bind_latest_action(&mut value)?;
         // The latest requested read is the tool's answer, not redundant receipt
         // history. Its records have already been paged/bounded at the tool edge.
         // Removing world here used to leave valid page counts with no records.
@@ -545,8 +546,10 @@ fn compact_history(value: &mut Value) {
             ] {
                 o.remove(key);
             }
-            for v in o.values_mut() {
-                compact_history(v);
+            for (key, v) in o.iter_mut() {
+                if key != "action_feedback" || !feedback::compact_action_feedback(v) {
+                    compact_history(v);
+                }
             }
         }
         Value::Array(a) => {
@@ -801,13 +804,11 @@ impl Brain {
                 | minecraft_sdk::Action::StartMoveThrough { .. }
                 | minecraft_sdk::Action::CancelControl { .. }
         );
-        let mut receipt = self
-            .client
-            .act(&ActionRequest {
-                action_id: id.clone(),
-                action: action.clone(),
-            })
-            .await?;
+        let request = ActionRequest {
+            action_id: id.clone(),
+            action: action.clone(),
+        };
+        let mut receipt = self.client.act(&request).await?;
         drop(_guard);
         if !movement && receipt.outcome == Outcome::Running {
             receipt = self
@@ -818,13 +819,7 @@ impl Brain {
         self.journal.resolve_pending(&receipt)?;
         self.journal
             .note_gameplay_failure(&action, &receipt, &self.observed)?;
-        if let Some(snapshot) = containers::inspection(
-            &ActionRequest {
-                action_id: id,
-                action,
-            },
-            &receipt,
-        ) {
+        if let Some(snapshot) = containers::inspection(&request, &receipt) {
             self.journal.remember_container(
                 &self.server.instance_id,
                 self.observed.player["uuid"].as_str().unwrap_or_default(),
@@ -834,7 +829,7 @@ impl Brain {
         self.journal
             .event("action_receipt", serde_json::to_value(&receipt)?)?;
         self.observed = self.client.observe().await?;
-        Ok(json!({"receipt":receipt,"after":projection(&self.observed)}))
+        Ok(json!({"request":request,"receipt":receipt,"after":projection(&self.observed)}))
     }
     pub async fn inspect(&mut self, id: &str) -> Result<minecraft_sdk::Receipt> {
         let receipt = self.client.action_status(id).await?;
@@ -1564,6 +1559,9 @@ fn shrink_value(value: &mut Value) {
         }
         Value::Object(o) => {
             for (key, v) in o.iter_mut() {
+                if key == "action_feedback" && feedback::compact_action_feedback(v) {
+                    continue;
+                }
                 if key == "inventory"
                     && let Some(a) = v.as_array_mut()
                 {

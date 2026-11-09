@@ -3,6 +3,7 @@ mod chat;
 mod control;
 mod effects;
 mod fluids;
+mod mining;
 mod motion;
 mod recipes;
 mod routes;
@@ -1435,6 +1436,7 @@ fn dispatch(
                 })?;
                 let observation_ms = observation_started.elapsed().as_millis();
                 effects::validate_item_use(&action.action, &before)?;
+                mining::validate(&action.action, &before)?;
                 let preparation = if let Action::Craft {
                     recipe, menu_id, ..
                 } = &action.action
@@ -1727,9 +1729,12 @@ fn verified_effect(action: &Action, before: &Observation, after: &Observation) -
                 .is_some_and(|(b, a)| b != a);
             match stage {
                 DigStage::Start => {
-                    changed
-                        || (after.player["mining"]["active"] == true
-                            && after.player["mining"]["block"] == p)
+                    mining::has_target(before, block)
+                        && (changed
+                            || (after.player["mining"]["active"] == true
+                                && after.player["mining"]["block"] == p
+                                && (before.player["mining"]["active"] != true
+                                    || before.player["mining"]["block"] != p)))
                 }
                 DigStage::Finish => changed,
                 DigStage::Cancel => {
