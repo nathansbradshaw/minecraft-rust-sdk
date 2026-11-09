@@ -1412,7 +1412,11 @@ fn fit_context(context: &mut Value) -> Result<()> {
         ("player_request", 2000),
     ] {
         if !(focused && field == "last_tool_result") {
-            bound_value(&mut context[field], budget);
+            if field == "memory" {
+                memory::fit_view(&mut context[field], budget);
+            } else {
+                bound_value(&mut context[field], budget);
+            }
         }
     }
     // Preserve the experiment/error channel under pressure. Older history,
@@ -1431,7 +1435,11 @@ fn fit_context(context: &mut Value) -> Result<()> {
             break;
         }
         if !(focused && field == "last_tool_result") {
-            bound_value(&mut context[field], budget);
+            if field == "memory" {
+                memory::fit_view(&mut context[field], budget);
+            } else {
+                bound_value(&mut context[field], budget);
+            }
         }
     }
     // Recursive shrinking has a floor: short scalar fields, complete inventory
@@ -1447,6 +1455,24 @@ fn fit_context(context: &mut Value) -> Result<()> {
     }
     if !projection.is_empty() {
         context["context_projection"] = json!(projection);
+    }
+    if serde_json::to_vec(context)?.len() > 32768
+        && context["last_experiment"]["result"]["output_files"]["stdout"]["path"].is_string()
+        && context["last_experiment"]["result"]["stdout"].is_string()
+    {
+        // Keep typed outcomes, errors and source/receipt bindings ahead of a
+        // retrievable historical stdout preview.
+        let original_bytes = context["last_experiment"]["result"]["stdout"]
+            .to_string()
+            .len();
+        context["last_experiment"]["result"]["stdout"] = json!({"omitted_for_context_budget":true,"original_preview_bytes":original_bytes,"retained_in":"last_experiment.result.output_files.stdout"});
+    }
+    // The full manual is deterministically retrievable by section. Preserve
+    // useful recalled outcomes before replacing them with omission markers.
+    if serde_json::to_vec(context)?.len() > 32768 && context["sdk_reference"].is_string() {
+        let bytes = context["sdk_reference"].to_string().len();
+        context["sdk_reference"] = workspace::reference_index();
+        context["context_projection"]["sdk_reference"] = json!({"complete":false,"view":"retrievable_section_index","original_bytes":bytes,"retained_in":"read sdk://reference (built-in, bound to this engine)"});
     }
     for field in [
         "completed_tool_activity",
@@ -1467,23 +1493,6 @@ fn fit_context(context: &mut Value) -> Result<()> {
         context[field] = json!({"omitted_for_context_budget":true,"original_bytes":bytes,"original_records":records,"retained_in":"persistent client journal and original tool output files"});
         projection.insert(field.into(), json!({"complete":false,"view":"elided_redundant_history","original_bytes":bytes,"original_records":records}));
         context["context_projection"] = json!(projection);
-    }
-    if serde_json::to_vec(context)?.len() > 32768
-        && context["last_experiment"]["result"]["output_files"]["stdout"]["path"].is_string()
-        && context["last_experiment"]["result"]["stdout"].is_string()
-    {
-        // A complete focused page must retain its record and cursor bindings.
-        // Historical stdout is retrievable and lower priority than that page,
-        // stderr, typed outcomes, source hashes and durable action IDs.
-        let original_bytes = context["last_experiment"]["result"]["stdout"]
-            .to_string()
-            .len();
-        context["last_experiment"]["result"]["stdout"] = json!({"omitted_for_context_budget":true,"original_preview_bytes":original_bytes,"retained_in":"last_experiment.result.output_files.stdout"});
-    }
-    if serde_json::to_vec(context)?.len() > 32768 && context["sdk_reference"].is_string() {
-        let bytes = context["sdk_reference"].to_string().len();
-        context["sdk_reference"] = workspace::reference_index();
-        context["context_projection"]["sdk_reference"] = json!({"complete":false,"view":"retrievable_section_index","original_bytes":bytes,"retained_in":"read sdk://reference (built-in, bound to this engine)"});
     }
     if serde_json::to_vec(context)?.len() > 32768 && context["spatial_searches"].is_object() {
         let bytes = context["spatial_searches"].to_string().len();
@@ -1971,6 +1980,25 @@ mod tests {
         assert_eq!(
             context["observation"]["world"]["blocks"][0]["position"],
             json!([12, 64, -9])
+        );
+    }
+    #[test]
+    fn retrievable_manual_is_indexed_before_executed_memory_is_elided() {
+        let memory = json!([{"origin":"program_experiment","text":"Observed block change; no retained item gain","provenance":{"version":"source-binding","native_receipt_references":[{"action_id":"own-action","kind":"dig"}]},"native_authority":false}]);
+        let mut context = json!({"goal":"collect materials","sdk_reference":"retrievable manual ".repeat(2000),
+            "memory":memory,"last_tool_result":{"result":{"view":"file","content":"source line\n".repeat(1000)}},
+            "last_experiment":{"result":{"exit_code":0,"inventory_delta":[]}},"observation":{"player":{"inventory":[]}}});
+        fit_context(&mut context).unwrap();
+        assert!(context.to_string().len() <= 32768);
+        assert_eq!(context["memory"], memory);
+        assert_eq!(
+            context["context_projection"]["sdk_reference"]["view"],
+            "retrievable_section_index"
+        );
+        assert!(context["sdk_reference"].is_object());
+        assert_eq!(
+            context["last_experiment"]["result"]["inventory_delta"],
+            json!([])
         );
     }
     fn conversation(action: model::GoalAction, goal: &str) -> model::Conversation {

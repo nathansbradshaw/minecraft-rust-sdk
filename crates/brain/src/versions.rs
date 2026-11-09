@@ -232,14 +232,34 @@ impl Journal {
             .take(2)
             .cloned()
             .collect::<Vec<_>>();
-        let mut outcome = result.clone();
-        crate::bound_value(&mut outcome, 1500);
+        // Lead with semantic results. Cargo's large stdout preview can otherwise
+        // occupy the entire recalled excerpt and hide every gameplay outcome.
+        let actions: Vec<_> = result["local_action_feedback"]["requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(4)
+            .map(|row| {
+                let action = &row["request"]["action"];
+                json!({"kind":action["kind"],"stage":action["stage"],
+                    "block":action["block"],"outcome":row["response"]["outcome"],
+                    "verified":row["response"]["native_effect_verified"]})
+            })
+            .collect();
+        let inventory = result["inventory_delta"].as_array().map(|rows|
+            json!({"changes":rows.iter().take(4).collect::<Vec<_>>(),"omitted":rows.len().saturating_sub(4)}));
+        let errors: Vec<_> = result["compiler_diagnostics"]["errors"]
+            .as_array().into_iter().flatten().take(2).map(|error|
+                json!({"code":error["code"],"message":error["message"].as_str().unwrap_or_default().chars().take(160).collect::<String>()})).collect();
         let text = format!(
-            "Program {}. Goal: {}. Files: {}. Outcome: {}",
-            choice.input,
+            "Program {}. Exit {}. Retained inventory delta {}. Action sample {}. Error sample {}. Goal: {}. Files: {}. Block change is not pickup; exit zero is not task success.",
+            choice.input.chars().take(80).collect::<String>(),
+            result["exit_code"],
+            json!(inventory),
+            json!(actions),
+            json!(errors),
             goal,
             filenames.join(", "),
-            outcome
         );
         let effects:Vec<_>=result["local_action_feedback"]["requests"].as_array().into_iter().flatten().filter(|row|row["response"]["outcome"]=="observed"&&row["response"]["native_effect_verified"]==true).take(4).map(|row|json!({"action_id":row["request"]["action_id"],"kind":row["request"]["action"]["kind"]})).collect();
         let gain = result["inventory_delta"]
@@ -339,7 +359,7 @@ mod tests {
         };
         {
             let j = Journal::open(&state.join("brain.sqlite")).unwrap();
-            j.remember_program(&state,&version,"Craft a wooden pickaxe",&choice,&json!({"success":true,"exit_code":0,"inventory_changed":false,"inventory_delta":[],"local_action_feedback":{"requests":[]}})).unwrap();
+            j.remember_program(&state,&version,"Craft a wooden pickaxe",&choice,&json!({"success":true,"exit_code":0,"stdout":"compiler-artifact boilerplate".repeat(1000),"inventory_changed":false,"inventory_delta":[],"local_action_feedback":{"requests":[{"request":{"action_id":"own-finish","action":{"kind":"dig","stage":"finish","block":{"x":17,"y":64,"z":-9}}},"response":{"outcome":"observed","native_effect_verified":true}}]}})).unwrap();
         }
         let j = Journal::open(&state.join("brain.sqlite")).unwrap();
         let found = j.recall("Resume crafting the wooden pickaxe").unwrap();
@@ -352,6 +372,11 @@ mod tests {
                 .starts_with("candidate")
         );
         assert_eq!(found[0]["native_authority"], false);
+        let excerpt = found[0]["text"].as_str().unwrap();
+        assert!(excerpt.contains("Retained inventory delta {\"changes\":[],\"omitted\":0}"));
+        assert!(excerpt.contains("\"stage\":\"finish\""));
+        assert!(excerpt.contains("\"z\":-9"));
+        assert!(!excerpt.contains("compiler-artifact"));
         assert!(inspect(&state, &version).is_ok());
     }
     #[test]

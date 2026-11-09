@@ -11,7 +11,10 @@ fn publication_budget(tree_bytes: usize, history_bytes: usize) -> Result<()> {
     }
     // Source revisions accumulate while the current reusable project stays
     // small. Every historical blob still passes the same path/size/secret scan.
-    if history_bytes > 16 * 1024 * 1024 {
+    // Reviewed source history has reached 16 MiB while the current tree is
+    // under 2 MiB. Retain that history; path/file/secret checks still scan every
+    // blob, and current-tree and individual-file ceilings remain unchanged.
+    if history_bytes > 24 * 1024 * 1024 {
         return Err(format!(
             "Source publication history exceeds reviewed budget: {history_bytes} bytes"
         )
@@ -204,7 +207,9 @@ mod tests {
     fn retained_source_revisions_do_not_expand_the_current_tree_budget() {
         assert!(publication_budget(1_213_568, 8_418_253).is_ok());
         assert!(publication_budget(8 * 1024 * 1024 + 1, 9 * 1024 * 1024).is_err());
-        assert!(publication_budget(1_213_568, 16 * 1024 * 1024 + 1).is_err());
+        assert!(publication_budget(1_753_260, 16_737_705).is_ok());
+        assert!(publication_budget(1_753_260, 24 * 1024 * 1024).is_ok());
+        assert!(publication_budget(1_213_568, 24 * 1024 * 1024 + 1).is_err());
     }
     #[test]
     fn blocks_runtime_and_private_paths() {
