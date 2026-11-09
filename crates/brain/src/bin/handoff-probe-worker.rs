@@ -63,9 +63,9 @@ fn fixture(r: &Request, file: &Path) -> Result<Option<model::Choice>> {
         let block = rows
             .iter()
             .find(|b| {
-                // Empty-hand dirt clicks cannot strip logs, open containers or
+                // Empty-hand dirt/grass clicks cannot strip logs, open containers or
                 // place supplies. No coordinates, server address or task solution.
-                if b["block"] != "minecraft:dirt" || b["may_interact"] != true {
+                if !matches!(b["block"].as_str(),Some("minecraft:dirt"|"minecraft:grass_block")) || b["may_interact"] != true {
                     return false;
                 }
                 let Some(q) = b["position"].as_array() else {
@@ -84,7 +84,7 @@ fn fixture(r: &Request, file: &Path) -> Result<Option<model::Choice>> {
                         < 16.
             })
             .ok_or(
-                "No nearby observed dirt; fixture setup is ineligible, do not force a world repair",
+                "No nearby observed dirt/grass; fixture setup is ineligible, do not force a world repair",
             )?;
         let q = &block["position"];
         let action = json!({"kind":"place","block":{"x":q[0],"y":q[1],"z":q[2]},"face":1,"hand":"main","hit":[0.5,1.,0.5]});
@@ -189,7 +189,7 @@ mod tests {
             key_file: dir.path().join("unused.key"),
             use_sol: false,
             development: false,
-            context: json!({"turn":0,"goal":"fixture","observation":{"player":{"uuid":"own","selected":0,"position":[0.5,2.,0.5],"inventory":[{"slot":0,"count":1,"item":"minecraft:crafting_table"}]},"world":{"blocks":[{"position":[0,0,0],"block":"minecraft:dirt","may_interact":true}]}}}),
+            context: json!({"turn":0,"goal":"fixture","observation":{"player":{"uuid":"own","selected":0,"position":[0.5,2.,0.5],"inventory":[{"slot":0,"count":1,"item":"minecraft:crafting_table"}]},"world":{"blocks":[{"position":[0,0,0],"block":"minecraft:grass_block","may_interact":true}]}}}),
         };
         let setup = fixture(&r, &file).unwrap().unwrap();
         assert_eq!(
