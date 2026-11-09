@@ -1,4 +1,5 @@
 pub use minecraft_sdk_core::*;
+pub mod auditory;
 pub mod menu;
 pub mod navigation;
 #[cfg(test)]
