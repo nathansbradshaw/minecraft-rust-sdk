@@ -41,3 +41,15 @@ The existing model allocation and shared inference/compilation budgets apply.
 The independent body and conversation continue during reasoning and development.
 `repair-probe PRIVATE_CONTEXT.json` inspects applicability without inference,
 gameplay or source writes. Native retained progress remains a separate gate.
+
+# Exhausted navigation
+
+Two exhausted routes within three blocks, with the same goal, source, anchored
+local terrain and inventory, open a coding checkpoint. The worker supplies the
+complete unchanged conventional `src/main.rs` (up to 4 KiB) for a model-authored
+edit or a specific missing-interface report. Other layouts keep ordinary tools.
+The current source is a candidate, not evidence that it caused the route failure
+or compiled. The model still chooses the method and must compile, execute and
+verify it. New goals, changed source, changed anchored terrain/inventory, leaving
+the area, or pending intentions prevent the checkpoint. This adds no model
+allowance, gameplay authority, mandatory digging policy or task-success credit.

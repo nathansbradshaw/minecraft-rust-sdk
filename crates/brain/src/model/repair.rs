@@ -4,6 +4,7 @@ use serde_json::json;
 use std::{fs, path::Path};
 
 pub(super) struct Transition {
+    checkpoint: bool,
     gameplay: Option<Value>,
     path: String,
     source_sha256: String,
@@ -261,6 +262,46 @@ impl Transition {
     /// Incomplete, changed or foreign source keeps the ordinary tool interface.
     /// Files are read by the container-local worker, never the inference host.
     pub fn from_context(context: &Value) -> Option<Self> {
+        Self::failed_source(context).or_else(|| Self::coding_checkpoint(context))
+    }
+    fn coding_checkpoint(context: &Value) -> Option<Self> {
+        let checkpoint = &context["coding_checkpoint"];
+        if checkpoint["format"] != "navigation-coding-checkpoint-v1"
+            || checkpoint["count"].as_u64()? < 2
+            || context["goal_revision"].as_str()?.is_empty()
+            || checkpoint["goal_revision"] != context["goal_revision"]
+            || context["pending_action"].as_str() != Some("")
+        {
+            return None;
+        }
+        let root = fs::canonicalize(context["workspace"].as_str()?).ok()?;
+        let fingerprint = crate::progress::workspace_fingerprint(&root).ok()?;
+        if checkpoint["source_sha256"] != fingerprint {
+            return None;
+        }
+        // A conventional existing entry is an editable candidate, not a claim
+        // that it compiled or caused the navigation failure. Other layouts
+        // retain ordinary tools rather than guessing an entry or file contents.
+        let file = fs::canonicalize(root.join("src/main.rs")).ok()?;
+        file.strip_prefix(&root).ok()?;
+        let metadata = fs::metadata(&file).ok()?;
+        if !metadata.is_file() || metadata.len() > 4096 {
+            return None;
+        }
+        let source = crate::workspace::read(&root, "src/main.rs").ok()?;
+        if source["content_complete"] != true {
+            return None;
+        }
+        Some(Self {
+            checkpoint: true,
+            gameplay: None,
+            path: "src/main.rs".into(),
+            source_sha256: source["source_sha256"].as_str()?.into(),
+            failed_workspace_sha256: fingerprint,
+            source: Some(source),
+        })
+    }
+    fn failed_source(context: &Value) -> Option<Self> {
         let compiler = &context["compiler_feedback"];
         let recovered = complete_gameplay_experiment(&context["last_experiment"]);
         let experiment = recovered.as_ref().unwrap_or(&context["last_experiment"]);
@@ -363,6 +404,7 @@ impl Transition {
             return None;
         }
         Some(Self {
+            checkpoint: false,
             gameplay: gameplay.map(|mut evidence| {
                 evidence["trace_recovered_from_private_journal"] =
                     experiment["trace_recovered_from_private_journal"].clone();
@@ -375,12 +417,16 @@ impl Transition {
         })
     }
     pub fn prepare(&self, context: &mut Value, schema: &mut Value) {
-        let mode = if self.gameplay.is_some() {
+        let mode = if self.checkpoint {
+            "verified_coding_checkpoint"
+        } else if self.gameplay.is_some() {
             "verified_gameplay_repair"
         } else {
             "verified_compiler_repair"
         };
-        let source_view = if self.gameplay.is_some() {
+        let source_view = if self.checkpoint {
+            "coding_candidate_source"
+        } else if self.gameplay.is_some() {
             "gameplay_repair_source"
         } else {
             "compiler_repair_source"
@@ -400,6 +446,11 @@ impl Transition {
         if self.gameplay.is_some() {
             context["coding_transition"]["task"] = json!(
                 "The complete unchanged compiled Rust entry and concrete failed/historical gameplay outcomes are supplied. Repair the cause with an exact old/new source edit, or report the precise missing fact/interface. Diagnose before trying another intention: merely changing IDs cannot fix an invalid route or expired interaction. Gather fresh state in the repaired program, preserve pending/uncertain IDs and reconcile rather than blindly replaying. Read-only status/history runs are valid and require no mutation. The model authors all code; compile and execute a changed version, then verify actual retained progress. Do not reread the same source or rerun the unchanged failed program."
+            );
+        }
+        if self.checkpoint {
+            context["coding_transition"]["task"] = json!(
+                "Repeated routes exhausted the same nearby observed terrain without completing the goal. The current editable Rust entry is supplied in full; it is not claimed to have caused this failure or to be compiled. Author an actual exact old/new source edit for a different bounded investigation or gameplay method, or report the precise missing SDK fact/interface that prevents a candidate. Do not select another distant target or reread unchanged terrain/reference instead of writing code. Query fresh state inside your candidate as needed. Preserve pending/uncertain IDs, never blindly replay mutations, and respect ordinary gameplay permissions and deployment instructions. After the edit compile/run the changed candidate and inspect actual retained results. The model chooses the method and authors all code; no route, gameplay walkthrough or task success is supplied."
             );
         }
         schema["properties"]["tool"]["enum"] = json!(["edit", "report"]);
@@ -430,6 +481,56 @@ impl Transition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stalled_navigation_can_author_a_candidate_without_inventing_a_failed_program() {
+        let (dir, mut context) = fixture();
+        context["compiler_feedback"] = Value::Null;
+        context["last_experiment"] = Value::Null;
+        context["goal_revision"] = json!("goal");
+        context["pending_action"] = json!("");
+        context["coding_checkpoint"] = json!({"format":"navigation-coding-checkpoint-v1","count":2,
+            "goal_revision":"goal","source_sha256":crate::progress::workspace_fingerprint(dir.path()).unwrap()});
+        let transition = Transition::from_context(&context).unwrap();
+        let mut schema = super::super::schema();
+        let original = context.clone();
+        transition.prepare(&mut context, &mut schema);
+        assert_eq!(
+            context["coding_transition"]["mode"],
+            "verified_coding_checkpoint"
+        );
+        assert_eq!(context["coding_candidate_source"]["content_complete"], true);
+        assert!(context["coding_transition"]["gameplay_failure"].is_null());
+        assert_eq!(
+            schema["properties"]["tool"]["enum"],
+            json!(["edit", "report"])
+        );
+        for (path, value) in [
+            ("/pending_action", json!("uncertain-id")),
+            ("/goal_revision", json!("different")),
+            ("/coding_checkpoint/count", json!(1)),
+            ("/coding_checkpoint/source_sha256", json!("stale")),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(path).unwrap() = value;
+            assert!(Transition::from_context(&changed).is_none(), "{path}");
+        }
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        assert!(Transition::from_context(&original).is_none());
+    }
+    #[test]
+    fn a_candidate_checkpoint_cannot_read_source_through_an_external_symlink() {
+        let (dir, mut context) = fixture();
+        context["compiler_feedback"] = Value::Null;
+        context["last_experiment"] = Value::Null;
+        let external = tempfile::NamedTempFile::new().unwrap();
+        fs::remove_file(dir.path().join("src/main.rs")).unwrap();
+        std::os::unix::fs::symlink(external.path(), dir.path().join("src/main.rs")).unwrap();
+        context["goal_revision"] = json!("goal");
+        context["pending_action"] = json!("");
+        context["coding_checkpoint"] = json!({"format":"navigation-coding-checkpoint-v1","count":2,"goal_revision":"goal",
+            "source_sha256":crate::progress::workspace_fingerprint(dir.path()).unwrap()});
+        assert!(Transition::from_context(&context).is_none());
+    }
     fn gameplay_fixture() -> (tempfile::TempDir, Value) {
         let (dir, mut context) = fixture();
         let log = json!({"reason":"compiler-artifact","target":{"name":"candidate","kind":["bin"],"src_path":dir.path().join("src/main.rs")}}).to_string();
