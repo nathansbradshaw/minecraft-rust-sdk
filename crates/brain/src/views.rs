@@ -149,6 +149,36 @@ pub fn menu_slot(value: &Value) -> Value {
         ],
     )
 }
+/// Keep occupied native slot bindings in the default view. Totals alone mix
+/// crafting inputs with a prepared output. Roles remain supplied by the server;
+/// this does not infer a result slot from a menu name or grant pickup authority.
+pub(crate) fn menu_stacks(menu: &Value) -> Value {
+    if crate::containers::menu_summary(menu).is_none() {
+        return json!({"available":false,"complete":false});
+    }
+    let mut stacks = serde_json::Map::new();
+    let mut occupied = 0;
+    for row in menu["slots"].as_array().into_iter().flatten() {
+        if row["player_inventory"] != false || row["count"] == 0 {
+            continue;
+        }
+        occupied += 1;
+        if stacks.len() >= 16 {
+            continue;
+        }
+        let key = row["slot"]
+            .as_u64()
+            .expect("validated menu slot")
+            .to_string();
+        stacks.insert(key.clone(), menu_slot(row));
+        if serde_json::to_vec(&stacks).map_or(true, |bytes| bytes.len() > 3072) {
+            stacks.remove(&key);
+        }
+    }
+    let omitted = occupied - stacks.len();
+    json!({"available":true,"complete":omitted==0,"omitted_occupied_slots":omitted,
+        "slots":stacks,"scope":"Occupied non-player slots in this native menu sample; excludes retained inventory and cursor. Slot roles are not inferred. Empty slots need a focused menu view. This is not proof of crafting or pickup."})
+}
 pub fn focused(observation: &Observation, input: &str) -> Result<Value> {
     ensure(input.len() <= 1024, "Bounded observation query required")?;
     let query: Query = serde_json::from_str(input)?;
@@ -276,6 +306,44 @@ mod tests {
         assert_eq!(result["page"]["complete"], true);
         let overview = crate::projection(&observation());
         assert_eq!(overview["world"]["entities"][0]["entity_id"], 49);
+    }
+    #[test]
+    fn default_menu_keeps_output_input_inventory_and_cursor_separate() {
+        let mut obs = observation();
+        obs.player["inventory"] = json!([{"slot":9,"item":"mod:input","count":7}]);
+        obs.menu = json!({"menu_id":3,"state_id":19,"type":"mod:workbench",
+            "carried":{"item":"mod:result","count":2},"slots":[
+            {"slot":0,"player_inventory":false,"item":"mod:result","count":4,"may_pickup":true,"may_place_carried":false},
+            {"slot":1,"player_inventory":false,"item":"mod:input","count":2,"may_pickup":true,"may_place_carried":true},
+            {"slot":2,"player_inventory":false,"item":"minecraft:air","count":0},
+            {"slot":3,"player_inventory":true,"item":"mod:input","count":7}]});
+        let projected = crate::projection(&obs);
+        let stacks = &projected["menu"]["non_player_stacks"];
+        assert_eq!(stacks["complete"], true);
+        assert_eq!(stacks["slots"]["0"]["count"], 4);
+        assert_eq!(stacks["slots"]["1"]["count"], 2);
+        assert_eq!(stacks["slots"].as_object().unwrap().len(), 2);
+        assert_eq!(projected["player"]["inventory"][0]["count"], 7);
+        assert_eq!(projected["menu"]["carried"]["count"], 2);
+        let mut context = json!({"observation":projected,
+            "server":{"description":"x".repeat(30000)},"sdk_reference":"docs".repeat(3000),
+            "recent":vec![json!({"text":"x".repeat(10000)});12]});
+        crate::fit_context(&mut context).unwrap();
+        assert_eq!(context["observation"]["menu"]["non_player_stacks"], *stacks);
+        assert_eq!(context["observation"]["menu"]["state_id"], 19);
+    }
+    #[test]
+    fn default_menu_marks_bounded_and_malformed_samples_incomplete() {
+        let mut menu = json!({"slots":(0..40).map(|i|json!({"slot":i,
+            "player_inventory":false,"item":"mod:stack","count":1})).collect::<Vec<_>>()});
+        let view = menu_stacks(&menu);
+        assert_eq!(view["complete"], false);
+        assert_eq!(view["omitted_occupied_slots"], 24);
+        assert_eq!(view["slots"].as_object().unwrap().len(), 16);
+        assert!(serde_json::to_vec(&view).unwrap().len() < 4096);
+        menu["slots"][0]["slot"] = json!(1);
+        assert_eq!(menu_stacks(&menu)["available"], false);
+        assert_eq!(menu_stacks(&json!({}))["complete"], false);
     }
     #[test]
     fn menu_pages_preserve_output_and_empty_slot_bindings_without_reindexing() {
