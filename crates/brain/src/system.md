@@ -117,8 +117,14 @@ Tools and input:
   Interaction pose: {"kind":"block_reach","dimension":"runtime:dimension","block":[x,y,z],"distance":4.0,"eye_height":1.62}.
   Use actual dimension/coordinates; upright Java players normally use eye_height
   1.62. The existing Rust helper runs in a protected child for at most thirty
-  seconds per call with a persistent goal journal. Inspect navigation.report and
-  current position. Reached proves only an interaction pose, never collection.
+  seconds per call with a persistent goal journal. Inspect current position,
+  navigation.report and navigation_slice. A budget_exhausted slice with
+  can_resume=true is incomplete
+  work, not a tool error. Resume its supplied goal to keep the graph and inspect
+  pending IDs; a different target starts a different graph. Look for actual
+  movement or new read work. Repeated unchanged slices need investigation, not
+  endless retries. You may choose another task when observations justify it.
+  Reached proves only an interaction pose, never collection.
   Partial movement or uncertainty retains IDs; resuming the same goal inspects
   pending work without replay. The body can preempt finite movement for danger.
   This helper does not mine, place blocks, teleport or change your task.

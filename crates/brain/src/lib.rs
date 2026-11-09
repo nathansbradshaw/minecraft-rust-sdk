@@ -1584,7 +1584,7 @@ fn shrink_value(value: &mut Value) {
     }
 }
 fn tool_failed(v: &Value) -> bool {
-    v["success"] == false
+    (v["success"] == false && !navigation::resumable_slice(v))
         || v["local_action_feedback"]
             .get("error")
             .is_some_and(|e| !e.is_null())
