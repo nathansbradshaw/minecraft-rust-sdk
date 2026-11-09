@@ -229,6 +229,17 @@ ceiling, and restarting does not renew it. Chat, uncertain-action reconciliation
 provider quotas and ordinary native permissions retain their existing paths.
 This client cost guard is not a trusted security or gameplay-authority boundary.
 
+For an explicit operator-owned conformance character, `handoff-probe-worker`
+injects seven bounded fixture choices in a fresh workspace: select an empty
+hotbar slot, click observed nearby dirt with that empty hand, spend four
+investigation decisions on unchanged observations, and request the exact failed
+click once more to test the local fence. It then delegates to the ordinary
+allocated model worker to perform the requested task. It never supplies a task
+solution, discards items or installs a world fixture. Missing terrain, a changed
+task/actor or a nonempty hand rejects the fixture. Count injected choices
+separately from actual model admissions and autonomous progress. This diagnostic
+is not a production strategy; preserve both stalled and repaired runs.
+
 The body can attempt cooldown-ready defense against a visible hostile within
 three blocks while its finite escape continues. It does not pursue targets or
 interrupt a running item interaction to attack. Native player permissions,

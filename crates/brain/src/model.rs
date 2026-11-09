@@ -73,7 +73,7 @@ pub fn retry_at(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Opti
 
 /// A daily allocation rejection applies only to the requested model. Queue,
 /// pacing, authentication and schema errors do not authorize model hopping.
-pub(crate) fn daily_reset(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<i64> {
+pub fn daily_reset(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<i64> {
     error
         .downcast_ref::<HttpFailure>()
         .and_then(|e| {
