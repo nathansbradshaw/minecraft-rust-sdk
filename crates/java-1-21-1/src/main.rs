@@ -1431,7 +1431,10 @@ fn dispatch(
                 })?;
                 let observation_ms = observation_started.elapsed().as_millis();
                 effects::validate_item_use(&action.action, &before)?;
-                if let Action::Craft { recipe, .. } = &action.action {
+                let preparation = if let Action::Craft {
+                    recipe, menu_id, ..
+                } = &action.action
+                {
                     if !discovery["observation_capabilities"]
                         .as_array()
                         .is_some_and(|caps| caps.iter().any(|cap| cap == recipes::CAPABILITY))
@@ -1442,8 +1445,12 @@ fn dispatch(
                         ));
                     }
                     let found=native.call("observe-extension",json!({"player_uuid":request.player_uuid,"capability":recipes::CAPABILITY,"input":{"recipe":recipe,"limit":1}})).map_err(|_|ApiError::new(ErrorCode::NotReady,"Runtime recipe validation unavailable; no gameplay packet sent"))?;
-                    recipes::validate(recipe, &found)?;
-                }
+                    Some(recipes::Preparation::bind(
+                        recipe, *menu_id, &found, &before,
+                    )?)
+                } else {
+                    None
+                };
                 if before.player["health"].as_f64().is_some_and(|h| h <= 0.)
                     && !matches!(
                         action.action,
@@ -1556,7 +1563,10 @@ fn dispatch(
                     let job = effects::Job::start(
                         player,
                         native.clone(),
-                        before,
+                        effects::Baseline {
+                            observation: before,
+                            preparation,
+                        },
                         action,
                         sent.is_ok(),
                         config.control_max_ticks,
@@ -1783,9 +1793,9 @@ fn verified_effect(action: &Action, before: &Observation, after: &Observation) -
             before.menu["menu_id"] == after.menu["menu_id"]
                 && (get(before) != get(after) || before.menu["carried"] != after.menu["carried"])
         }
-        Action::Craft { menu_id, .. } => {
-            after.menu["menu_id"] == *menu_id && before.menu["slots"] != after.menu["slots"]
-        }
+        // Craft proof requires its dispatch-bound runtime result, handled by
+        // effects::Job. A generic slot difference cannot certify preparation.
+        Action::Craft { .. } => false,
         Action::CloseMenu { menu_id } => *menu_id != 0 && after.menu["menu_id"] == 0,
         Action::Chat { message } => {
             let baseline = before.player["accepted_chat"]

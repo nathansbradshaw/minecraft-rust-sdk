@@ -33,6 +33,21 @@ cannot add it. Existing finite controls and ordinary player permissions apply.
 for the observed menu. This is recipe placement into a grid. A prepared result
 is not yet an item retained by the character.
 
+The Java adapter binds preparation verification to the exact runtime recipe
+lookup before dispatch. For the supported Java inventory and crafting-table
+menus, a changed crafting grid must contain the expected result item and count
+in its output slot. Clearing an old recipe, picking up unrelated inventory, or
+changing only the menu revision cannot establish preparation. A prepared result
+receipt has `effect.kind = recipe_preparation` and
+`inventory_acquisition_verified = false`. It verifies item/count metadata, not
+custom component semantics. This verifier supports vanilla shaped/shapeless
+serializers, including installed mod recipes using them. Unknown menu layouts,
+other recipe types/serializers, special recipes and unavailable results require an adapter and
+fail explicitly before sending a gameplay packet. An unchanged already prepared
+grid does not establish a new effect; inspect its current output instead of
+replaying the request. Normal lack of an expected output expires within the
+action budget without claiming success or an uncertain mutation.
+
 `menu::click_slot(&observation, slot, button, click_mode::QUICK_MOVE)` binds an
 intention to the observed menu ID and revision, refusing a missing slot or bad
 revision. Observe again between interactions. The server still rejects stale
