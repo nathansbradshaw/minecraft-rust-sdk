@@ -52,6 +52,21 @@ fn preview(text: &str, bytes: usize) -> String {
     format!("{} [historical text truncated]", &text[..end])
 }
 
+/// Recall order is priority order. Generic history shrinking keeps the tail,
+/// which would discard the executed-outcome prefix. Never shorten bindings.
+pub(crate) fn fit_view(value: &mut Value, budget: usize) {
+    if let Some(rows) = value.as_array_mut() {
+        while rows.len() > 1 && serde_json::to_vec(rows).map_or(usize::MAX, |v| v.len()) > budget {
+            rows.pop();
+        }
+        if serde_json::to_vec(rows).map_or(usize::MAX, |v| v.len()) > budget
+            && let Some(text) = rows.first().and_then(|row| row["text"].as_str())
+        {
+            rows[0]["text"] = json!(preview(text, 160));
+        }
+    }
+}
+
 impl Journal {
     pub(crate) fn remember_from(
         &self,
@@ -106,29 +121,56 @@ impl Journal {
             .map(|w| format!("\"{w}\""))
             .collect::<Vec<_>>()
             .join(" OR ");
-        let sql = if fts.is_empty() {
-            format!("{select} ORDER BY m.id DESC LIMIT 16")
-        } else {
-            format!(
-                "{select} JOIN memory_search ON memory_search.rowid=m.id WHERE memory_search MATCH ?1 ORDER BY bm25(memory_search),m.id DESC LIMIT 16"
-            )
-        };
-        let mut stmt = self.db.prepare(&sql)?;
-        let mut rows = if fts.is_empty() {
-            stmt.query([])?
-        } else {
-            stmt.query([fts])?
-        };
         let mut result = Vec::new();
-        while let Some(row) = rows.next()? {
-            let provenance: Value = serde_json::from_str(&row.get::<_, String>(5)?)?;
-            let value = json!({"id":row.get::<_,i64>(0)?,"at":row.get::<_,i64>(1)?,"kind":row.get::<_,String>(2)?,"text":preview(&row.get::<_,String>(3)?,600),"origin":row.get::<_,String>(4)?,"provenance":provenance,"binding":"historical; reobserve before using any location, menu, entity or inventory claim","native_authority":false});
-            if serde_json::to_vec(&result)?.len() + value.to_string().len() + 2 > 4800 {
-                continue;
-            }
-            result.push(value);
-            if result.len() == 8 {
-                break;
+        let mut versions = std::collections::HashSet::new();
+        // Separate pools prevent many exact-goal historical file writes from
+        // excluding actual experiments. Two slots leave room for facts/reports;
+        // receipt references describe historical effects, never reliable skills.
+        for executed in [true, false] {
+            let filter = if executed {
+                "coalesce(s.origin,'')='program_experiment'"
+            } else {
+                "coalesce(s.origin,'')!='program_experiment'"
+            };
+            let rank = if executed {
+                "CASE WHEN json_array_length(json_extract(s.provenance,'$.native_receipt_references'))>0 THEN 0 ELSE 1 END,"
+            } else {
+                ""
+            };
+            let sql = if fts.is_empty() {
+                format!("{select} WHERE {filter} ORDER BY {rank}m.id DESC LIMIT 16")
+            } else {
+                format!(
+                    "{select} JOIN memory_search ON memory_search.rowid=m.id WHERE memory_search MATCH ?1 AND {filter} ORDER BY {rank}bm25(memory_search),m.id DESC LIMIT 16"
+                )
+            };
+            let mut stmt = self.db.prepare(&sql)?;
+            let mut rows = if fts.is_empty() {
+                stmt.query([])?
+            } else {
+                stmt.query([&fts])?
+            };
+            let mut selected = 0;
+            while let Some(row) = rows.next()? {
+                let provenance: Value = serde_json::from_str(&row.get::<_, String>(5)?)?;
+                if executed
+                    && let Some(version) = provenance["version"].as_str()
+                    && versions.contains(version)
+                {
+                    continue;
+                }
+                let value = json!({"id":row.get::<_,i64>(0)?,"at":row.get::<_,i64>(1)?,"kind":row.get::<_,String>(2)?,"text":preview(&row.get::<_,String>(3)?,600),"origin":row.get::<_,String>(4)?,"provenance":provenance,"binding":"historical; reobserve before using any location, menu, entity or inventory claim","native_authority":false});
+                if serde_json::to_vec(&result)?.len() + value.to_string().len() + 2 > 4800 {
+                    continue;
+                }
+                if executed && let Some(version) = value["provenance"]["version"].as_str() {
+                    versions.insert(version.to_owned());
+                }
+                result.push(value);
+                selected += 1;
+                if result.len() == 8 || (executed && selected == 2) {
+                    break;
+                }
             }
         }
         Ok(json!(result))
@@ -192,6 +234,75 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn executed_outcomes_survive_many_exact_goal_unexecuted_files_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.sqlite");
+        let j = Journal::open(&path).unwrap();
+        j.remember_from("skill", "stone pickaxe: block changed, retained inventory unchanged", "program_experiment",
+            &json!({"version":"executed","status":"candidate","native_receipt_references":[{"action_id":"own-finish","kind":"dig"}]})).unwrap();
+        // Duplicate executions must not occupy both reserved source slots.
+        j.remember_from("skill", "stone pickaxe: same program run", "program_experiment",
+            &json!({"version":"executed","status":"candidate","native_receipt_references":[{"action_id":"own-finish","kind":"dig"}]})).unwrap();
+        j.remember_from(
+            "skill",
+            "stone pickaxe: compiler failure",
+            "program_experiment",
+            &json!({"version":"failed","status":"candidate","native_receipt_references":[]}),
+        )
+        .unwrap();
+        for _ in 0..40 {
+            j.remember_from(
+                "skill",
+                "stone pickaxe stone pickaxe stone pickaxe generated file",
+                "historical_program_file",
+                &json!({"version":"unexecuted","status":"file only, not proof of compilation"}),
+            )
+            .unwrap();
+        }
+        j.remember("report", "stone pickaxe requested by a player")
+            .unwrap();
+        drop(j);
+        let j = Journal::open_read_only(&path).unwrap();
+        let result = j.recall("stone pickaxe").unwrap();
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows[0]["origin"], "program_experiment");
+        assert_eq!(rows[0]["provenance"]["version"], "executed");
+        assert_eq!(rows[1]["provenance"]["version"], "failed");
+        assert!(
+            rows.iter()
+                .skip(2)
+                .any(|row| row["origin"] != "program_experiment")
+        );
+        assert!(rows.iter().all(|row| row["native_authority"] == false));
+        assert!(result.to_string().len() <= 4800);
+        assert!(
+            j.recall("unrelated nonexistent subject")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn context_compaction_keeps_priority_prefix_and_exact_evidence_bindings() {
+        let first = json!({"origin":"program_experiment","text":"actual outcome ".repeat(30),
+            "provenance":{"version":"complete-source-version","native_receipt_references":[{"action_id":"exact-own-action-id","kind":"dig"}]},"native_authority":false});
+        let mut rows = vec![first.clone()];
+        rows.extend(
+            (0..7).map(
+                |_| json!({"origin":"historical_program_file","text":"unexecuted ".repeat(60)}),
+            ),
+        );
+        let mut value = json!(rows);
+        fit_view(&mut value, 1000);
+        assert_eq!(value[0], first);
+        assert!(value.to_string().len() <= 1000);
+        assert!(!value.as_array().unwrap().is_empty());
+        fit_view(&mut value, 100);
+        assert_eq!(value[0]["provenance"], first["provenance"]);
+        assert_eq!(value[0]["native_authority"], false);
+    }
     #[test]
     fn different_goal_phrasing_retrieves_labelled_memory_after_restart() {
         let dir = tempfile::tempdir().unwrap();

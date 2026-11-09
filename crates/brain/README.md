@@ -176,6 +176,14 @@ entire goal to occur as one substring. Results retain their origin, instance,
 dimension and historical observation revision. Agent-authored notes remain
 notes even when called facts; remembered locations need fresh observation, and
 live entity/menu/session handles are not retained as reusable observations.
+Recall reserves at most two slots for relevant executed source versions before
+searching general memory. Historical receipt references take priority within
+that pool, while duplicate versions share a slot. These references do not
+establish a reliable skill. Program excerpts lead with exit status, retained
+inventory changes and sampled typed outcomes, rather than Cargo output. Under
+context pressure, saved stdout and the retrievable SDK manual are compacted
+before recalled outcomes are discarded; current observations and action/error
+bindings keep their existing protections.
 
 Rust experiments save content-addressed source before execution and associate
 the version with the resulting client diagnostics. Identical files share storage.
