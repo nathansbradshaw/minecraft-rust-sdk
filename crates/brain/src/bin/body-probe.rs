@@ -23,22 +23,25 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if args.len() != 3 || !matches!(args[1].as_str(), "blocked" | "compile") {
-        return Err("body-probe PRIVATE_CONFIG.json blocked|compile SECONDS | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
+    if args.len() != 3 || !matches!(args[1].as_str(), "blocked" | "compile" | "exposed") {
+        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
     }
     let seconds: u64 = args[2].parse()?;
     if !(1..=600).contains(&seconds) {
         return Err("Diagnostic duration must be 1–600 seconds".into());
     }
     let mut cfg: Config = serde_json::from_slice(&private_read(Path::new(&args[0]), 16384)?)?;
-    cfg.body.enabled = true;
+    // Exposed is a positive pressure control: the same ordinary character and
+    // admission path, deliberately without the independent protective body.
+    cfg.body.enabled = args[1] != "exposed";
+    cfg.conversation = false;
     let mut brain = Brain::open(cfg).await?;
     let started = Instant::now();
     let initial_scene = brain.client.observe().await?;
     brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
         "scope":"Full SDK observation for this diagnostic; body may already be acting. Not an earlier frozen-trial scene.",
         "observation":initial_scene}))?;
-    brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler."}))?;
+    brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"body_enabled":brain.body.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler. Exposed mode is a deliberate no-defense positive control, never an agent success."}))?;
     let run=async {
         if args[1]=="compile" {
             let compiler_started=Instant::now();
@@ -46,6 +49,23 @@ async fn main() -> Result<()> {
             brain.journal.event("body_probe_compiler",json!({"result":result,"elapsed_ms":compiler_started.elapsed().as_millis(),"success_is_not_survival_proof":true}))?;
             // A failed compiler is also a required resilience case. Preserve its
             // error and keep the body running for the declared trial duration.
+        } else if args[1]=="exposed" {
+            let deadline=tokio::time::Instant::from_std(started+Duration::from_secs(seconds));
+            let mut cadence=tokio::time::interval(Duration::from_millis(500));
+            cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _=tokio::time::sleep_until(deadline)=>break,
+                    _=cadence.tick()=>{}
+                }
+                let Ok(observed)=tokio::time::timeout_at(deadline,brain.client.observe()).await else { break; };
+                let observed=observed?;
+                brain.journal.event("exposed_native_sample",json!({"elapsed_ms":started.elapsed().as_millis(),
+                    "revision":observed.revision,"sample_clock":observed.world["sample_clock"],
+                    "health":observed.player["health"],"food":observed.player["food"],
+                    "position":observed.player["position"],"body_enabled":false,"models_called":0}))?;
+            }
         } else {
             // Same caller runtime can remain blocked while the independent body
             // and local gameplay arbiter keep receiving real SDK observations.

@@ -260,6 +260,10 @@ action admission and observed completion. There is one gameplay controller;
 this fallback grants no competing model control or extra model allowance.
 `body-probe` exercises blocked-reasoning and actual-compilation diagnostics;
 `body-probe inspect-observation` replays only the fast policy without acting.
+`body-probe CONFIG exposed SECONDS` deliberately disables protection and samples
+native health on a bounded timer to check actual hostile pressure. Exposed
+controls never count as agent successes. Record weak exposures and timing errors;
+the presence of a hostile alone does not demonstrate a Survival challenge.
 These diagnostics do not establish general Survival competence.
 
 Visible hostile phantoms receive a 32-block warning radius in the replaceable
@@ -267,6 +271,13 @@ body policy rather than the ordinary 10-block melee radius. The body prefers
 approaching observed low collision roofs over increasing open-ground distance.
 Refuge candidates require known clear, supported floor and solid cover over the
 player footprint; unseen shelter and foliage without collision do not qualify.
+Observed extra horizontal roof coverage adds an interior preference, capped at
+one block and computed from continuous collision cover. A covered corner and
+roof interior are not equally protective. This remains a client heuristic:
+flyers may enter from the side, and a roof does not establish invulnerability.
+A visible flyer within 4.5 blocks disables the refuge bonus so it cannot pin the
+body in place during contact-range intrusion. Ordinary supported retreat and
+cooldown-ready defense remain available.
 This preference is disabled for incoming projectiles, primed blasts and burning,
 and cannot reward a landing within 4.5 blocks of another visible melee threat.
 A roof is a route preference, not an immunity or survival guarantee. Normal
