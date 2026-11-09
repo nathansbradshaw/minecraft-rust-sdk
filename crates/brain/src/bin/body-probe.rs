@@ -5,6 +5,7 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+mod probe_admission;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -26,28 +27,50 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if !((args.len() == 3 && matches!(args[1].as_str(), "blocked" | "compile" | "exposed"))
+    if !((matches!(args.len(), 3 | 4)
+        && matches!(args[1].as_str(), "blocked" | "compile" | "exposed"))
         || (args.len() == 4 && args[1] == "navigate"))
     {
-        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
+        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
     }
     let seconds: u64 = args[2].parse()?;
     if !(1..=600).contains(&seconds) {
         return Err("Diagnostic duration must be 1–600 seconds".into());
     }
     let mut cfg: Config = serde_json::from_slice(&private_read(Path::new(&args[0]), 16384)?)?;
+    let admission = if args.len() == 4 && args[1] != "navigate" {
+        Some(probe_admission::Spec::read(Path::new(&args[3]))?)
+    } else {
+        None
+    };
     // Exposed is a positive pressure control: the same ordinary character and
     // admission path, deliberately without the independent protective body.
-    cfg.body.enabled = args[1] != "exposed";
+    let enable_body = args[1] != "exposed";
+    cfg.body.enabled = enable_body && admission.is_none();
     cfg.conversation = false;
+    cfg.await_chat_goal = false;
     let mut brain = Brain::open(cfg).await?;
-    let started = Instant::now();
-    let initial_scene = brain.client.observe().await?;
-    brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
-        "scope":"Full SDK observation for this diagnostic; body may already be acting. Not an earlier frozen-trial scene.",
-        "observation":initial_scene}))?;
-    brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"body_enabled":brain.body.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler. Navigate mode uses an operator-declared traversal with real adapter interval priming. Exposed mode is a deliberate no-defense positive control, never an agent success."}))?;
     let run=async {
+        if let Some(spec)=&admission {
+            brain.observed=probe_admission::wait(&mut brain,spec).await?;
+            brain.cfg.body.enabled=enable_body;
+            if enable_body {
+                for capability in ["minecraft:finite_locomotion","minecraft:survival_facts","minecraft:ranged_observation","minecraft:pending_actions","minecraft:session_material_preservation"] {
+                    if !brain.server.capabilities.iter().any(|c|c==capability) {
+                        return Err(format!("Diagnostic body requires {capability}").into());
+                    }
+                }
+                let profile: minecraft_sdk::Profile=serde_json::from_slice(&private_read(&brain.cfg.profile,16384)?)?;
+                let range=brain.server.limits["finite_move_waypoint_blocks"].as_f64().filter(|v|(0.9..=4.2).contains(v)).unwrap_or(3.5);
+                brain.body=Some(minecraft_sdk_brain::body::Handle::start_with_waypoint_range(profile,brain.cfg.body.clone(),&brain.cfg.state,brain.observed.clone(),range)?);
+            }
+        }
+        let started = Instant::now();
+        let initial_scene = brain.client.observe().await?;
+        brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
+            "scope":"Full SDK observation; body may already be acting. Optional stimulus admission is the earlier start-state witness.",
+            "observation":initial_scene}))?;
+        brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"body_enabled":brain.body.is_some(),"stimulus_admission":admission.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler. Navigate mode uses an operator-declared traversal with real adapter interval priming. Exposed mode is a deliberate no-defense positive control, never an agent success."}))?;
         if args[1]=="compile" {
             let compiler_started=Instant::now();
             let result=tools::terminal(&mut brain,"cargo build --offline --message-format=json").await?;

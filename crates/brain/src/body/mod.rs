@@ -123,7 +123,9 @@ impl Handle {
     ) -> Result<Self> {
         Self::start_with_waypoint_range(profile, cfg, state, initial, 3.5)
     }
-    pub(crate) fn start_with_waypoint_range(
+    /// Start with the server-advertised local waypoint range. Remote admission
+    /// remains authoritative; this only bounds client-side candidate selection.
+    pub fn start_with_waypoint_range(
         profile: Profile,
         cfg: Config,
         state: &Path,
@@ -132,6 +134,10 @@ impl Handle {
     ) -> Result<Self> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         ensure((50..=1000).contains(&cfg.period_ms), "Invalid body cadence")?;
+        ensure(
+            (0.9..=4.2).contains(&finite_waypoint_axis),
+            "Invalid body waypoint range",
+        )?;
         let socket = state.join("actions.sock");
         if socket.exists() {
             let m = fs::symlink_metadata(&socket)?;
