@@ -57,6 +57,29 @@ fn journal_key(instance: &str, actor: &Value, goal: &Goal) -> String {
             .as_bytes(),
     )
 }
+fn classify_slice(result: &mut Value, goal: &Goal) {
+    let transport_ok =
+        result["success"] == true && result["exit_code"] == 0 && result["timed_out"] == false;
+    let status = result["navigation"]["report"]["status"]
+        .as_str()
+        .unwrap_or("error")
+        .to_owned();
+    let resumable =
+        transport_ok && status == "budget_exhausted" && result["navigation"]["error"].is_null();
+    result["success"] = json!(transport_ok && status == "reached");
+    result["navigation_slice"] = json!({"format":"navigation-slice-v1",
+        "completed":result["success"],"can_resume":resumable,"goal":goal,
+        "resume_tool":"navigate","scope":"Local bounded helper outcome, not proof of task completion. A normal slice deadline can resume the same goal/journal; pending IDs are inspected rather than replayed. Investigate unchanged slices without native movement or new read work; do not poll indefinitely."});
+}
+pub(crate) fn resumable_slice(result: &Value) -> bool {
+    result["navigation_slice"]["format"] == "navigation-slice-v1"
+        && result["navigation_slice"]["can_resume"] == true
+        && result["navigation_slice"]["completed"] == false
+        && result["navigation"]["report"]["status"] == "budget_exhausted"
+        && result["navigation"]["error"].is_null()
+        && result["exit_code"] == 0
+        && result["timed_out"] == false
+}
 pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
     ensure(
         brain.body.is_some(),
@@ -110,9 +133,7 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
     match response {
         Ok(response) => {
             result["navigation"] = response;
-            result["success"] = json!(
-                result["success"] == true && result["navigation"]["report"]["status"] == "reached"
-            );
+            classify_slice(&mut result, &request.goal);
         }
         Err(error) => {
             result["success"] = json!(false);
@@ -130,6 +151,64 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_finite_slice_is_resumable_without_becoming_success_or_execution_credit() {
+        let goal: Goal =
+            serde_json::from_value(json!({"kind":"position","dimension":"fixture:world",
+            "target":[10.,64.,0.],"distance":0.5}))
+            .unwrap();
+        let mut result = json!({"success":true,"exit_code":0,"timed_out":false,
+            "navigation":{"report":{"status":"budget_exhausted","pending_action":"existing-id"}},
+            "local_action_feedback":{"requests":[]}});
+        classify_slice(&mut result, &goal);
+        assert!(resumable_slice(&result));
+        assert_eq!(result["success"], false);
+        assert!(!crate::tool_failed(&result));
+        assert!(
+            !crate::progress::executed("navigate", &result, "same", "same"),
+            "A resumable label alone cannot reset the unchanged-inspection guard"
+        );
+        assert_eq!(
+            result["navigation"]["report"]["pending_action"],
+            "existing-id"
+        );
+        let restored: Goal =
+            serde_json::from_value(result["navigation_slice"]["goal"].clone()).unwrap();
+        assert_eq!(restored, goal);
+        for status in [
+            "no_known_route",
+            "target_not_reached",
+            "needs_reconciliation",
+        ] {
+            let mut failure = json!({"success":true,"exit_code":0,"timed_out":false,
+                "navigation":{"report":{"status":status}}});
+            classify_slice(&mut failure, &goal);
+            assert!(!resumable_slice(&failure));
+            assert!(crate::tool_failed(&failure));
+        }
+        for case in [
+            "timeout",
+            "process",
+            "native_rejection",
+            "uncertain",
+            "error",
+        ] {
+            let mut failure = result.clone();
+            match case {
+                "timeout" => failure["timed_out"] = json!(true),
+                "process" => failure["exit_code"] = json!(1),
+                "error" => failure["navigation"]["error"] = json!({"code":"unsupported_version"}),
+                _ => {
+                    failure["local_action_feedback"]["requests"] = json!([{"response":{
+                    "outcome":if case=="uncertain"{"uncertain"}else{"rejected"}}}])
+                }
+            }
+            assert!(
+                crate::tool_failed(&failure),
+                "{case} must retain its failure boundary"
+            );
+        }
+    }
     #[test]
     fn route_journals_are_actor_server_and_goal_bound_not_input_format_bound() {
         let input =

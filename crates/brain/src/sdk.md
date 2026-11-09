@@ -133,6 +133,10 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   use it for a bounded route rather than one model turn per local waypoint.
   Completed read pages survive operation deadlines. Resume the same goal and
   journal; cached pages are validated against the current scene before use.
+  A normal brain-tool slice returns navigation_slice.can_resume=true with its
+  typed goal while success/completed remain false. It is not a tool error or
+  proof of progress. Reuse that goal for continuation rather than discarding the
+  graph; inspect genuine failures and repeated slices without useful new work.
   A read cursor is not gameplay progress, and pending action IDs still require
   inspection/reconciliation rather than replay. The matching adapter prunes
   endpoints that cannot contain a legal player pose before trajectory search.
