@@ -137,7 +137,12 @@ fn main_hand_changed(action: &Action, before: &Observation, after: &Observation)
             }
     ) && before.player["selected"] != after.player["selected"]
 }
-fn proof(action: &Action, before: &Observation, after: &Observation, preparation: Option<&recipes::Preparation>) -> Option<Value> {
+fn proof(
+    action: &Action,
+    before: &Observation,
+    after: &Observation,
+    preparation: Option<&recipes::Preparation>,
+) -> Option<Value> {
     if !same_lane(before, after) {
         return None;
     }
@@ -474,7 +479,12 @@ impl Context {
                     use_start = after.world["game_time"].as_u64();
                 }
                 let released = !is_held || after.player["using_item"] == false;
-                if let Some(effect) = proof(&self.request.action, &self.before, &after, self.preparation.as_ref()) {
+                if let Some(effect) = proof(
+                    &self.request.action,
+                    &self.before,
+                    &after,
+                    self.preparation.as_ref(),
+                ) {
                     self.finish(
                         Outcome::Observed,
                         Some(&after),

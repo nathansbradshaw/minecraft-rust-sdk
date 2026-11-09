@@ -24,6 +24,10 @@ impl Preparation {
         let count = row["result"]["count"].as_u64().unwrap_or(0);
         if !matches!(menu_type, "minecraft:inventory" | "minecraft:crafting")
             || row["type"] != "minecraft:crafting"
+            || !matches!(
+                row["serializer"].as_str(),
+                Some("minecraft:crafting_shaped" | "minecraft:crafting_shapeless")
+            )
             || row["special"] != false
             || row["result_known"] != true
             || !registry_id(item)
@@ -31,44 +35,73 @@ impl Preparation {
             || count == 0
             || count > u64::from(u32::MAX)
         {
-            return Err(ApiError::new(ErrorCode::UnsupportedCapability,
-                "Recipe preparation verification requires a supported crafting menu and a known static result; other menus or dynamic recipes need an adapter"));
+            return Err(ApiError::new(
+                ErrorCode::UnsupportedCapability,
+                "Recipe preparation verification requires a supported crafting menu and a known static result; other menus or dynamic recipes need an adapter",
+            ));
         }
-        Ok(Self { recipe: recipe.into(), menu_id, menu_type: menu_type.into(), item: item.into(), count })
+        Ok(Self {
+            recipe: recipe.into(),
+            menu_id,
+            menu_type: menu_type.into(),
+            item: item.into(),
+            count,
+        })
     }
     pub fn proof(&self, before: &Observation, after: &Observation) -> Option<Value> {
-        if before.menu["menu_id"] != self.menu_id || after.menu["menu_id"] != self.menu_id
-            || before.menu["type"] != self.menu_type || after.menu["type"] != self.menu_type
-        { return None; }
+        if before.menu["menu_id"] != self.menu_id
+            || after.menu["menu_id"] != self.menu_id
+            || before.menu["type"] != self.menu_type
+            || after.menu["type"] != self.menu_type
+        {
+            return None;
+        }
         let before_grid = grid(&before.menu)?;
         let after_grid = grid(&after.menu)?;
         // Inventory pickup, state-ID churn, an unchanged old output, or clearing
         // another recipe are not evidence that this requested recipe is ready.
-        if before_grid == after_grid { return None; }
+        if before_grid == after_grid {
+            return None;
+        }
         let output = after_grid.iter().find(|row| row["slot"] == 0)?;
-        if output["item"] != self.item || output["count"] != self.count
-            || after.menu["slots"].as_array()?.iter().find(|row| row["slot"] == 0)?["may_pickup"] != true
-        { return None; }
-        Some(serde_json::json!({"kind":"recipe_preparation","recipe":self.recipe,
+        if output["item"] != self.item
+            || output["count"] != self.count
+            || after.menu["slots"]
+                .as_array()?
+                .iter()
+                .find(|row| row["slot"] == 0)?["may_pickup"]
+                != true
+        {
+            return None;
+        }
+        Some(
+            serde_json::json!({"kind":"recipe_preparation","recipe":self.recipe,
             "menu_id":self.menu_id,"menu_type":self.menu_type,"output_slot":0,
             "result":{"item":self.item,"count":self.count},
             "verified_fields":["item","count"],"components_verified":false,
             "inventory_acquisition_verified":false,
-            "scope":"Changed native crafting grid with the requested runtime item/count result ready. Output has not been taken; custom component semantics require an adapter."}))
+            "scope":"Changed native crafting grid with the requested runtime item/count result ready. Output has not been taken; custom component semantics require an adapter."}),
+        )
     }
 }
 fn grid(menu: &Value) -> Option<Vec<Value>> {
     let slots = menu["slots"].as_array()?;
-    if slots.is_empty() || slots.len() > 512 { return None; }
+    if slots.is_empty() || slots.len() > 512 {
+        return None;
+    }
     let mut seen = std::collections::BTreeSet::new();
     let mut grid = Vec::new();
     for row in slots {
         let slot = row["slot"].as_u64()?;
-        if !seen.insert(slot) { return None; }
+        if !seen.insert(slot) {
+            return None;
+        }
         if !row["player_inventory"].as_bool()? {
             let item = row["item"].as_str()?;
             let count = row["count"].as_u64()?;
-            if !registry_id(item) || (item == "minecraft:air") != (count == 0) { return None; }
+            if !registry_id(item) || (item == "minecraft:air") != (count == 0) {
+                return None;
+            }
             grid.push(serde_json::json!({"slot":slot,"item":item,"count":count,"components":row["components"]}));
         }
     }
@@ -119,14 +152,18 @@ mod tests {
     fn lookup() -> Value {
         json!({"format":"minecraft-runtime-recipes-v1","complete":true,"unknown_recipe":false,
             "matches":[{"id":"fixture:recipe","known":true,"type":"minecraft:crafting",
-                "special":false,"result_known":true,"result":{"item":"fixture:result","count":4}}]})
+                "serializer":"minecraft:crafting_shaped","special":false,"result_known":true,"result":{"item":"fixture:result","count":4}}]})
     }
     fn observation() -> Observation {
-        Observation { revision:"1".into(),player:json!({}),world:json!({}),
-            menu:json!({"menu_id":0,"state_id":1,"type":"minecraft:inventory","slots":[
+        Observation {
+            revision: "1".into(),
+            player: json!({}),
+            world: json!({}),
+            menu: json!({"menu_id":0,"state_id":1,"type":"minecraft:inventory","slots":[
                 {"slot":0,"item":"fixture:old_output","count":4,"player_inventory":false,"may_pickup":true},
                 {"slot":1,"item":"fixture:raw","count":2,"player_inventory":false,"may_pickup":true},
-                {"slot":36,"item":"minecraft:air","count":0,"player_inventory":true,"may_pickup":true}]}) }
+                {"slot":36,"item":"minecraft:air","count":0,"player_inventory":true,"may_pickup":true}]}),
+        }
     }
     #[test]
     fn cleared_old_recipe_and_unrelated_inventory_are_not_preparation() {
@@ -135,7 +172,7 @@ mod tests {
         let before = observation();
         let bound = Preparation::bind("fixture:recipe", 0, &lookup(), &before).unwrap();
         let mut after = before.clone();
-        for slot in [0,1] {
+        for slot in [0, 1] {
             after.menu["slots"][slot]["item"] = json!("minecraft:air");
             after.menu["slots"][slot]["count"] = json!(0);
         }
@@ -165,33 +202,61 @@ mod tests {
         assert_eq!(proof["kind"], "recipe_preparation");
         assert_eq!(proof["inventory_acquisition_verified"], false);
         assert_eq!(proof["components_verified"], false);
-        for (path,value) in [
-            ("/menu/menu_id",json!(1)),("/menu/type",json!("fixture:menu")),
-            ("/menu/slots/0/item",json!("fixture:wrong")),
-            ("/menu/slots/0/count",json!(3)),("/menu/slots/0/may_pickup",json!(false)),
-            ("/menu/slots/0/player_inventory",json!(true)),("/menu/slots/1/slot",json!(0))
+        for (path, value) in [
+            ("/menu/menu_id", json!(1)),
+            ("/menu/type", json!("fixture:menu")),
+            ("/menu/slots/0/item", json!("fixture:wrong")),
+            ("/menu/slots/0/count", json!(3)),
+            ("/menu/slots/0/may_pickup", json!(false)),
+            ("/menu/slots/0/player_inventory", json!(true)),
+            ("/menu/slots/1/slot", json!(0)),
         ] {
             let mut bad = after.clone();
-            *bad.menu.pointer_mut(path.strip_prefix("/menu").unwrap()).unwrap() = value;
+            *bad.menu
+                .pointer_mut(path.strip_prefix("/menu").unwrap())
+                .unwrap() = value;
             assert!(bound.proof(&before, &bad).is_none(), "accepted {path}");
         }
     }
     #[test]
     fn unsupported_menu_dynamic_result_and_stale_binding_fail_before_dispatch() {
         let before = observation();
-        assert_eq!(Preparation::bind("fixture:recipe", 1, &lookup(), &before).err().unwrap().code, ErrorCode::Conflict);
-        for (path,value) in [("/matches/0/special",json!(true)),
-            ("/matches/0/result_known",json!(false)),("/matches/0/type",json!("fixture:machine")),
-            ("/matches/0/result/count",json!(0)),("/matches/0/result/item",json!("minecraft:air"))] {
+        assert_eq!(
+            Preparation::bind("fixture:recipe", 1, &lookup(), &before)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::Conflict
+        );
+        for (path, value) in [
+            ("/matches/0/special", json!(true)),
+            ("/matches/0/serializer", json!("fixture:custom_dynamic")),
+            ("/matches/0/result_known", json!(false)),
+            ("/matches/0/type", json!("fixture:machine")),
+            ("/matches/0/result/count", json!(0)),
+            ("/matches/0/result/item", json!("minecraft:air")),
+        ] {
             let mut bad = lookup();
             *bad.pointer_mut(path).unwrap() = value;
-            assert_eq!(Preparation::bind("fixture:recipe",0,&bad,&before).err().unwrap().code, ErrorCode::UnsupportedCapability);
+            assert_eq!(
+                Preparation::bind("fixture:recipe", 0, &bad, &before)
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::UnsupportedCapability
+            );
         }
         let mut other = before.clone();
         other.menu["type"] = json!("fixture:unknown");
-        assert_eq!(Preparation::bind("fixture:recipe",0,&lookup(),&other).err().unwrap().code, ErrorCode::UnsupportedCapability);
+        assert_eq!(
+            Preparation::bind("fixture:recipe", 0, &lookup(), &other)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::UnsupportedCapability
+        );
         other.menu["type"] = json!("minecraft:crafting");
-        assert!(Preparation::bind("fixture:recipe",0,&lookup(),&other).is_ok());
+        assert!(Preparation::bind("fixture:recipe", 0, &lookup(), &other).is_ok());
     }
     #[test]
     fn recipe_admission_requires_exact_installed_and_known_identity() {

@@ -40,8 +40,9 @@ in its output slot. Clearing an old recipe, picking up unrelated inventory, or
 changing only the menu revision cannot establish preparation. A prepared result
 receipt has `effect.kind = recipe_preparation` and
 `inventory_acquisition_verified = false`. It verifies item/count metadata, not
-custom component semantics. Unknown menu layouts, non-crafting recipe types,
-special/dynamic results and unavailable result metadata require an adapter and
+custom component semantics. This verifier supports vanilla shaped/shapeless
+serializers, including installed mod recipes using them. Unknown menu layouts,
+other recipe types/serializers, special recipes and unavailable results require an adapter and
 fail explicitly before sending a gameplay packet. An unchanged already prepared
 grid does not establish a new effect; inspect its current output instead of
 replaying the request. Normal lack of an expected output expires within the
