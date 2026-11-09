@@ -21,6 +21,9 @@ fn target(root: &Path, input: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((root, path))
 }
 pub fn read(root: &Path, input: &str) -> Result<Value> {
+    if input.trim_start().starts_with('{') {
+        return read_range(root, input);
+    }
     let (root, path) = target(root, input)?;
     let attempt = || -> Result<Value> {
         let file = fs::File::open(&path)?;
@@ -34,8 +37,9 @@ pub fn read(root: &Path, input: &str) -> Result<Value> {
         ensure(bytes.len() <= 65536, "File grew beyond the read limit")?;
         let mut content = String::from_utf8(bytes)?;
         let total = content.len();
+        let hash = crate::digest(content.as_bytes());
         loop {
-            let answer = json!({"view":"file","workspace":root,"requested_path":input,"path":path,"source_bytes":total,"content_complete":content.len()==total,"content":content,"note":"Relative paths use workspace; use the returned path directly. For omitted content use bounded terminal line/range reads."});
+            let answer = json!({"view":"file","workspace":root,"requested_path":input,"path":path,"source_sha256":hash,"source_bytes":total,"content_complete":content.len()==total,"content":content,"note":"Relative paths use workspace. For missing source use read input JSON {path,start_line,end_line} (1-based inclusive), not another identical full-file read. Use edit with an exact old/new fragment for a local correction."});
             if serde_json::to_vec(&answer)?.len() <= BUDGET {
                 return Ok(answer);
             }
@@ -58,6 +62,59 @@ pub fn read(root: &Path, input: &str) -> Result<Value> {
         )
         .into()
     })
+}
+
+fn read_range(root: &Path, input: &str) -> Result<Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Range {
+        path: String,
+        start_line: usize,
+        end_line: usize,
+    }
+    let range: Range = serde_json::from_str(input)?;
+    ensure(
+        range.start_line > 0
+            && range.end_line >= range.start_line
+            && range.end_line - range.start_line < 200,
+        "Read 1–200 lines using 1-based inclusive start_line/end_line",
+    )?;
+    let (_, path) = target(root, &range.path)?;
+    let file = fs::File::open(&path)?;
+    ensure(
+        file.metadata()?.is_file() && file.metadata()?.len() <= 65536,
+        "Bounded regular source file required",
+    )?;
+    let mut bytes = Vec::new();
+    file.take(65537).read_to_end(&mut bytes)?;
+    ensure(bytes.len() <= 65536, "File grew beyond read limit")?;
+    let source = String::from_utf8(bytes)?;
+    let lines: Vec<_> = source.split_inclusive('\n').collect();
+    ensure(
+        range.start_line <= lines.len(),
+        "Start line is beyond the current file; inspect source hash and line count",
+    )?;
+    let end = range.end_line.min(lines.len());
+    let mut content = String::new();
+    let mut returned_end = range.start_line - 1;
+    loop {
+        let answer = json!({"view":"file_range","path":path,"source_sha256":crate::digest(source.as_bytes()),"source_bytes":source.len(),"total_lines":lines.len(),"start_line":range.start_line,"end_line":returned_end,"requested_end_line":range.end_line,"range_complete":returned_end==end,"next_line":if returned_end<end {Some(returned_end+1)} else {None},"content":content,"note":"Exact source lines for this hash; ranges from a changed hash must be read again. Use edit with an unambiguous old/new fragment, then run the changed program."});
+        if returned_end == end {
+            return Ok(answer);
+        }
+        let line = lines[returned_end];
+        let mut next = answer.clone();
+        next["content"] = json!(format!("{content}{line}"));
+        if next.to_string().len() + 64 > BUDGET {
+            ensure(
+                returned_end >= range.start_line,
+                "One source line exceeds the view budget; use a bounded terminal character slice",
+            )?;
+            return Ok(answer);
+        }
+        content.push_str(line);
+        returned_end += 1;
+    }
 }
 pub fn list(root: &Path, input: &str) -> Result<Value> {
     let (root, path) = target(root, if input.is_empty() { "." } else { input })?;
@@ -134,6 +191,59 @@ pub fn manifest_hint(root: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ranged_source_reads_reach_omitted_lines_and_bind_pages_to_source_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = (1..=180)
+            .map(|n| format!("line{n}: {}\n", "λ".repeat(30)))
+            .collect::<String>();
+        fs::write(dir.path().join("source.rs"), &source).unwrap();
+        let first = read(dir.path(), "source.rs").unwrap();
+        assert_eq!(first["content_complete"], false);
+        let mut line = 100;
+        let mut complete = String::new();
+        loop {
+            let page = read(
+                dir.path(),
+                &json!({"path":"source.rs","start_line":line,"end_line":180}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(page["source_sha256"], crate::digest(source.as_bytes()));
+            assert!(page.to_string().len() <= BUDGET);
+            complete.push_str(page["content"].as_str().unwrap());
+            if page["range_complete"] == true {
+                break;
+            }
+            let next = page["next_line"].as_u64().unwrap();
+            assert!(next > line);
+            line = next;
+        }
+        assert_eq!(
+            complete,
+            source.split_inclusive('\n').skip(99).collect::<String>()
+        );
+        assert!(
+            read(
+                dir.path(),
+                r#"{"path":"source.rs","start_line":0,"end_line":1}"#
+            )
+            .is_err()
+        );
+        assert!(
+            read(
+                dir.path(),
+                r#"{"path":"source.rs","start_line":1,"end_line":201}"#
+            )
+            .is_err()
+        );
+        assert!(
+            read(
+                dir.path(),
+                r#"{"path":"source.rs","start_line":181,"end_line":182}"#
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn large_listings_and_unicode_file_previews_have_honest_bounds() {
         let root = tempfile::tempdir().unwrap();

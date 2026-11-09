@@ -118,7 +118,7 @@ pub struct Choice {
     #[serde(default)]
     pub experiment: bool,
 }
-pub const TOOLS: [&str; 18] = [
+pub const TOOLS: [&str; 19] = [
     "develop",
     "observe",
     "query",
@@ -128,6 +128,7 @@ pub const TOOLS: [&str; 18] = [
     "reconcile",
     "read",
     "write",
+    "edit",
     "list",
     "search",
     "terminal",
@@ -149,7 +150,7 @@ pub(crate) fn validate_choice(choice: &Choice) -> Result<()> {
     )
 }
 pub fn schema() -> Value {
-    json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, compilation, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual tool input: Rust source for write, command for terminal, binary name for run, serialized typed action for sdk."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
+    json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, compilation, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual input: Rust source for write; JSON old/new/expected_sha256 for edit; path or JSON path/start_line/end_line for read; shell command for terminal; binary name for run; typed action JSON for sdk."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write/edit; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
 fn session_schema(development: bool) -> Value {
     let mut schema = schema();

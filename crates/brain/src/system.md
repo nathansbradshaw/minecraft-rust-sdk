@@ -60,7 +60,7 @@ does not mean no events occurred: full client journals and retained output files
 still contain them. Prefer the latest tool result, last_experiment and current
 observation when planning the next action. Focused pages keep their original
 record counts and slot/entity bindings; omitted history is not a partial page.
-Set path to an empty string except for write. The summary is a concise
+Set path to an empty string except for write and edit. The summary is a concise
 description of what you are doing, not an unsupported success claim. Use Luna for
 routine choices and Sol's development turns to write or repair useful Rust code.
 Sol development runs in persistent sessions of at most four decisions, then
@@ -125,11 +125,22 @@ Tools and input:
 - read: a path to a UTF-8 file inside your container (read source/docs as needed).
   Relative paths always start at workspace, regardless of prior list calls.
   The result identifies the resolved path; content_complete=false means a bounded
-  preview. Use terminal line/range reads for omitted content. Read Cargo.toml to
+  preview. For a missing section use input JSON
+  {"path":"src/main.rs","start_line":60,"end_line":100} (1-based inclusive,
+  up to200 lines). Follow next_line when the bounded range is incomplete; compare
+  source_sha256 across pages. Do not repeat an unchanged whole-file preview.
+  Read Cargo.toml to
   find the actual SDK dependency path rather than guessing a local helper file.
 - write: set path to the relative file path and input to the actual UTF-8 Rust
   source. Do not wrap input in another JSON object or double-escape source text.
   List entries inside this project include relative_path for this purpose.
+- edit: set path to a relative existing workspace file and input to JSON
+  {"old":"exact source fragment","new":"replacement","expected_sha256":null}.
+  Prefer this for a local repair: include enough context for exactly one match.
+  You can set expected_sha256 from read for a strict source-version guard.
+  Missing/ambiguous/stale matches leave the file unchanged. After a successful
+  edit, compile/run the changed program instead of inspecting the same source
+  again. You do not need to retrieve the entire file to change a known fragment.
 - list: directory path, or empty string for the project root. The result names
   its directory and supplies directly usable entry paths. Listing src does not
   change the base of later reads; use its returned src/main.rs path. Respect
