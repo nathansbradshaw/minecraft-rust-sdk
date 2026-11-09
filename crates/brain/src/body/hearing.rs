@@ -35,6 +35,11 @@ impl Memory {
         let tick = frame.sample_game_time;
         let changed = self.scope.as_ref().is_some_and(|old| old != &scope)
             || self.tick.is_some_and(|old| tick < old);
+        // A new native audio epoch already fences the prior connection/life.
+        // Its recent emissions may precede this body's first poll and are valid.
+        // Within a retained stream, a changed life must not inherit old cues.
+        let discard_prior_life =
+            changed && self.scope.as_ref().is_some_and(|old| old.3 == frame.epoch);
         if changed {
             self.facts.clear();
             self.hazards.clear();
@@ -52,7 +57,7 @@ impl Memory {
             self.facts.extend(
                 fresh
                     .iter()
-                    .filter(|sound| !changed || sound.game_time >= tick)
+                    .filter(|sound| !discard_prior_life || sound.game_time >= tick)
                     .cloned(),
             );
             if self.facts.len() > 32 {
@@ -64,7 +69,7 @@ impl Memory {
                 fresh
                     .iter()
                     .filter(|sound| {
-                        (!changed || sound.game_time >= tick)
+                        (!discard_prior_life || sound.game_time >= tick)
                             && matches!(
                                 sound.sound_id.as_str(),
                                 "minecraft:entity.creeper.primed" | "minecraft:entity.tnt.primed"
@@ -302,5 +307,22 @@ mod tests {
         .unwrap();
         assert!(error.to_string().contains(auditory::CAPABILITY));
         assert!(!root.path().join("actions.sock").exists());
+    }
+    #[test]
+    fn reconnect_keeps_a_recent_cue_delivered_in_the_new_native_epoch() {
+        let mut memory = Memory::default();
+        memory
+            .update(&mut scene(100, "minecraft:block.glass.step"))
+            .unwrap();
+        let mut reconnected = scene(104, "minecraft:entity.creeper.primed");
+        reconnected.player["entity_id"] = json!(2);
+        reconnected.world["auditory"]["epoch"] = json!("new-connection");
+        reconnected.world["auditory"]["events"][0]["game_time"] = json!(102);
+        memory.update(&mut reconnected).unwrap();
+        assert_eq!(blasts(&reconnected).len(), 1);
+        assert_eq!(
+            reconnected.world["client_hearing"]["hypotheses"][0]["emission_game_time"],
+            102
+        );
     }
 }
