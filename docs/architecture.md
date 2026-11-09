@@ -231,7 +231,7 @@ This client cost guard is not a trusted security or gameplay-authority boundary.
 
 For an explicit operator-owned conformance character, `handoff-probe-worker`
 injects seven bounded fixture choices in a fresh workspace: select an empty
-hotbar slot, click observed nearby dirt or grass with that empty hand, spend four
+hotbar slot, click an observed nearby noninteractive vanilla block with that empty hand, spend four
 investigation decisions on unchanged observations, and request the exact failed
 click once more to test the local fence. It then delegates to the ordinary
 allocated model worker to perform the requested task. It never supplies a task
