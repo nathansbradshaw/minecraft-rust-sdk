@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     let before = client.observe().await?;
     if before.player["on_ground"] != true
         || before.player["sprinting"] != true
-        || before.player["health"] != 20
+        || before.player["health"].as_f64() != Some(20.)
     {
         return Err("Fresh healthy grounded sprinting fixture required".into());
     }
