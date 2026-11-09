@@ -550,9 +550,12 @@ pub(super) fn evade_with_native(
     if !burning
         && !projectile_danger
         && !blast_escape
-        && let Some(route) = cover::approach(o, blocked, waypoint_axis)
+        && let Some(plan) = cover::plan(o, blocked, waypoint_axis)
     {
-        return Some(route);
+        return match plan {
+            cover::Plan::Move(route) => Some(route),
+            cover::Plan::Hold => None,
+        };
     }
     // Begin approaching observed refuge before a dive reaches melee range.
     // Only safe, supported floor centres participate; no unseen shelter is invented.
@@ -933,7 +936,7 @@ mod tests {
             .unwrap()
             .retain(|b| b["position"][0].as_i64().unwrap() >= -2);
         assert!(
-            cover::approach(&unknown, &[], 3.5).is_none(),
+            cover::plan(&unknown, &[], 3.5).is_none(),
             "Unknown space behind wall is not a cover route"
         );
         o.world["entities"]
@@ -942,8 +945,49 @@ mod tests {
             .push(json!({"visible":true,"hostile":true,
             "ranged_attack":false,"position":[2.5,1.,0.5]}));
         assert!(
-            cover::approach(&o, &[], 3.5).is_none(),
+            cover::plan(&o, &[], 3.5).is_none(),
             "Mixed melee threat retains urgent evasion"
+        );
+    }
+    #[test]
+    fn guarded_retreat_stays_beside_the_wall_and_settles_without_repeated_actions() {
+        let mut o = world();
+        o.player = json!({"position":[-0.5,1.,-1.5],"on_ground":true});
+        o.world["entities"] = json!([{"visible":false,"hostile":true,"ranged_attack":true,
+            "position":[11.5,1.,-2.8],"client_memory":{"kind":"last_visible_ranged_threat"}}]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&b["position"]).unwrap();
+            if p[0] == 0. && (1. ..=3.).contains(&p[1]) && (-2. ..=2.).contains(&p[2]) {
+                b["block"] = json!("minecraft:stone_bricks");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let first = evade(&o).expect("Guard toward far end while archer is hidden");
+        assert!(
+            (first.target.x + 0.5).abs() < 0.01 && first.target.z > 0.5,
+            "{first:?}"
+        );
+        assert!(!first.cover_path.is_empty());
+        assert!(!can_pass_waypoint(&o, &first));
+        o.player["position"] = json!([first.target.x, first.target.y, first.target.z]);
+        for _ in 0..3 {
+            let Some(route) = evade(&o) else {
+                break;
+            };
+            assert!(
+                (route.target.x + 0.5).abs() < 0.01,
+                "Do not drift away from cover: {route:?}"
+            );
+            assert!(covered(
+                [route.target.x, route.target.y, route.target.z],
+                [11.5, 1., -2.8],
+                &boxes(&o)
+            ));
+            o.player["position"] = json!([route.target.x, route.target.y, route.target.z]);
+        }
+        assert!(
+            evade(&o).is_none(),
+            "A good guard position does not submit zero-distance controls repeatedly"
         );
     }
     #[test]

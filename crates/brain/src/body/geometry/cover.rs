@@ -41,7 +41,11 @@ fn shielded(p: [f64; 3], enemies: &[[f64; 3]], screens: &[[f64; 6]]) -> bool {
 }
 /// All points and transitions remain supported by the current observation.
 /// This predicts occlusion, not future enemy behavior or verified protection.
-pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<Escape> {
+pub(super) enum Plan {
+    Move(Escape),
+    Hold,
+}
+pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<Plan> {
     if o.player["on_ground"] != true || o.player["in_water"] == true || o.player["in_lava"] == true
     {
         return None;
@@ -79,9 +83,32 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
         .copied()
         .filter(|b| b[4] > start[1] + 0.3 && b[1] < start[1] + 1.8)
         .collect();
-    if screens.is_empty() || shielded(start, &enemies, &screens) {
+    if screens.is_empty() {
         return None;
     }
+    let guarding = shielded(start, &enemies, &screens);
+    let adjacent = |p: [f64; 3]| {
+        screens
+            .iter()
+            .any(|b| (p[0] - p[0].clamp(b[0], b[3])).hypot(p[2] - p[2].clamp(b[2], b[5])) <= 0.85)
+    };
+    let shadow_segment = |a: [f64; 3], b: [f64; 3]| {
+        let steps = ((a[0] - b[0]).hypot(a[2] - b[2]) * 4.).ceil().max(1.) as u32;
+        (0..=steps).all(|n| {
+            let t = f64::from(n) / f64::from(steps);
+            shielded(
+                std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t),
+                &enemies,
+                &screens,
+            )
+        })
+    };
+    let separation = |p: [f64; 3]| {
+        enemies
+            .iter()
+            .map(|e| (p[0] - e[0]).hypot(p[2] - e[2]))
+            .fold(24., f64::min)
+    };
     let mut nodes = vec![start];
     for x in -4..=4 {
         for z in -4..=4 {
@@ -97,6 +124,7 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
                     .all(|e| (p[0] - e[0]).hypot(p[2] - e[2]) >= 4.5)
                 && clear(&cells, p, &obstacles)
                 && supported(&cells, p, &obstacles)
+                && (!guarding || shielded(p, &enemies, &screens))
             {
                 nodes.push(p);
             }
@@ -107,14 +135,27 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
     let mut visited = vec![false; nodes.len()];
     distance[0] = 0.;
     let mut goal = None;
+    let mut best_guard = f64::NEG_INFINITY;
     for _ in 0..nodes.len() {
-        let current = (0..nodes.len())
+        let Some(current) = (0..nodes.len())
             .filter(|&i| !visited[i] && distance[i] <= 8.)
-            .min_by(|&a, &b| distance[a].total_cmp(&distance[b]))?;
-        visited[current] = true;
-        if current != 0 && shielded(nodes[current], &enemies, &screens) {
-            goal = Some(current);
+            .min_by(|&a, &b| distance[a].total_cmp(&distance[b]))
+        else {
             break;
+        };
+        visited[current] = true;
+        if shielded(nodes[current], &enemies, &screens) {
+            if !guarding && current != 0 {
+                goal = Some(current);
+                break;
+            }
+            if guarding && adjacent(nodes[current]) {
+                let value = separation(nodes[current]) - distance[current] * 0.15;
+                if value > best_guard {
+                    best_guard = value;
+                    goal = Some(current);
+                }
+            }
         }
         for next in 1..nodes.len() {
             if visited[next] {
@@ -126,13 +167,20 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
                 && distance[current] + length < distance[next]
                 && avoids_contact(nodes[current], nodes[next], &enemies)
                 && segment(&cells, &obstacles, nodes[current], nodes[next])
+                && (!guarding || shadow_segment(nodes[current], nodes[next]))
             {
                 distance[next] = distance[current] + length;
                 previous[next] = Some(current);
             }
         }
     }
+    if guarding && adjacent(start) && best_guard <= separation(start) + 0.15 {
+        return Some(Plan::Hold);
+    }
     let mut at = goal?;
+    if at == 0 {
+        return Some(Plan::Hold);
+    }
     let mut path = vec![nodes[at]];
     while let Some(parent) = previous[at] {
         if parent == 0 {
@@ -148,15 +196,21 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
             && (p[0] - start[0]).hypot(p[2] - start[2]) >= 0.35
             && avoids_contact(start, p, &enemies)
             && segment(&cells, &obstacles, start, p)
+            && (!guarding || shadow_segment(start, p))
     })?;
-    Some(Escape {
+    Some(Plan::Move(Escape {
         target: Position {
             x: target[0],
             y: target[1],
             z: target[2],
         },
         jump: false,
-        reason: "approach observed ranged cover around a supported corner".into(),
+        reason: if guarding {
+            "maintain guarded position beside observed ranged cover"
+        } else {
+            "approach observed ranged cover around a supported corner"
+        }
+        .into(),
         cover_path: path
             .into_iter()
             .map(|p| Position {
@@ -165,7 +219,7 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
                 z: p[2],
             })
             .collect(),
-    })
+    }))
 }
 
 #[cfg(test)]
