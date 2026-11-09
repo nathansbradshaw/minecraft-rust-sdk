@@ -358,7 +358,7 @@ impl Journal {
         let requested_page = (value["tool"] == "observe"
             && matches!(
                 value["result"]["view"].as_str(),
-                Some("blocks" | "entities" | "menu" | "inventory")
+                Some("blocks" | "entities" | "menu" | "inventory" | "terrain")
             )
             && value["result"]["page"].is_object())
             || (value["tool"] == "query" && value["result"]["view"] == "capability_query");
@@ -2371,7 +2371,7 @@ mod tests {
         };
         observation.world["blocks"] = json!((0..64).map(|n|json!({"position":[n,64,9],"block":format!("custom:{}{n}","resource".repeat(24)),"state":"properties".repeat(20),"may_interact":true,"collision":[[0,0,0,1,1,1]]})).collect::<Vec<_>>());
         observation.world["entities"] = json!((0..64).map(|n|json!({"entity_id":n,"type":"minecraft:item","position":[n,64,9],"item":{"item":format!("custom:{}{n}","resource".repeat(24)),"count":2}})).collect::<Vec<_>>());
-        for view in ["blocks", "entities", "menu", "inventory"] {
+        for view in ["blocks", "entities", "menu", "inventory", "terrain"] {
             let page =
                 views::focused(&observation, &json!({"view":view,"limit":32}).to_string()).unwrap();
             j.event("tool_result", json!({"tool":"observe","result":page}))

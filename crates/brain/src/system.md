@@ -98,7 +98,10 @@ Tools and input:
   describes quota fallback. You can write and run code directly with Luna when
   Sol is unavailable; another develop request cannot replenish an allowance.
 - observe: empty string for the compact SDK overview. For focused current facts,
-  pass JSON {"view":"menu|inventory|entities|blocks","offset":0,"limit":16}.
+  pass JSON {"view":"menu|inventory|entities|blocks|terrain","offset":0,"limit":16}.
+  Terrain groups the nine nearby columns into support/feet/head/above-head cells.
+  Use it to investigate exhausted local navigation; omitted cells are unknown.
+  Another distant target cannot by itself open a locally exhausted graph.
   Select one view name; limit is 1..32. Optional match_id is an exact runtime ID
   (entity type, block ID or item ID). For example, view entities with match_id
   minecraft:item returns currently observed loot rather than old arrows. Menu
