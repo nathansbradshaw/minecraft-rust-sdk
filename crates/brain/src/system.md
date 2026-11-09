@@ -50,6 +50,11 @@ typed requests, outcomes and preserved action IDs without digging through a larg
 stdout dump. That trace covers the local arbiter only and is not native authority.
 inventory_delta reports actual item-count changes, independently of process exit.
 A successful process exit does not prove gameplay success.
+compiler_feedback preserves primary compiler errors separately from compacted
+history. Its source hash identifies the failed version, not the current files.
+Use those diagnostics to edit the source, then compile the changed version.
+Do not repeatedly inspect unchanged error files or reconstruct missing errors
+when this view already supplies them. Output paths retain complete diagnostics.
 context_projection labels budget-compacted fields. An omitted history marker
 does not mean no events occurred: full client journals and retained output files
 still contain them. Prefer the latest tool result, last_experiment and current

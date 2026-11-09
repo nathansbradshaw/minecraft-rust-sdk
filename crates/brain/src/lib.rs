@@ -137,7 +137,7 @@ fn conversation_default() -> bool {
     true
 }
 fn model_context_contract(instructions: &str) -> String {
-    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v2/bounded-investigation-routing-v2/native-navigation-feedback-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v3/compiler-error-view-v1/bounded-investigation-routing-v2/native-navigation-feedback-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
@@ -435,6 +435,10 @@ impl Journal {
         let signature = progress::experiment_signature(source, result);
         let novel = self.get("experiment_signature")?.as_deref() != Some(signature.as_str());
         let mut saved = json!({"tool":choice.tool,"command":choice.input,"summary":choice.summary,"source_sha256":source,"goal_revision":goal_revision,"signature":signature,"result":result,"authority":"container diagnostics, not benchmark/native certification"});
+        let compiler = feedback::compiler_view(&saved);
+        if !compiler.is_null() {
+            self.set("compiler_feedback", &compiler.to_string())?;
+        }
         compact_history(&mut saved);
         bound_value(&mut saved, 8192);
         self.set("last_experiment", &saved.to_string())?;
@@ -1063,6 +1067,9 @@ impl Brain {
                 .get("last_experiment")?
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                 .unwrap_or(Value::Null);
+            context["compiler_feedback"] = self
+                .journal
+                .compiler_feedback(&self.journal.get("goal_revision")?.unwrap_or_default())?;
             fit_context(&mut context)?;
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
@@ -1463,6 +1470,8 @@ pub fn replay_context(journal: &Journal, context: &mut Value) -> Result<Value> {
             .unwrap_or(Value::Null);
     }
     context["working_notes"] = json!(journal.get("working_notes")?);
+    context["compiler_feedback"] =
+        journal.compiler_feedback(&journal.get("goal_revision")?.unwrap_or_default())?;
     let sizes = |v: &Value| -> Value {
         v.as_object()
             .map(|o| {
