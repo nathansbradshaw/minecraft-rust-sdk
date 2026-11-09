@@ -201,6 +201,23 @@ impl Journal {
         self.select_goal_checked(goal, kind, data, player_request, None)?
             .ok_or_else(|| "Unconditional goal selection failed".into())
     }
+    /// Explicit configured work needs the same durable scope as player tasks.
+    /// Waiting-for-chat controllers must retain their admission boundary.
+    fn activate_configured_goal(&self, configured: &str, await_chat_goal: bool) -> Result<()> {
+        if !await_chat_goal
+            && self
+                .get("goal_revision")?
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            let goal = self.get("goal")?.unwrap_or_else(|| configured.to_owned());
+            self.select_goal(&goal, "configured_goal_activated", json!({
+                "goal":goal,"source":"explicit controller configuration or preserved unrevisioned task",
+                "allowances_changed":false,"native_actions_replayed":false
+            }), None)?;
+        }
+        Ok(())
+    }
     fn select_goal_checked(
         &self,
         goal: &str,
@@ -640,6 +657,7 @@ impl Brain {
         use std::io::Read;
         fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
         let run_id = digest(&random)[..24].to_owned();
+        journal.activate_configured_goal(&cfg.goal, cfg.await_chat_goal)?;
         let goal = journal.get("goal")?.unwrap_or_else(|| cfg.goal.clone());
         let mut profile: Profile = serde_json::from_slice(&private_read(&cfg.profile, 16384)?)?;
         let actor_lock = ownership::acquire(
@@ -1647,6 +1665,63 @@ fn tool_failed(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_goal_gets_one_durable_revision_and_can_complete_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("brain.sqlite")).unwrap();
+        journal
+            .activate_configured_goal("collect wood", false)
+            .unwrap();
+        let revision = journal.get("goal_revision").unwrap().unwrap();
+        assert!(!revision.is_empty());
+        assert_eq!(
+            journal.get("goal").unwrap().as_deref(),
+            Some("collect wood")
+        );
+        journal.set("inspection_streak", "7").unwrap();
+        journal
+            .activate_configured_goal("a different configured default", false)
+            .unwrap();
+        assert_eq!(
+            journal.get("goal_revision").unwrap().as_deref(),
+            Some(revision.as_str())
+        );
+        assert_eq!(
+            journal.get("goal").unwrap().as_deref(),
+            Some("collect wood")
+        );
+        assert_eq!(
+            journal.get("inspection_streak").unwrap().as_deref(),
+            Some("7")
+        );
+        assert!(journal.complete_goal("collect wood", &revision).unwrap());
+        journal
+            .activate_configured_goal("collect wood", false)
+            .unwrap();
+        assert!(journal.goal_completed("collect wood").unwrap());
+    }
+    #[test]
+    fn configured_goal_activation_preserves_legacy_text_and_chat_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("brain.sqlite")).unwrap();
+        journal.activate_configured_goal("wait", true).unwrap();
+        assert!(journal.get("goal").unwrap().is_none());
+        assert!(journal.get("goal_revision").unwrap().is_none());
+        journal.set("goal", "preserved task").unwrap();
+        journal.set("goal_revision", "").unwrap();
+        journal
+            .activate_configured_goal("different default", true)
+            .unwrap();
+        assert_eq!(journal.get("goal_revision").unwrap().as_deref(), Some(""));
+        journal
+            .activate_configured_goal("different default", false)
+            .unwrap();
+        assert_eq!(
+            journal.get("goal").unwrap().as_deref(),
+            Some("preserved task")
+        );
+        assert!(!journal.get("goal_revision").unwrap().unwrap().is_empty());
+    }
     #[test]
     fn final_turn_read_failure_gets_one_persistent_feedback_opportunity() {
         let dir = tempfile::tempdir().unwrap();
