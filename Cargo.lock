@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "minecraft-sdk-java-1-21-1"
-version = "0.1.0-alpha.13"
+version = "0.1.0-alpha.14"
 dependencies = [
  "libc",
  "minecraft-sdk-core",

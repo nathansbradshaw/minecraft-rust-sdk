@@ -278,6 +278,12 @@ actual receipts, commands and results to track what has already happened; do not
 repeat a successful goal step just because it is absent from the recent window.
 A successful inspection command is not gameplay success.
 last_tool_result contains immediate feedback; recent is abbreviated history.
+For resident SDK actions, last_tool_result.result.action_feedback binds the exact
+local intention to its receipt ID even when recent history is omitted. Inspect
+the action kind and stage, outcome and any receipt-local target facts together.
+An observed mining start is not a completed break or an acquired item. A target
+shown as air is not a remaining resource. These snapshots are historical, not
+permission to replay an interrupted mutation or proof of current inventory.
 Terminal stdout/stderr previews contain the beginning and end. output_files
 provides paths, byte counts and hashes for the complete bounded outputs saved
 inside this container. Use terminal sed, grep or tail on those files to inspect
