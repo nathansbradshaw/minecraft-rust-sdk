@@ -228,7 +228,9 @@ async fn main() -> Result<()> {
         &mut file,
         json!({"event":"cancelled","receipt":cancelled,"cancel":cancel}),
     )?;
-    if cancelled.outcome != Outcome::Cancelled
+    if cancel.outcome != Outcome::Observed
+        || cancel.evidence["native_effect_verified"] != true
+        || cancelled.outcome != Outcome::Cancelled
         || cancelled.evidence["input_released"] != true
         || cancelled.evidence["native_effect_verified"] != false
     {
