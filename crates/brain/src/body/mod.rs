@@ -132,6 +132,51 @@ impl Handle {
         initial: Observation,
         finite_waypoint_axis: f64,
     ) -> Result<Self> {
+        Self::start_with_controls(profile, cfg, state, initial, finite_waypoint_axis, false)
+    }
+    /// Use capabilities already discovered by the owning controller; no extra
+    /// network request delays the first defensive reaction.
+    pub fn start_for_server(
+        profile: Profile,
+        cfg: Config,
+        state: &Path,
+        initial: Observation,
+        server: &ServerInfo,
+    ) -> Result<Self> {
+        ensure(
+            profile.instance_id == server.instance_id,
+            "Body server instance mismatch",
+        )?;
+        for capability in [
+            "minecraft:finite_locomotion",
+            "minecraft:survival_facts",
+            "minecraft:ranged_observation",
+            "minecraft:pending_actions",
+            "minecraft:session_material_preservation",
+        ] {
+            ensure(
+                server.capabilities.iter().any(|c| c == capability),
+                &format!("Default Survival brain requires {capability}"),
+            )?;
+        }
+        let range = server.limits["finite_move_waypoint_blocks"]
+            .as_f64()
+            .filter(|v| (0.9..=4.2).contains(v))
+            .unwrap_or(3.5);
+        let through = server
+            .capabilities
+            .iter()
+            .any(|c| c == "minecraft:waypoint_passthrough");
+        Self::start_with_controls(profile, cfg, state, initial, range, through)
+    }
+    fn start_with_controls(
+        profile: Profile,
+        cfg: Config,
+        state: &Path,
+        initial: Observation,
+        finite_waypoint_axis: f64,
+        through: bool,
+    ) -> Result<Self> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         ensure((50..=1000).contains(&cfg.period_ms), "Invalid body cadence")?;
         ensure(
@@ -195,7 +240,7 @@ impl Handle {
                         let journal = Journal::open(&journal)?;
                         let listener = tokio::net::UnixListener::from_std(listener)?;
                         tokio::select! {
-                            r=controller(client.clone(),cfg,active.clone(),stopped,&journal,finite_waypoint_axis)=>r,
+                            r=controller(client.clone(),cfg,active.clone(),stopped,&journal,finite_waypoint_axis,through)=>r,
                             r=serve(listener,client,active.clone())=>r,
                         }
                     })
@@ -332,6 +377,7 @@ async fn proxy(
                 && !matches!(
                     request.request.action,
                     Action::StartMove { .. }
+                        | Action::StartMoveThrough { .. }
                         | Action::CancelControl { .. }
                         | Action::CancelUseItem { .. }
                 )
@@ -388,6 +434,7 @@ async fn controller(
     stop: Arc<AtomicBool>,
     j: &Journal,
     finite_waypoint_axis: f64,
+    through_supported: bool,
 ) -> Result<()> {
     let mut entropy = [0u8; 16];
     std::io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut entropy)?;
@@ -652,16 +699,58 @@ async fn controller(
                         *shared.reason.lock().map_err(|_| "Body state unavailable")? =
                             route.reason.clone();
                         let dispatch_started = Instant::now();
-                        let r = send(
-                            &client,
-                            j,
+                        let ranged_only =
+                            observed.world["entities"]
+                                .as_array()
+                                .is_some_and(|entities| {
+                                    let mut ranged = false;
+                                    for e in entities
+                                        .iter()
+                                        .filter(|e| e["visible"] == true && e["hostile"] == true)
+                                    {
+                                        if e["ranged_attack"] != true {
+                                            return false;
+                                        }
+                                        ranged = true;
+                                    }
+                                    ranged
+                                });
+                        let through = through_supported
+                            && ranged_only
+                            && !burning
+                            && geometry::can_pass_waypoint(&observed, &route);
+                        let action = if through {
+                            Action::StartMoveThrough {
+                                target: route.target.clone(),
+                                max_ticks: 60,
+                            }
+                        } else {
                             Action::StartMove {
-                                target: route.target,
+                                target: route.target.clone(),
                                 jump: route.jump,
                                 max_ticks: 60,
-                            },
-                        )
-                        .await?;
+                            }
+                        };
+                        let mut r = send(&client, j, action).await?;
+                        // A definite pre-dispatch capability refusal can use
+                        // the precise alternative. Never replay uncertain input.
+                        if through
+                            && r.outcome == Outcome::Rejected
+                            && r.error
+                                .as_ref()
+                                .is_some_and(|e| e.code == ErrorCode::UnsupportedCapability)
+                        {
+                            r = send(
+                                &client,
+                                j,
+                                Action::StartMove {
+                                    target: route.target,
+                                    jump: route.jump,
+                                    max_ticks: 60,
+                                },
+                            )
+                            .await?;
+                        }
                         let dispatched_id = r.action_id.clone();
                         if r.outcome == Outcome::Running {
                             owned_control = dispatched_id.clone();

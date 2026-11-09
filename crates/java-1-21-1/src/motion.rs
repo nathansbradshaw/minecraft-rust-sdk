@@ -228,12 +228,24 @@ fn arrived(body: &Body, target: [f64; 3], needs_jump: bool, medium: Medium) -> b
         && (medium == Medium::Air || body.velocity[1].abs() < 0.025)
         && (body.on_ground || medium != Medium::Air)
 }
+/// Passage is a native pose beyond the waypoint plane within a narrow level
+/// corridor, not a claim that the character stopped at the exact coordinate.
+fn crossed(position: [f64; 3], origin: [f64; 3], target: [f64; 3]) -> bool {
+    let dx = target[0] - origin[0];
+    let dz = target[2] - origin[2];
+    let length = dx.hypot(dz);
+    length >= 0.2
+        && (position[0] - target[0]) * dx + (position[2] - target[2]) * dz >= 0.
+        && ((position[0] - origin[0]) * dz - (position[2] - origin[2]) * dx).abs() / length <= 0.35
+        && (position[1] - target[1]).abs() <= 0.05
+}
 fn steering(
     body: &Body,
     target: [f64; 3],
     needs_jump: &mut bool,
     o: &Observation,
     p: Parameters,
+    through: bool,
 ) -> AnyResult<([f64; 3], bool)> {
     let delta = [
         target[0] - body.position[0],
@@ -260,7 +272,11 @@ fn steering(
     } else {
         0.02
     };
-    let desired = (speed * 2.1585 * slow).min(len * 0.5);
+    let desired = if through {
+        speed * 2.1585 * slow
+    } else {
+        (speed * 2.1585 * slow).min(len * 0.5)
+    };
     let mut change = [
         if len > 1e-9 {
             delta[0] / len * desired - body.velocity[0]
@@ -305,9 +321,26 @@ pub(super) fn preview(
     target: [f64; 3],
     jump: bool,
 ) -> AnyResult<Vec<([f64; 3], bool)>> {
+    preview_mode(o, target, jump, false)
+}
+fn preview_mode(
+    o: &Observation,
+    target: [f64; 3],
+    jump: bool,
+    through: bool,
+) -> AnyResult<Vec<([f64; 3], bool)>> {
     let scene = Scene::new(o)?;
     let params = parameters(o)?;
     let mut body = observed_body(o)?;
+    let origin = body.position;
+    if through
+        && (!body.on_ground
+            || params.medium != Medium::Air
+            || (target[1] - origin[1]).abs() > 0.01
+            || (target[0] - origin[0]).hypot(target[2] - origin[2]) < 0.2)
+    {
+        return Err("Pass-through movement requires a distinct level-ground waypoint".into());
+    }
     let mut needs_jump = jump;
     let mut frames = Vec::new();
     for _ in 0..100 {
@@ -315,7 +348,11 @@ pub(super) fn preview(
             Some(v) => v.medium(body.position, params.width, params.height)?,
             None => params.medium,
         };
-        if arrived(&body, target, needs_jump, medium) {
+        if if through {
+            body.on_ground && crossed(body.position, origin, target)
+        } else {
+            arrived(&body, target, needs_jump, medium)
+        } {
             return Ok(frames);
         }
         let (friction, speed_factor) = scene.surface(&body, params.width);
@@ -325,11 +362,18 @@ pub(super) fn preview(
             medium,
             ..params
         };
-        let (acceleration, jump) = steering(&body, target, &mut needs_jump, o, p)?;
+        let (acceleration, jump) = steering(&body, target, &mut needs_jump, o, p, through)?;
         let mut next = body;
         next.tick(acceleration, jump, p, &scene.boxes);
         if !scene.covers(body.position, next.position, p) {
             return Err("Input prediction leaves observed collision geometry".into());
+        }
+        if through
+            && (!next.on_ground
+                || medium != Medium::Air
+                || (next.position[1] - origin[1]).abs() > 0.05)
+        {
+            return Err("Pass-through prediction leaves supported level ground".into());
         }
         body = next;
         frames.push((body.position, body.on_ground));
@@ -351,6 +395,8 @@ struct Drive {
     action: ActionRequest,
     before: Observation,
     target: [f64; 3],
+    origin: [f64; 3],
+    through: bool,
     jump: bool,
     started: Instant,
     input_started: Option<Instant>,
@@ -601,7 +647,19 @@ impl Actor {
                             if d.input_started.is_some_and(|at| at.elapsed() >= d.expiry) {
                                 release(&mut d, Outcome::Expired);
                             }
-                            if d.released.is_none() && arrived(&e.body, d.target, d.jump, p.medium)
+                            if d.through
+                                && (!e.body.on_ground
+                                    || p.medium != Medium::Air
+                                    || (e.body.position[1] - d.origin[1]).abs() > 0.05)
+                            {
+                                release(&mut d, Outcome::Failed);
+                            }
+                            if d.released.is_none()
+                                && if d.through {
+                                    crossed(e.body.position, d.origin, d.target)
+                                } else {
+                                    arrived(&e.body, d.target, d.jump, p.medium)
+                                }
                             {
                                 release(&mut d, Outcome::Observed);
                             }
@@ -616,8 +674,13 @@ impl Actor {
                                         .skip(d.release_at)
                                         .any(|(pos, _)| distance(*pos, observed) < 0.08)
                                 {
-                                    let verified = *outcome != Outcome::Observed
-                                        || movement_target_reached(observed, d.target);
+                                    let goal_verified = if d.through {
+                                        snapshot.o.player["on_ground"] == true
+                                            && crossed(observed, d.origin, d.target)
+                                    } else {
+                                        movement_target_reached(observed, d.target)
+                                    };
+                                    let verified = *outcome != Outcome::Observed || goal_verified;
                                     let final_outcome = if verified {
                                         outcome.clone()
                                     } else {
@@ -628,6 +691,13 @@ impl Actor {
                                         receipt.error=(!verified).then(||ApiError::new(ErrorCode::Conflict,"Released control did not reach its observed target"));
                                         let first = receipt.evidence["first_effect"].clone();
                                         receipt.evidence = json!({"before":compact(&d.action.action,&d.before),"after":compact(&d.action.action,&snapshot.o),"target":d.target,"target_tolerance_blocks":MOVEMENT_TARGET_TOLERANCE,"native_effect_verified":verified,"input_released":true,"frames_sent":d.frames.len(),"elapsed_ms":d.started.elapsed().as_millis(),"first_effect":first,"server_momentum":d.momentum_evidence(),"release_scope":"Native pose matches a submitted released-input frame; passive gravity and momentum continue"});
+                                        if d.through {
+                                            receipt.evidence["native_effect_verified"] =
+                                                json!(verified && *outcome == Outcome::Observed);
+                                            receipt.evidence["target_tolerance_blocks"] =
+                                                Value::Null;
+                                            receipt.evidence["waypoint_passage"] = json!({"verified":goal_verified,"controller_origin":d.origin,"corridor_half_width_blocks":0.35,"vertical_tolerance_blocks":0.05,"scope":"Native level-ground pose crossed the waypoint plane inside its corridor; not a stopped-position assertion."});
+                                        }
                                     }
                                 } else if released_at.elapsed() > Duration::from_secs(2) {
                                     finish_interrupted(
@@ -655,7 +725,7 @@ impl Actor {
                         && d.released.is_none()
                     {
                         (acceleration, jump) =
-                            steering(&body, d.target, &mut d.jump, &snapshot.o, p)?;
+                            steering(&body, d.target, &mut d.jump, &snapshot.o, p, d.through)?;
                     }
                     let mut next = e.body;
                     next.tick(acceleration, jump, p, &snapshot.scene.boxes);
@@ -762,16 +832,19 @@ impl Actor {
                 "A dead character must respawn before moving",
             ));
         }
-        let Action::StartMove {
-            target,
-            jump,
-            max_ticks,
-        } = &request.action
-        else {
-            return Err(ApiError::new(
-                ErrorCode::InvalidRequest,
-                "Finite movement required",
-            ));
+        let (target, jump, max_ticks, through) = match &request.action {
+            Action::StartMove {
+                target,
+                jump,
+                max_ticks,
+            } => (target, *jump, max_ticks, false),
+            Action::StartMoveThrough { target, max_ticks } => (target, false, max_ticks, true),
+            _ => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    "Finite movement required",
+                ));
+            }
         };
         let mut e = self
             .engine
@@ -803,7 +876,7 @@ impl Actor {
         predicted.player["position"] = json!(e.body.position);
         predicted.player["velocity"] = json!(e.body.velocity);
         predicted.player["on_ground"] = json!(e.body.on_ground);
-        preview(&predicted, target, *jump).map_err(|error| {
+        preview_mode(&predicted, target, jump, through).map_err(|error| {
             ApiError::new(
                 ErrorCode::UnsupportedCapability,
                 format!("No supported held-input trajectory: {error}"),
@@ -812,7 +885,9 @@ impl Actor {
         e.drive = Some(Drive {
             action: request.clone(),
             target,
-            jump: *jump,
+            origin: e.body.position,
+            through,
+            jump,
             started: Instant::now(),
             input_started: None,
             expiry: Duration::from_millis(u64::from(*max_ticks) * 50),
@@ -890,6 +965,52 @@ mod tests {
             player: json!({"uuid":"fixture","dimension":"minecraft:overworld","position":[0.5,1.,0.5],"velocity":[0.,0.,0.],"health":20.,"movement_speed":0.1,"on_ground":true,"physics":{"format":"java767-physics-v1","width":0.6,"height":1.8,"gravity":0.08,"jump_velocity":0.42,"step_height":0.6,"water_efficiency":0.,"levitation":-1}}),
             world: json!({"blocks":blocks}),
         }
+    }
+    #[test]
+    fn passage_keeps_legal_momentum_and_does_not_change_stopped_arrivals() {
+        let o = input_prediction_fixture();
+        let target = [3.5, 1., 0.5];
+        let stopped = preview(&o, target, false).unwrap();
+        let through = preview_mode(&o, target, false, true).unwrap();
+        assert!(through.len() < stopped.len());
+        let speed = |frames: &Vec<([f64; 3], bool)>| {
+            let n = frames.len();
+            distance(frames[n - 1].0, frames[n - 2].0)
+        };
+        assert!(
+            speed(&through) > 0.1,
+            "Passage must retain movement rather than certify a stop"
+        );
+        // Frame displacement precedes drag; it is not the post-drag body
+        // velocity checked by arrived(). Preserve the actual point contract.
+        assert!(distance(stopped.last().unwrap().0, target) < 0.08);
+        assert!(speed(&stopped) < speed(&through) * 0.5);
+        assert!(crossed(through.last().unwrap().0, [0.5, 1., 0.5], target));
+        assert!(!crossed([3.4, 1., 0.5], [0.5, 1., 0.5], target));
+        assert!(!crossed([3.8, 1., 0.9], [0.5, 1., 0.5], target));
+        assert!(!crossed([3.8, 1.1, 0.5], [0.5, 1., 0.5], target));
+    }
+    #[test]
+    fn passage_refuses_vertical_airborne_wall_and_missing_support_paths() {
+        let mut o = input_prediction_fixture();
+        assert!(preview_mode(&o, [2.5, 2., 0.5], false, true).is_err());
+        assert!(preview_mode(&o, [0.5, 1., 0.5], false, true).is_err());
+        o.player["on_ground"] = json!(false);
+        assert!(preview_mode(&o, [2.5, 1., 0.5], false, true).is_err());
+        o = input_prediction_fixture();
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            if row["position"][0] == 2 && row["position"][1] == 1 {
+                row["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        assert!(preview_mode(&o, [3.5, 1., 0.5], false, true).is_err());
+        o = input_prediction_fixture();
+        for row in o.world["blocks"].as_array_mut().unwrap() {
+            if row["position"][0] == 2 && row["position"][1] == 0 {
+                row["collision"] = json!([]);
+            }
+        }
+        assert!(preview_mode(&o, [3.5, 1., 0.5], false, true).is_err());
     }
     #[test]
     fn a_swim_pose_with_upward_momentum_is_not_a_released_arrival() {
@@ -1172,6 +1293,125 @@ mod tests {
         )
         .unwrap();
         wait_until(|| packets.load(Ordering::Acquire) >= 3);
+        // Exercise the real actor/cache/wire lifecycle, not only its predictor.
+        for (name, action) in [
+            (
+                "fixture-through",
+                Action::StartMoveThrough {
+                    target: Position {
+                        x: 2.5,
+                        y: 1.,
+                        z: 0.5,
+                    },
+                    max_ticks: 60,
+                },
+            ),
+            (
+                "fixture-return",
+                Action::StartMove {
+                    target: Position {
+                        x: 0.5,
+                        y: 1.,
+                        z: 0.5,
+                    },
+                    jump: false,
+                    max_ticks: 60,
+                },
+            ),
+        ] {
+            let request = ActionRequest {
+                action_id: name.into(),
+                action,
+            };
+            let state = Arc::new(Mutex::new(Receipt {
+                action_id: name.into(),
+                outcome: Outcome::Running,
+                adapter_version: VERSION.into(),
+                evidence: json!({}),
+                error: None,
+            }));
+            actor
+                .start_control(
+                    actor.observe().unwrap(),
+                    &request,
+                    0,
+                    state.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            wait_until(|| state.lock().unwrap().outcome.terminal());
+            let result = state.lock().unwrap();
+            assert_eq!(
+                result.outcome,
+                Outcome::Observed,
+                "{name}: {}",
+                result.evidence
+            );
+            assert_eq!(result.evidence["input_released"], true);
+            if name == "fixture-through" {
+                assert_eq!(result.evidence["waypoint_passage"]["verified"], true);
+            }
+        }
+        let check_passage_release = || {
+            for cancelled in [false, true] {
+                wait_until(|| {
+                    let e = actor.engine.lock().unwrap();
+                    e.drive.is_none()
+                        && e.body.on_ground
+                        && e.body.velocity[0].hypot(e.body.velocity[2]) < 0.001
+                });
+                let origin = actor.engine.lock().unwrap().body.position;
+                let request = ActionRequest {
+                    action_id: format!("fixture-through-release-{cancelled}"),
+                    action: Action::StartMoveThrough {
+                        target: Position {
+                            x: origin[0] + if origin[0] > 1. { -2. } else { 2. },
+                            y: origin[1],
+                            z: origin[2],
+                        },
+                        max_ticks: if cancelled { 60 } else { 1 },
+                    },
+                };
+                let state = Arc::new(Mutex::new(Receipt {
+                    action_id: request.action_id.clone(),
+                    outcome: Outcome::Running,
+                    adapter_version: VERSION.into(),
+                    evidence: json!({}),
+                    error: None,
+                }));
+                let cancel = Arc::new(AtomicBool::new(false));
+                actor
+                    .start_control(
+                        actor.observe().unwrap(),
+                        &request,
+                        0,
+                        state.clone(),
+                        cancel.clone(),
+                    )
+                    .unwrap();
+                if cancelled {
+                    wait_until(|| {
+                        state.lock().unwrap().evidence["progress"]["frames_sent"]
+                            .as_u64()
+                            .is_some_and(|n| n >= 1)
+                    });
+                    cancel.store(true, Ordering::Release);
+                }
+                wait_until(|| state.lock().unwrap().outcome.terminal());
+                let result = state.lock().unwrap();
+                assert_eq!(
+                    result.outcome,
+                    if cancelled {
+                        Outcome::Cancelled
+                    } else {
+                        Outcome::Expired
+                    }
+                );
+                assert_eq!(result.evidence["input_released"], true);
+                assert_eq!(result.evidence["native_effect_verified"], false);
+                assert_eq!(result.evidence["waypoint_passage"]["verified"], false);
+            }
+        };
         let unreachable = ActionRequest {
             action_id: "fixture-reject-before-input".into(),
             action: Action::StartMove {
@@ -1358,6 +1598,7 @@ mod tests {
                 );
             }
         }
+        check_passage_release();
         let request = ActionRequest {
             action_id: "fixture-correct".into(),
             action: Action::StartMove {

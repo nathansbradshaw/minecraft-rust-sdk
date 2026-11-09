@@ -122,6 +122,23 @@ Navigation retains a terminal, verified pose outside that target as
 `target_not_reached`, preserving the native outcome and retiring the intention
 without replay. Missing native proof or mismatched actor bindings stay fenced.
 
+Rust adapter alpha.13 additionally advertises `minecraft:waypoint_passthrough`.
+`start_move_through` takes `target` and positive `max_ticks`. It holds ordinary
+movement input until crossing the waypoint plane within a 0.35-block lateral
+corridor and 0.05-block vertical tolerance, then releases input. Fresh native
+pose and release evidence are required. This is a passage receipt, not a stopped
+arrival: passive momentum continues. The adapter accepts only distinct, supported,
+level, dry-ground paths with known collision geometry. Jumps, airborne starts,
+fluids and unknown support require another control. Cancellation and expiry
+release input without claiming passage. Existing `start_move` semantics remain
+unchanged; use it for precise interaction positions.
+
+The default body opts into passage only when advertised, escaping exclusively
+ranged visible threats on a route with a fully observed safe metre beyond its
+waypoint. Mixed threats, fire, jumps and precision work retain stopped controls.
+This reduces avoidable braking; native matched-pressure evaluations must still
+establish whether the character survives.
+
 Interactions use a separate finite observer lane. Mining, placement, menu changes,
 item use and combat can return `running` while their native effects develop. An
 initial lack of change is progress information, not an uncertain mutation. Inspect

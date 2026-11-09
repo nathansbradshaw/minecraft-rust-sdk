@@ -55,14 +55,8 @@ async fn main() -> Result<()> {
             brain.observed=probe_admission::wait(&mut brain,spec).await?;
             brain.cfg.body.enabled=enable_body;
             if enable_body {
-                for capability in ["minecraft:finite_locomotion","minecraft:survival_facts","minecraft:ranged_observation","minecraft:pending_actions","minecraft:session_material_preservation"] {
-                    if !brain.server.capabilities.iter().any(|c|c==capability) {
-                        return Err(format!("Diagnostic body requires {capability}").into());
-                    }
-                }
                 let profile: minecraft_sdk::Profile=serde_json::from_slice(&private_read(&brain.cfg.profile,16384)?)?;
-                let range=brain.server.limits["finite_move_waypoint_blocks"].as_f64().filter(|v|(0.9..=4.2).contains(v)).unwrap_or(3.5);
-                brain.body=Some(minecraft_sdk_brain::body::Handle::start_with_waypoint_range(profile,brain.cfg.body.clone(),&brain.cfg.state,brain.observed.clone(),range)?);
+                brain.body=Some(minecraft_sdk_brain::body::Handle::start_for_server(profile,brain.cfg.body.clone(),&brain.cfg.state,brain.observed.clone(),&brain.server)?);
             }
         }
         let started = Instant::now();

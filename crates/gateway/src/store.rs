@@ -15,6 +15,7 @@ fn independent_control(action: &Action) -> bool {
         Action::Chat { .. }
             | Action::Look { .. }
             | Action::StartMove { .. }
+            | Action::StartMoveThrough { .. }
             | Action::CancelControl { .. }
             | Action::CancelUseItem { .. }
             | Action::Move { .. }

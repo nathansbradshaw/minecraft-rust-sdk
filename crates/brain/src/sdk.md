@@ -54,6 +54,11 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   finite, ordinary movement. Action::CancelControl { action_id:String } cancels
   that control. Legacy Move, Jump and MotionFrame are disabled in protected
   coding deployments; old examples using them require adaptation.
+- If discovery advertises minecraft:waypoint_passthrough, Action::StartMoveThrough
+  { target: Position{x,y,z}, max_ticks:u16 } crosses a dry level-ground waypoint
+  without braking to rest. Its native passage receipt is not a precise stopped
+  arrival. Passive momentum continues after release; require known safe ground
+  beyond the target. Use StartMove for interaction positioning and jumps.
 - Block interaction JSON uses kind `place` or `use_block`, not `place_block`.
   block is the clicked block's integer world position. hit is a block-local
   [x,y,z] offset with every coordinate in0..1, not an absolute world position.

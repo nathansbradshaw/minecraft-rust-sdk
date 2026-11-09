@@ -109,6 +109,44 @@ pub struct Escape {
     pub jump: bool,
     pub reason: String,
 }
+/// A defensive pass-through may carry passive momentum beyond its waypoint.
+/// Require a fully observed, supported, level continuation; unknown is unsafe.
+pub fn can_pass_waypoint(o: &Observation, route: &Escape) -> bool {
+    if route.jump
+        || o.player["on_ground"] != true
+        || o.player["in_water"] == true
+        || o.player["in_lava"] == true
+    {
+        return false;
+    }
+    let Some(start) = point(&o.player["position"]) else {
+        return false;
+    };
+    let end = [route.target.x, route.target.y, route.target.z];
+    let dx = end[0] - start[0];
+    let dz = end[2] - start[2];
+    let length = dx.hypot(dz);
+    if length < 0.2 || (end[1] - start[1]).abs() > 0.01 {
+        return false;
+    }
+    let Some(rows) = o.world["blocks"].as_array() else {
+        return false;
+    };
+    let cells: Cells<'_> = rows
+        .iter()
+        .filter_map(|b| point(&b["position"]).map(|p| ([p[0] as i32, p[1] as i32, p[2] as i32], b)))
+        .collect();
+    let obstacles = boxes(o);
+    (0..=5).all(|n| {
+        let extra = f64::from(n) / 5.;
+        let p = [
+            end[0] + dx / length * extra,
+            end[1],
+            end[2] + dz / length * extra,
+        ];
+        clear(&cells, p, &obstacles) && supported(&cells, p, &obstacles)
+    })
+}
 /// A bounded prediction returned by the installed movement adapter. It still
 /// needs fresh action admission and observed completion, like every movement.
 #[derive(Clone, Debug)]
@@ -761,6 +799,49 @@ mod tests {
             world: json!({"blocks":blocks,"entities":[{"visible":true,"hostile":true,"position":[2.5,1.,0.5]}]}),
             menu: Value::Null,
         }
+    }
+    #[test]
+    fn passage_needs_known_safe_ground_beyond_an_otherwise_valid_waypoint() {
+        let mut o = world();
+        o.player["on_ground"] = json!(true);
+        let route = Escape {
+            target: Position {
+                x: 2.5,
+                y: 1.,
+                z: 0.5,
+            },
+            jump: false,
+            reason: "fixture".into(),
+        };
+        assert!(can_pass_waypoint(&o, &route));
+        for kind in ["wall", "hole", "fire", "unknown"] {
+            let mut bad = o.clone();
+            if kind == "unknown" {
+                bad.world["blocks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|b| b["position"][0] != 3);
+            } else {
+                for b in bad.world["blocks"].as_array_mut().unwrap() {
+                    if b["position"] == json!([3, 1, 0]) && kind == "wall" {
+                        b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+                    }
+                    if b["position"] == json!([3, 0, 0]) && kind == "hole" {
+                        b["collision"] = json!([]);
+                        b["block"] = json!("minecraft:air");
+                    }
+                    if b["position"] == json!([3, 1, 0]) && kind == "fire" {
+                        b["block"] = json!("minecraft:fire");
+                    }
+                }
+            }
+            assert!(
+                !can_pass_waypoint(&bad, &route),
+                "unsafe {kind} continuation admitted"
+            );
+        }
+        o.player["on_ground"] = json!(false);
+        assert!(!can_pass_waypoint(&o, &route));
     }
     #[test]
     fn visible_phantom_is_detected_before_the_melee_radius() {

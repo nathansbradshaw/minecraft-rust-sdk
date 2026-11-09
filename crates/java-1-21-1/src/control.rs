@@ -77,7 +77,10 @@ impl Job {
             return Ok(r);
         }
         if self.cancel_id.as_deref() == Some(id) {
-            r.evidence = json!({"control_action_id":self.id,"control_outcome":r.outcome,"control":r.evidence,"native_effect_verified":r.outcome.terminal() && r.evidence["native_effect_verified"]==true});
+            // Cancellation certifies released input, independently of whether
+            // the interrupted waypoint was reached or passed.
+            let released = r.outcome.terminal() && r.evidence["input_released"] == true;
+            r.evidence = json!({"control_action_id":self.id,"control_outcome":r.outcome,"control":r.evidence,"native_effect_verified":released});
             r.action_id = id.into();
             if r.outcome.terminal() {
                 if r.evidence["native_effect_verified"] == true {
@@ -122,9 +125,10 @@ impl Job {
         request: &ActionRequest,
         epoch: u64,
     ) -> Result<Self> {
-        let Action::StartMove {
+        let (Action::StartMove {
             target, max_ticks, ..
-        } = &request.action
+        }
+        | Action::StartMoveThrough { target, max_ticks }) = &request.action
         else {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
@@ -252,6 +256,16 @@ mod tests {
             let mut r = job.state.lock().unwrap();
             r.evidence["native_effect_verified"] = json!(true);
         }
+        assert_eq!(job.status("cancel").unwrap().outcome, Outcome::Failed);
+        {
+            let mut r = job.state.lock().unwrap();
+            r.evidence["native_effect_verified"] = json!(false);
+            r.evidence["input_released"] = json!(true);
+        }
         assert_eq!(job.status("cancel").unwrap().outcome, Outcome::Observed);
+        assert_eq!(
+            job.status("own").unwrap().evidence["native_effect_verified"],
+            false
+        );
     }
 }
