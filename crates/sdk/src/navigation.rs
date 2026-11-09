@@ -165,6 +165,8 @@ struct Node {
 struct Attempt {
     request: ActionRequest,
     origin: [f64; 3],
+    #[serde(default)]
+    source_node: Option<String>,
     scene: String,
     target: [f64; 3],
     outcome: Option<Outcome>,
@@ -360,6 +362,26 @@ fn observed_pose(o: &Observation) -> Result<Origin> {
 fn blocked_key(from: &str, to: &str, scene: &str) -> String {
     format!("{from}>{to}@{scene}")
 }
+fn current_node(state: &State, observed: &Observation, position: [f64; 3]) -> String {
+    // A verified arrival can coast across the graph's rounding boundary after
+    // input release (notably on ice). Expand the reached waypoint rather than
+    // leaving it perpetually unexplored beside a new rounded origin. This is
+    // only graph identity: exact goal checks and native admission stay intact.
+    if let Some(last) = state.history.last()
+        && last.outcome == Some(Outcome::Observed)
+        && let Some(arrival) = &last.arrival_verification
+        && arrival["target_reached"] == true
+        && arrival["entity_id"].as_i64().is_some()
+        && arrival["entity_id"] == observed.player["entity_id"]
+        && arrival["dimension"] == observed.player["dimension"]
+        && arrival["epoch"].as_str().is_some_and(|s| !s.is_empty())
+        && arrival["epoch"] == observed.world["sample_clock"]["epoch"]
+        && distance(position, last.target) <= 0.35
+    {
+        return key(last.target);
+    }
+    key(position)
+}
 fn choose(state: &State, start: &str) -> Option<Route> {
     let mut costs: BTreeMap<String, f64> = BTreeMap::from([(start.to_owned(), 0.)]);
     let mut first = BTreeMap::<String, Route>::new();
@@ -517,11 +539,17 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 .take()
                 .ok_or_else(|| local("Pending intention vanished"))?;
             attempt.outcome = Some(receipt.outcome.clone());
-            attempt.arrival_verification=arrival.map(|(actual,reached)|serde_json::json!({"target_reached":reached,"native_after_position":actual,"tolerance_blocks":MOVEMENT_TARGET_TOLERANCE,"native_receipt_outcome":receipt.outcome}));
+            attempt.arrival_verification=arrival.map(|(actual,reached)|serde_json::json!({"target_reached":reached,"native_after_position":actual,"tolerance_blocks":MOVEMENT_TARGET_TOLERANCE,"native_receipt_outcome":receipt.outcome,
+                "entity_id":receipt.evidence["after"]["player"]["entity_id"],
+                "dimension":receipt.evidence["after"]["player"]["dimension"],
+                "epoch":receipt.evidence["after"]["world"]["sample_clock"]["epoch"]}));
             if receipt.outcome != Outcome::Observed || arrival.is_some_and(|(_, reached)| !reached)
             {
                 j.state.blocked.insert(blocked_key(
-                    &key(attempt.origin),
+                    &attempt
+                        .source_node
+                        .clone()
+                        .unwrap_or_else(|| key(attempt.origin)),
                     &key(attempt.target),
                     &attempt.scene,
                 ));
@@ -728,7 +756,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
         let Some(origin) = origin else {
             continue;
         };
-        let current = key(origin.position);
+        let current = current_node(&j.state, &observation, origin.position);
         let mut edges = Vec::new();
         if !j.state.nodes.contains_key(&current) && j.state.nodes.len() >= options.max_nodes {
             return Ok(j.report("budget_exhausted", "Navigation node budget reached"));
@@ -798,6 +826,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
         j.state.pending = Some(Attempt {
             request: request.clone(),
             origin: origin.position,
+            source_node: Some(current),
             scene,
             target: route.target,
             outcome: None,
@@ -877,6 +906,102 @@ mod tests {
             max_ticks: 60,
             duration_ticks: 10,
             touched_blocks: Vec::new(),
+        }
+    }
+    #[test]
+    fn verified_arrival_drift_expands_the_reached_node_only_in_the_same_life_and_clock() {
+        let root = Temp::new();
+        let mut j = Journal::open(
+            &root.0.join("nav.json"),
+            goal(),
+            "instance",
+            "actor",
+            [1.7, 1., 0.5],
+        )
+        .unwrap();
+        j.state.history.push(Attempt {
+            request: ActionRequest {
+                action_id: "arrived".into(),
+                action: Action::StartMove {
+                    target: Position {
+                        x: 1.5,
+                        y: 1.,
+                        z: 0.5,
+                    },
+                    jump: false,
+                    max_ticks: 60,
+                },
+            },
+            origin: [0.5, 1., 0.5],
+            source_node: Some(key([0.5, 1., 0.5])),
+            scene: "fixture".into(),
+            target: [1.5, 1., 0.5],
+            outcome: Some(Outcome::Observed),
+            arrival_verification: Some(serde_json::json!({"target_reached":true,
+                "native_after_position":[1.535,1.,0.5],"entity_id":1,
+                "dimension":"fixture:world","epoch":"clock-a"})),
+        });
+        let mut observed: Observation =
+            serde_json::from_value(observation([1.7, 1., 0.5])).unwrap();
+        observed.player["entity_id"] = serde_json::json!(1);
+        observed.world["sample_clock"] = serde_json::json!({"epoch":"clock-a"});
+        let canonical = current_node(&j.state, &observed, [1.7, 1., 0.5]);
+        assert_eq!(canonical, key([1.5, 1., 0.5]));
+        assert_ne!(
+            canonical,
+            key([1.7, 1., 0.5]),
+            "The old rounded origin left the arrived node unexplored"
+        );
+        j.state.nodes.insert(
+            canonical.clone(),
+            Node {
+                position: [1.7, 1., 0.5],
+                expanded: true,
+                edges: vec![Edge {
+                    route: route([2.5, 1., 0.5]),
+                    to: key([2.5, 1., 0.5]),
+                }],
+            },
+        );
+        j.state.nodes.insert(
+            key([2.5, 1., 0.5]),
+            Node {
+                position: [2.5, 1., 0.5],
+                expanded: false,
+                edges: Vec::new(),
+            },
+        );
+        assert_eq!(
+            choose(&j.state, &canonical).unwrap().target,
+            [2.5, 1., 0.5],
+            "Expand from the arrived waypoint to another frontier instead of correcting the drift"
+        );
+        for case in [
+            "life",
+            "clock",
+            "dimension",
+            "distant",
+            "unverified",
+            "legacy",
+        ] {
+            let mut o = observed.clone();
+            let mut p = [1.7, 1., 0.5];
+            match case {
+                "life" => o.player["entity_id"] = serde_json::json!(2),
+                "clock" => o.world["sample_clock"]["epoch"] = serde_json::json!("clock-b"),
+                "dimension" => o.player["dimension"] = serde_json::json!("other:world"),
+                "distant" => p[0] = 1.9,
+                "unverified" => {
+                    j.state.history[0].arrival_verification.as_mut().unwrap()["target_reached"] =
+                        serde_json::json!(false)
+                }
+                _ => j.state.history[0].arrival_verification = None,
+            }
+            assert_eq!(
+                current_node(&j.state, &o, p),
+                key(p),
+                "{case} cannot reuse arrival identity"
+            );
         }
     }
     async fn respond(
@@ -1341,6 +1466,7 @@ mod tests {
             scene: "fixture".into(),
             target: [1.5, 1., 0.5],
             outcome: None,
+            source_node: None,
             arrival_verification: None,
         });
         j.save().unwrap();
@@ -1410,6 +1536,7 @@ mod tests {
                     scene: "scene".into(),
                     target: [1.5, 1., 0.5],
                     outcome: None,
+                    source_node: Some("canonical-source".into()),
                     arrival_verification: None,
                 });
                 j.save().unwrap();
@@ -1448,6 +1575,14 @@ mod tests {
                         false
                     );
                     assert_eq!(j.state.history[0].request.action_id, "ended");
+                    assert!(
+                        j.state.blocked.contains(&blocked_key(
+                            "canonical-source",
+                            &key([1.5, 1., 0.5]),
+                            "scene"
+                        )),
+                        "A failed edge must remain fenced under the persisted source node after reopen"
+                    );
                 }
                 "foreign" => {
                     assert_eq!(result.unwrap_err().code, ErrorCode::Conflict);
@@ -1483,6 +1618,7 @@ mod tests {
                 scene: "scene".into(),
                 target: [1.5, 1., 0.5],
                 outcome: None,
+                source_node: None,
                 arrival_verification: None,
             });
             j.save().unwrap();
@@ -1564,6 +1700,7 @@ mod tests {
                 scene: "scene".into(),
                 target: [1.5, 1., 0.5],
                 outcome: None,
+                source_node: None,
                 arrival_verification: None,
             });
             j.save().unwrap();
@@ -1649,6 +1786,7 @@ mod tests {
                 scene: "known".into(),
                 target: [1.5, 1., 0.5],
                 outcome: None,
+                source_node: None,
                 arrival_verification: None,
             });
             j.save().unwrap();
