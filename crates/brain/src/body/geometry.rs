@@ -1,6 +1,7 @@
 use minecraft_sdk::{Observation, Position};
 use serde_json::Value;
 use std::collections::HashMap;
+mod cover;
 type Cells<'a> = HashMap<[i32; 3], &'a Value>;
 
 pub fn point(v: &Value) -> Option<[f64; 3]> {
@@ -108,11 +109,14 @@ pub struct Escape {
     pub target: Position,
     pub jump: bool,
     pub reason: String,
+    /// Remaining currently observed route toward predicted ballistic cover.
+    pub cover_path: Vec<Position>,
 }
 /// A defensive pass-through may carry passive momentum beyond its waypoint.
 /// Require a fully observed, supported, level continuation; unknown is unsafe.
 pub fn can_pass_waypoint(o: &Observation, route: &Escape) -> bool {
-    if route.jump
+    if !route.cover_path.is_empty()
+        || route.jump
         || o.player["on_ground"] != true
         || o.player["in_water"] == true
         || o.player["in_lava"] == true
@@ -314,6 +318,7 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
                     // Upward water steering holds swim input; a ground-jump request
                     // must not persist into the next grounded phase.
                     jump: false,
+                    cover_path: Vec::new(),
                     reason: if dry {
                         "leave water for observed dry support"
                     } else if breathable {
@@ -539,6 +544,13 @@ pub(super) fn evade_with_native(
         .collect();
     let obstacles = boxes(o);
     let blast_escape = !blasts.is_empty();
+    if !burning
+        && !projectile_danger
+        && !blast_escape
+        && let Some(route) = cover::approach(o, blocked, waypoint_axis)
+    {
+        return Some(route);
+    }
     // Begin approaching observed refuge before a dive reaches melee range.
     // Only safe, supported floor centres participate; no unseen shelter is invented.
     let seek_refuge = threats.iter().any(|(_, _, aerial)| *aerial)
@@ -760,6 +772,7 @@ pub(super) fn evade_with_native(
                         z: p[2],
                     },
                     jump,
+                    cover_path: Vec::new(),
                     reason: if native_jump.is_some() {
                         "native-predicted retreat after stalled local avoidance"
                     } else if blast_escape {
@@ -881,6 +894,56 @@ mod tests {
         }
     }
     #[test]
+    fn cover_approach_turns_around_known_obstacle_without_blind_or_mixed_threat_routes() {
+        let mut o = world();
+        o.player = json!({"position":[0.06898744264365,1.,-0.289612793940735],"on_ground":true});
+        o.world["entities"] = json!([{"visible":true,"hostile":true,"ranged_attack":true,
+            "position":[11.2047145447027,1.,0.12051863731968064]}]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&b["position"]).unwrap();
+            if p[0] == -2. && (1. ..=3.).contains(&p[1]) && (-2. ..=2.).contains(&p[2]) {
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+                b["block"] = json!("minecraft:stone_bricks");
+            }
+        }
+        let route = evade(&o).expect("Known corner route");
+        assert!(
+            route.target.z < -2.3,
+            "Approach nearer end of the wall: {route:?}"
+        );
+        let goal = route
+            .cover_path
+            .last()
+            .expect("Retained planned cover goal");
+        assert!(covered(
+            [goal.x, goal.y, goal.z],
+            point(&o.world["entities"][0]["position"]).unwrap(),
+            &boxes(&o)
+        ));
+        assert!(
+            !can_pass_waypoint(&o, &route),
+            "Corner approach requires a precise stop"
+        );
+        let mut unknown = o.clone();
+        unknown.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["position"][0].as_i64().unwrap() >= -2);
+        assert!(
+            cover::approach(&unknown, &[], 3.5).is_none(),
+            "Unknown space behind wall is not a cover route"
+        );
+        o.world["entities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"visible":true,"hostile":true,
+            "ranged_attack":false,"position":[2.5,1.,0.5]}));
+        assert!(
+            cover::approach(&o, &[], 3.5).is_none(),
+            "Mixed melee threat retains urgent evasion"
+        );
+    }
+    #[test]
     fn passage_needs_known_safe_ground_beyond_an_otherwise_valid_waypoint() {
         let mut o = world();
         o.player["on_ground"] = json!(true);
@@ -892,6 +955,7 @@ mod tests {
             },
             jump: false,
             reason: "fixture".into(),
+            cover_path: Vec::new(),
         };
         assert!(can_pass_waypoint(&o, &route));
         for kind in ["wall", "hole", "fire", "unknown"] {

@@ -11,6 +11,8 @@ pub struct Choice {
     target: Position,
     jump: bool,
     reason: String,
+    #[serde(default)]
+    cover_path: Vec<Position>,
 }
 impl From<&Escape> for Choice {
     fn from(route: &Escape) -> Self {
@@ -18,6 +20,7 @@ impl From<&Escape> for Choice {
             target: route.target.clone(),
             jump: route.jump,
             reason: route.reason.clone(),
+            cover_path: route.cover_path.clone(),
         }
     }
 }
