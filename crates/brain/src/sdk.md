@@ -107,8 +107,9 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   ingredients suffice or establish menu compatibility. Unknown recipe IDs and
   locked book entries are refused before dispatch by the matching integration.
   recipes::material_summary(&observation, &recipe_row) groups runtime ingredient
-  representatives and pairs them with retained inventory counts. Exact-ID recipe
-  queries add this as client_materials when it fits the model view. Compare
+  representatives and pairs them with retained inventory counts. Recipe queries
+  returning one row add this as client_materials when it fits the model view.
+  A partial search can have other candidates; follow its original pagination. Compare
   occurrences and representative_count with inventory_count; inventory excludes
   grid, output and cursor. Groups share supplies, alternatives may be incomplete,
   and custom/component matching is not proved. This is planning feedback, not a

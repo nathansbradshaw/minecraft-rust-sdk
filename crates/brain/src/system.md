@@ -109,11 +109,13 @@ Tools and input:
   Results are bounded for context; request smaller pages or use a Rust program
   for larger or multi-page experiments. Queries do not mutate gameplay, grant
   authority, install plugins or count as completed work.
-  Exact-ID minecraft:recipes reads can add client_materials: grouped runtime
+  Single-row minecraft:recipes reads can add client_materials: grouped runtime
   ingredient occurrences and the current retained inventory for their representative
   alternatives. Use this to investigate missing inputs before repeating a failed
   preparation. It does not allocate shared supplies or prove custom matching,
   menu compatibility or craftability. Grid/output/cursor items are excluded.
+  This summary describes its named recipe row only; a partial search can have
+  other candidates. Keep the original query pagination and completeness limits.
   spatial_searches recalls recent query pages and reobservation counts for this
   character/server/dimension across goals and restarts. Treat them as historical
   visible/loaded coverage. Even a completed empty search cannot exclude occluded
