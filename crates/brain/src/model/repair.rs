@@ -12,7 +12,7 @@ pub(super) struct Transition {
 }
 /// Definite unsuccessful intended controls, rather than an exit-code heuristic.
 fn gameplay_failure(experiment: &Value) -> Option<Value> {
-    if experiment["tool"] != "run" || experiment["result"]["experiment"] != true {
+    if !matches!(experiment["tool"].as_str(), Some("run" | "terminal")) {
         return None;
     }
     let trace = &experiment["result"]["local_action_feedback"];
@@ -32,9 +32,16 @@ fn gameplay_failure(experiment: &Value) -> Option<Value> {
         let request: minecraft_sdk::ActionRequest =
             serde_json::from_value(row["request"].clone()).ok()?;
         let response = &row["response"];
-        let outcome: minecraft_sdk::Outcome =
-            serde_json::from_value(response["outcome"].clone()).ok()?;
-        if !outcome.terminal() || !row["status_refresh_error"].is_null() {
+        let outcome =
+            serde_json::from_value::<minecraft_sdk::Outcome>(response["outcome"].clone()).ok();
+        let refused = response["outcome"].is_null()
+            && matches!(
+                response["error"]["code"].as_str(),
+                Some("conflict" | "invalid_request" | "unsupported_capability")
+            );
+        if !(outcome.is_some_and(|o| o.terminal()) || refused)
+            || !row["status_refresh_error"].is_null()
+        {
             return None;
         }
         if matches!(
@@ -55,7 +62,7 @@ fn gameplay_failure(experiment: &Value) -> Option<Value> {
         matches!(
             row["response"]["outcome"].as_str(),
             Some("rejected" | "expired")
-        )
+        ) || (row["response"]["outcome"].is_null() && !row["response"]["error"].is_null())
     });
     let historical = mutations.iter().all(|row| {
         row["response"]["gateway_delivery"]["action_id_already_recorded"] == true
@@ -74,11 +81,12 @@ fn gameplay_failure(experiment: &Value) -> Option<Value> {
 }
 fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
     let bin = experiment["command"].as_str()?;
-    if bin.is_empty()
-        || bin.len() > 128
-        || !bin
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    if experiment["tool"] != "terminal"
+        && (bin.is_empty()
+            || bin.len() > 128
+            || !bin
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
     {
         return None;
     }
@@ -101,7 +109,7 @@ fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
             continue;
         };
         if value["reason"] != "compiler-artifact"
-            || value["target"]["name"] != bin
+            || (experiment["tool"] == "run" && value["target"]["name"] != bin)
             || !value["target"]["kind"]
                 .as_array()?
                 .iter()
@@ -214,18 +222,27 @@ impl Transition {
             return None;
         }
         let root = fs::canonicalize(context["workspace"].as_str()?).ok()?;
-        let automatic = latest["tool"] == "run"
-            && (gameplay.is_some()
-                || (latest["result"]["success"] == false
+        let explicit_source = latest["tool"] == "read"
+            && matches!(
+                latest["result"]["view"].as_str(),
+                Some("file" | "file_range")
+            );
+        let automatic = if gameplay.is_some() {
+            !explicit_source && latest["tool"] != "report"
+        } else {
+            latest["tool"] == "run"
+                && (latest["result"]["success"] == false
                     && latest["result"]["compiler_diagnostics"]["errors"]
                         .as_array()
-                        .is_some_and(|rows| !rows.is_empty())));
-        let read = if latest["tool"] == "read" {
+                        .is_some_and(|rows| !rows.is_empty()))
+        };
+        let read = if explicit_source || (gameplay.is_none() && latest["tool"] == "read") {
             latest["result"].clone()
         } else if automatic {
             if gameplay.is_some() {
-                if latest["result"]["local_action_feedback"]
-                    != experiment["result"]["local_action_feedback"]
+                if latest["tool"] == "run"
+                    && latest["result"]["local_action_feedback"]
+                        != experiment["result"]["local_action_feedback"]
                 {
                     return None;
                 }
@@ -465,6 +482,38 @@ mod tests {
         .unwrap();
         context["last_tool_result"]["result"] = context["last_experiment"]["result"].clone();
         assert!(Transition::from_context(&context).is_none());
+    }
+    #[test]
+    fn a_later_sdk_inspection_does_not_hide_a_failed_unchanged_program() {
+        let (_dir, mut context) = gameplay_fixture();
+        context["last_tool_result"] = json!({"tool":"read","goal_revision":"goal","result":{"view":"reference","path":"sdk://reference"}});
+        assert!(Transition::from_context(&context).is_some());
+        context["last_tool_result"]["tool"] = json!("query");
+        assert!(Transition::from_context(&context).is_some());
+        context["last_tool_result"]["tool"] = json!("report");
+        assert!(Transition::from_context(&context).is_none());
+    }
+    #[test]
+    fn conflicting_intent_is_repairable_but_transport_uncertainty_is_not() {
+        let (_dir, mut context) = gameplay_fixture();
+        for code in ["conflict", "invalid_request", "internal"] {
+            context["last_experiment"]["result"]["local_action_feedback"]["requests"][0]["response"] =
+                json!({"error":{"code":code,"message":"test"}});
+            context["last_tool_result"]["result"] = context["last_experiment"]["result"].clone();
+            assert_eq!(
+                Transition::from_context(&context).is_some(),
+                code != "internal"
+            );
+        }
+    }
+    #[test]
+    fn terminal_gameplay_uses_the_unique_compiled_entry_without_parsing_shell_commands() {
+        let (_dir, mut context) = gameplay_fixture();
+        context["last_experiment"]["tool"] = json!("terminal");
+        context["last_experiment"]["command"] =
+            json!("CARGO_BUILD_JOBS=1 cargo run --offline --bin candidate");
+        context["last_tool_result"]["tool"] = json!("terminal");
+        assert!(Transition::from_context(&context).is_some());
     }
     fn fixture() -> (tempfile::TempDir, Value) {
         let dir = tempfile::tempdir().unwrap();
