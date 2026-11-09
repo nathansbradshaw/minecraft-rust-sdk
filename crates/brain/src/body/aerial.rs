@@ -8,7 +8,25 @@ pub(super) fn diver(entity: &Value) -> bool {
 /// Require a low solid underside over the entire ordinary player footprint.
 /// A single eye ray, leaves without collision, and unknown terrain are insufficient.
 pub(super) fn roofed(p: [f64; 3], obstacles: &[[f64; 6]]) -> bool {
-    let bounds = [p[0] - 0.3, p[2] - 0.3, p[0] + 0.3, p[2] + 0.3];
+    covered_footprint(p, obstacles, 0.)
+}
+
+/// Conservative extra horizontal coverage, capped at one block. This is a
+/// preference for observed interior, not a proof that a flyer cannot enter.
+pub(super) fn margin(p: [f64; 3], obstacles: &[[f64; 6]]) -> f64 {
+    let mut margin = 0.;
+    for extra in [0.25, 0.5, 0.75, 1.] {
+        if !covered_footprint(p, obstacles, extra) {
+            break;
+        }
+        margin = extra;
+    }
+    margin
+}
+
+fn covered_footprint(p: [f64; 3], obstacles: &[[f64; 6]], extra: f64) -> bool {
+    let radius = 0.3 + extra;
+    let bounds = [p[0] - radius, p[2] - radius, p[0] + radius, p[2] + radius];
     let mut roofs = Vec::new();
     for b in obstacles {
         if !b.iter().all(|n| n.is_finite()) || b[4] <= b[1] || !(1.8..=2.5).contains(&(b[1] - p[1]))
@@ -95,5 +113,14 @@ mod tests {
             !roofed(p, &vec![[0., 3., 0., 1., 4., 1.]; 33]),
             "complex unbounded geometry is not proof of refuge"
         );
+    }
+    #[test]
+    fn interior_margin_requires_observed_continuous_cover() {
+        let roof = [[-1., 3., -1., 2., 4., 2.]];
+        assert_eq!(margin([0.5, 1., 0.5], &roof), 1.);
+        assert_eq!(margin([-0.5, 1., -0.5], &roof), 0.);
+        assert_eq!(margin([0.5, 1., 0.5], &[]), 0.);
+        let gap = [[-1., 3., -1., 0.99, 4., 2.], [1.01, 3., -1., 2., 4., 2.]];
+        assert_eq!(margin([0.5, 1., 0.5], &gap), 0.);
     }
 }
