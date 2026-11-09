@@ -218,6 +218,29 @@ Persisted failure context is historical client feedback, never effect proof or
 permission to replay an uncertain mutation. Unchanged exhausted diagnoses remain
 bounded across restart, and provider allowances remain unchanged.
 
+After consuming a diagnosis, the controller offers one persistent normal
+inspection window for useful alternatives rather than immediately suspending
+all task reasoning. It does not replenish the exhausted investigation. The
+exact observed empty-hand placement request is locally fenced only when its recorded relevant
+facts, native actor life/clock and goal still match. Changed hit parameters can
+matter for slabs or mod controls; cost-scope jitter normalization is not used to
+equate distinct requests here. Another inspection-only loop reaches the existing
+ceiling, and restarting does not renew it. Combat and item cooldowns retain their
+normal retry semantics. Chat, uncertain-action reconciliation,
+provider quotas and ordinary native permissions retain their existing paths.
+This client cost guard is not a trusted security or gameplay-authority boundary.
+
+For an explicit operator-owned conformance character, `handoff-probe-worker`
+injects seven bounded fixture choices in a fresh workspace: select an empty
+hotbar slot, click an observed nearby noninteractive vanilla block with that empty hand, spend four
+investigation decisions on unchanged observations, and request the exact failed
+click once more to test the local fence. It then delegates to the ordinary
+allocated model worker to perform the requested task. It never supplies a task
+solution, discards items or installs a world fixture. Missing terrain, a changed
+task/actor or a nonempty hand rejects the fixture. Count injected choices
+separately from actual model admissions and autonomous progress. This diagnostic
+is not a production strategy; preserve both stalled and repaired runs.
+
 The body can attempt cooldown-ready defense against a visible hostile within
 three blocks while its finite escape continues. It does not pursue targets or
 interrupt a running item interaction to attack. Native player permissions,

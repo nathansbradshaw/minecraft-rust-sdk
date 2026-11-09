@@ -50,6 +50,11 @@ typed requests, outcomes and preserved action IDs without digging through a larg
 stdout dump. That trace covers the local arbiter only and is not native authority.
 inventory_delta reports actual item-count changes, independently of process exit.
 A successful process exit does not prove gameplay success.
+compiler_feedback preserves primary compiler errors separately from compacted
+history. Its source hash identifies the failed version, not the current files.
+Use those diagnostics to edit the source, then compile the changed version.
+Do not repeatedly inspect unchanged error files or reconstruct missing errors
+when this view already supplies them. Output paths retain complete diagnostics.
 context_projection labels budget-compacted fields. An omitted history marker
 does not mean no events occurred: full client journals and retained output files
 still contain them. Prefer the latest tool result, last_experiment and current
@@ -216,6 +221,13 @@ equivalent source/output inspections. Explain the exact missing trusted interfac
 if client code cannot solve it. Exhausted unchanged diagnosis does not poll;
 changed code, meaningful game facts or a new task can reopen it. Body and chat
 remain active throughout.
+exhausted_boundary marks a consumed diagnosis, not a ban on useful alternatives.
+One persistent, bounded routine window lets you choose different work, repair
+code or select a useful goal. An exact observed empty-hand placement failure with
+unchanged relevant facts can be fenced locally before dispatch. Combat, item
+cooldowns and other controls retain their ordinary retry paths.
+This does not refill their diagnosis or provider allowance. Another inspection-
+only loop exhausts the normal inspection ceiling; restarts do not renew it.
 New accepted block-search coverage, including a complete search finding no
 matches, can change the diagnosis. Repeating known searches, pacing responses,
 timestamps and arbitrary input fields do not renew its budget. Search discoveries

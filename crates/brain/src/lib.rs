@@ -11,6 +11,7 @@ mod diagnostics;
 mod discovery;
 pub mod feedback;
 mod gameplay_failure;
+mod handoff;
 pub mod memory;
 pub mod model;
 pub mod navigation;
@@ -136,7 +137,7 @@ fn conversation_default() -> bool {
     true
 }
 fn model_context_contract(instructions: &str) -> String {
-    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v2/bounded-investigation-routing-v2/native-navigation-feedback-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v3/compiler-error-view-v1/bounded-investigation-routing-v2/native-navigation-feedback-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
@@ -434,6 +435,10 @@ impl Journal {
         let signature = progress::experiment_signature(source, result);
         let novel = self.get("experiment_signature")?.as_deref() != Some(signature.as_str());
         let mut saved = json!({"tool":choice.tool,"command":choice.input,"summary":choice.summary,"source_sha256":source,"goal_revision":goal_revision,"signature":signature,"result":result,"authority":"container diagnostics, not benchmark/native certification"});
+        let compiler = feedback::compiler_view(&saved);
+        if !compiler.is_null() {
+            self.set("compiler_feedback", &compiler.to_string())?;
+        }
         compact_history(&mut saved);
         bound_value(&mut saved, 8192);
         self.set("last_experiment", &saved.to_string())?;
@@ -798,6 +803,8 @@ impl Brain {
             previous.is_empty() || independent || cancelling,
             "Inspect/reconcile the recorded pending action before submitting another mutation",
         )?;
+        self.journal
+            .check_exhausted_intention(&action, &self.observed)?;
         let sequence = self.journal.event(
             "action_intent",
             json!({"action":action,"before":projection(&self.observed)}),
@@ -952,6 +959,19 @@ impl Brain {
                         }
                         progress::Investigation::Continue => investigation_left = remaining,
                         progress::Investigation::Exhausted => {
+                            if let Some(fresh) = self.journal.alternative_window(
+                                &subject,
+                                &revision,
+                                &self.goal,
+                                &self.observed,
+                                inspected,
+                                self.cfg.max_inspections_without_execution,
+                            )? {
+                                if fresh {
+                                    inspected = 0;
+                                }
+                                break;
+                            }
                             self.journal.event("investigation_exhausted",json!({"subject":subject,"goal":self.goal,"last_experiment":self.journal.get("last_experiment")?,"next_action":"Concrete defect: inspect the recorded diagnosis and missing boundary. No unchanged model polling; changed source, meaningful native facts or another task can reopen this subject.","body_and_chat":"remain active"}))?;
                             while self.journal.get("goal_revision")?.unwrap_or_default() == revision
                                 && progress::workspace_fingerprint_excluding_state(
@@ -1022,6 +1042,9 @@ impl Brain {
             context["gameplay_failure"] = self.journal.gameplay_failure_context(
                 &self.journal.get("goal_revision")?.unwrap_or_default(),
             )?;
+            context["exhausted_boundary"] = self
+                .journal
+                .alternative_context(&self.journal.get("goal_revision")?.unwrap_or_default())?;
             context["decision_session"] = json!({
                 "role":if develop {"sol"} else {"luna"},
                 "requested_model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},
@@ -1044,7 +1067,16 @@ impl Brain {
                 .get("last_experiment")?
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                 .unwrap_or(Value::Null);
-            fit_context(&mut context)?;
+            context["compiler_feedback"] = self
+                .journal
+                .compiler_feedback(&self.journal.get("goal_revision")?.unwrap_or_default())?;
+            if let Err(error) = fit_context(&mut context) {
+                let rejected = serde_json::to_string(&context)?;
+                if rejected.len() <= 262144 {
+                    self.journal.set("last_rejected_model_context", &rejected)?;
+                }
+                return Err(error);
+            }
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
             self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"preferred_development":preferred,"quota_fallback":preferred != develop,"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
@@ -1229,14 +1261,15 @@ impl Brain {
                         .event("tool_result", json!({"tool":choice.tool,"goal_revision":requested_revision,"result":value}))?;
                 }
                 Err(e) => {
-                    if !goal_changed {
+                    let fenced = e.downcast_ref::<handoff::ExhaustedIntention>().is_some();
+                    if !goal_changed && !fenced {
                         self.journal.set("needs_investigation", "true")?;
                     }
                     self.journal.event(
                         "tool_result",
                         json!({"tool":choice.tool,"goal_revision":requested_revision,"error":e.to_string()}),
                     )?;
-                    if !develop {
+                    if !develop && !fenced {
                         self.journal.request_development()?;
                     }
                 }
@@ -1321,6 +1354,30 @@ fn bound_value(value: &mut Value, budget: usize) {
     }
 }
 fn fit_context(context: &mut Value) -> Result<()> {
+    // The dedicated primary-error channel is already bounded. Do not spend
+    // the context budget again on legacy compiler records and Cargo's verbose
+    // stdout preview; full output locations remain on the experiment.
+    if context["compiler_feedback"]["errors"]
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty())
+        && context["compiler_feedback"]["source_sha256"]
+            == context["last_experiment"]["source_sha256"]
+        && context["compiler_feedback"]["goal_revision"]
+            == context["last_experiment"]["goal_revision"]
+    {
+        let result = &mut context["last_experiment"]["result"];
+        if let Some(result) = result.as_object_mut() {
+            result.insert(
+                "compiler_diagnostics".into(),
+                json!({"view":"compiler_feedback","complete":false,"full_bytes":"output_files"}),
+            );
+            for field in ["stdout", "stderr"] {
+                if result.get(field).is_some_and(Value::is_string) {
+                    result.insert(field.into(), json!({"view":"omitted_duplicate_compiler_preview","full_bytes":"output_files"}));
+                }
+            }
+        }
+    }
     // Focused views have already been paged under a byte ceiling. Truncating
     // their records again would invalidate returned counts and slot bindings.
     let focused = context["last_tool_result"]["result"]["view"].is_string();
@@ -1443,6 +1500,8 @@ pub fn replay_context(journal: &Journal, context: &mut Value) -> Result<Value> {
             .unwrap_or(Value::Null);
     }
     context["working_notes"] = json!(journal.get("working_notes")?);
+    context["compiler_feedback"] =
+        journal.compiler_feedback(&journal.get("goal_revision")?.unwrap_or_default())?;
     let sizes = |v: &Value| -> Value {
         v.as_object()
             .map(|o| {
