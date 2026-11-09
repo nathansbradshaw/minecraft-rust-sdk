@@ -186,12 +186,15 @@ pub fn threatened(o: &Observation) -> bool {
         .flatten()
         .any(|e| {
             e["hostile"] == true
-                && e["visible"] == true
+                && perceived(e)
                 && point(&e["position"]).is_some_and(|p| {
                     (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>()
                         < threat_radius(e).powi(2)
                 })
         })
+}
+fn perceived(entity: &Value) -> bool {
+    entity["visible"] == true || entity["client_memory"]["kind"] == "last_visible_ranged_threat"
 }
 /// Submersion needs protection independently of inference. A natively confirmed
 /// breathing surface swimmer may keep its finite input; unknown facts retain
@@ -490,7 +493,7 @@ pub(super) fn evade_with_native(
     let mut incoming_directions = Vec::new();
     let mut blasts = Vec::new();
     for e in o.world["entities"].as_array().into_iter().flatten() {
-        if e["visible"] != true {
+        if !perceived(e) {
             continue;
         }
         let Some(p) = point(&e["position"]) else {

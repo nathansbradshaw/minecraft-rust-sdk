@@ -64,3 +64,12 @@ calling this an exact replay. Replays are client policy evidence; bind their
 action IDs to trusted native receipts and scenes for gameplay conclusions.
 The diagnostic adds bounded recording overhead and does not change the policy
 or grant additional observations or gameplay authority.
+
+Cover approach searches only nearby currently known dry support and collision
+geometry. Its goal is predicted occlusion, not a claim of permanent protection.
+Approach segments retain precise stops. A last-visible ranged threat can remain
+in client policy memory for at most160 native ticks after losing sight. Recalled
+entries keep `visible:false` and an explicit `client_memory` origin/age; they do
+not use an invisible entity's current position. Native observations, attacks and
+authoritative action verification keep their actual current actor facts. Death,
+respawn, dimension/identity/clock changes and expiry invalidate the memory.

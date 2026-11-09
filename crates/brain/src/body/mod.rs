@@ -2,6 +2,7 @@
 mod aerial;
 pub mod decision;
 pub mod geometry;
+mod perception;
 mod recovery;
 mod tactics;
 #[cfg(test)]
@@ -470,6 +471,7 @@ async fn controller(
     let mut progress = tactics::Progress::default();
     let mut projectiles = tactics::Projectiles::default();
     let mut retreat_trail = tactics::RetreatTrail::default();
+    let mut threat_memory = perception::RangedMemory::default();
     let mut retreat_progress = recovery::Progress::default();
     let mut native_escape = recovery::Discovery::default();
     let mut last_meal = None;
@@ -541,7 +543,8 @@ async fn controller(
         let burning = observed.player["fire_ticks"]
             .as_i64()
             .is_some_and(|n| n > 0);
-        let threatened = geometry::threatened(&observed);
+        let policy_observed = threat_memory.policy(&observed);
+        let threatened = geometry::threatened(&policy_observed);
         let trail = retreat_trail.update(&observed, threatened || incoming);
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
         let water_emergency = geometry::water_danger(&observed);
@@ -570,7 +573,7 @@ async fn controller(
         let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
         let escape = if active["outcome"] != "running" && !awaiting_native {
             geometry::evade_with_native(
-                &observed,
+                &policy_observed,
                 &rejected_routes,
                 &stationary_projectiles,
                 &trail,
@@ -743,7 +746,7 @@ async fn controller(
                         };
                         let decision = (decision_samples > 0).then(|| {
                             decision::Snapshot::capture(
-                                &observed,
+                                &policy_observed,
                                 &rejected_routes,
                                 &stationary_projectiles,
                                 &trail,

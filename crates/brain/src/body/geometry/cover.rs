@@ -1,6 +1,21 @@
 //! Bounded dry-ground approach to currently observed ballistic cover.
 use super::*;
 
+fn avoids_contact(a: [f64; 3], b: [f64; 3], enemies: &[[f64; 3]]) -> bool {
+    let dx = b[0] - a[0];
+    let dz = b[2] - a[2];
+    let length = dx * dx + dz * dz;
+    enemies.iter().all(|e| {
+        let t = if length > 0. {
+            ((e[0] - a[0]) * dx + (e[2] - a[2]) * dz) / length
+        } else {
+            0.
+        }
+        .clamp(0., 1.);
+        (a[0] + t * dx - e[0]).hypot(a[2] + t * dz - e[2]) >= 4.5
+    })
+}
+
 fn segment(cells: &Cells<'_>, obstacles: &[[f64; 6]], a: [f64; 3], b: [f64; 3]) -> bool {
     let steps = ((a[0] - b[0]).hypot(a[2] - b[2]) * 8.).ceil().max(1.) as u32;
     (0..=steps).all(|n| {
@@ -36,7 +51,7 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
     for enemy in o.world["entities"]
         .as_array()?
         .iter()
-        .filter(|e| e["visible"] == true && e["hostile"] == true)
+        .filter(|e| perceived(e) && e["hostile"] == true)
     {
         if enemy["ranged_attack"] != true {
             return None;
@@ -109,6 +124,7 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
                 (nodes[current][0] - nodes[next][0]).hypot(nodes[current][2] - nodes[next][2]);
             if length <= 1.6
                 && distance[current] + length < distance[next]
+                && avoids_contact(nodes[current], nodes[next], &enemies)
                 && segment(&cells, &obstacles, nodes[current], nodes[next])
             {
                 distance[next] = distance[current] + length;
@@ -130,6 +146,7 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
         (p[0] - start[0]).abs() <= axis
             && (p[2] - start[2]).abs() <= axis
             && (p[0] - start[0]).hypot(p[2] - start[2]) >= 0.35
+            && avoids_contact(start, p, &enemies)
             && segment(&cells, &obstacles, start, p)
     })?;
     Some(Escape {
@@ -149,4 +166,18 @@ pub(super) fn approach(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Opti
             })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn safe_endpoints_cannot_shortcut_through_an_archers_contact_range() {
+        assert!(!avoids_contact(
+            [-5., 1., 0.],
+            [5., 1., 0.],
+            &[[0., 1., 0.]]
+        ));
+        assert!(avoids_contact([-5., 1., 5.], [5., 1., 5.], &[[0., 1., 0.]]));
+    }
 }
