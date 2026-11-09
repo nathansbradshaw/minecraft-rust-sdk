@@ -1,4 +1,5 @@
 pub mod adapter;
+mod delivery;
 pub mod operator;
 pub mod store;
 use adapter::{Adapter, AdapterConfig, AdapterPool};
@@ -514,7 +515,7 @@ async fn action(
         let (receipt, new) = g.db()?.prepare(&bot, &request, &adapter)?;
         let prepare_ms = phase.elapsed().as_millis();
         if !new {
-            return Ok(receipt);
+            return Ok(delivery::existing(receipt));
         }
         let phase = Instant::now();
         let response = g

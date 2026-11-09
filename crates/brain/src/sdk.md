@@ -89,6 +89,11 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
 - Keep unique durable IDs per intention. An interrupted/Uncertain mutation is
   inspected with action_status, pending_actions and reconcile; never replay it
   under a new ID. Reconciliation does not prove a historical effect.
+  A repeated act request can return evidence.gateway_delivery with
+  action_id_already_recorded=true and new_intention_dispatched=false. This
+  delivers the old receipt, including any old verified effect; it does not
+  execute that intention again. A learned program must inspect its existing
+  IDs and current postconditions, then use fresh IDs for distinct new work.
 - Print compact action ID/outcome/error and relevant before/after facts, not full
   world receipts every frame. Authoritative evidence stays in the gateway journal.
 - Generic menu builders: menu::prepare_recipe(&observation, recipe_id, make_all)

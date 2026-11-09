@@ -55,6 +55,15 @@ separate layers described below.
 
 The journal commits intent before dispatch, keeps action IDs permanently and
 fences multiple gateway processes with a file lock.
+An exact repeated action request returns its existing receipt with response-only
+`evidence.gateway_delivery.action_id_already_recorded = true` and
+`new_intention_dispatched = false`. Original outcomes, native effects and stored
+journal evidence stay historical and unchanged. Running-status refresh can still
+observe an existing action; this metadata only says no new intention was
+dispatched for the repeated request. SDK waits retain it through status reads.
+Use current postconditions to assess a resumed program, and inspect/reconcile
+uncertain IDs before distinct new work. A cached verified effect is not a new
+effect attributed to the latest program run.
 
 No HTTP or MCP operator endpoint exists. Operator recovery/revocation uses a
 mode-600 Unix socket beside the gateway journal, with same-UID peer checks.

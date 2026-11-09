@@ -249,7 +249,11 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
         {
             match tokio::time::timeout_at(deadline, brain.client.action_status(id)).await {
                 Ok(Ok(receipt)) => {
+                    let delivery = row["response"]["gateway_delivery"].clone();
                     row["response"] = crate::feedback::receipt_summary(&receipt);
+                    if !delivery.is_null() {
+                        row["response"]["gateway_delivery"] = delivery;
+                    }
                     if let Ok(request) = serde_json::from_value(row["request"].clone()) {
                         row["container_inspection"] =
                             json!(crate::containers::inspection(&request, &receipt));

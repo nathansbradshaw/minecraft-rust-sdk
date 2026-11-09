@@ -243,7 +243,8 @@ impl Journal {
                 let action = &row["request"]["action"];
                 json!({"kind":action["kind"],"stage":action["stage"],
                     "block":action["block"],"outcome":row["response"]["outcome"],
-                    "verified":row["response"]["native_effect_verified"]})
+                    "verified":row["response"]["native_effect_verified"],
+                    "reused_action_id":row["response"]["gateway_delivery"]["action_id_already_recorded"]})
             })
             .collect();
         let inventory = result["inventory_delta"].as_array().map(|rows|
@@ -261,7 +262,7 @@ impl Journal {
             goal,
             filenames.join(", "),
         );
-        let effects:Vec<_>=result["local_action_feedback"]["requests"].as_array().into_iter().flatten().filter(|row|row["response"]["outcome"]=="observed"&&row["response"]["native_effect_verified"]==true).take(4).map(|row|json!({"action_id":row["request"]["action_id"],"kind":row["request"]["action"]["kind"]})).collect();
+        let effects:Vec<_>=result["local_action_feedback"]["requests"].as_array().into_iter().flatten().filter(|row|row["response"]["outcome"]=="observed"&&row["response"]["native_effect_verified"]==true&&row["response"]["gateway_delivery"]["action_id_already_recorded"]!=true).take(4).map(|row|json!({"action_id":row["request"]["action_id"],"kind":row["request"]["action"]["kind"]})).collect();
         let gain = result["inventory_delta"]
             .as_array()
             .into_iter()
@@ -340,6 +341,46 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_native_receipt_cannot_promote_a_new_program_experiment() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let state = dir.path().join("state");
+        fs::create_dir(&work).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(work.join("main.rs"), "fn main() {}").unwrap();
+        let version = snapshot(&work, &state).unwrap().unwrap();
+        let j = Journal::open(&state.join("brain.sqlite")).unwrap();
+        let choice = Choice {
+            tool: "run".into(),
+            input: "gather".into(),
+            path: String::new(),
+            summary: String::new(),
+            notes: String::new(),
+            experiment: true,
+        };
+        j.remember_program(&state,&version,"gather materials",&choice,&json!({"success":true,"exit_code":0,"inventory_changed":true,
+            "inventory_delta":[{"item":"fixture:material","change":1}],
+            "local_action_feedback":{"requests":[{"request":{"action_id":"old-id","action":{"kind":"dig"}},
+                "response":{"outcome":"observed","native_effect_verified":true,"gateway_delivery":{"action_id_already_recorded":true,"new_intention_dispatched":false}}}]}})).unwrap();
+        let found = j.recall("gather materials").unwrap();
+        assert!(
+            found[0]["provenance"]["status"]
+                .as_str()
+                .unwrap()
+                .starts_with("candidate")
+        );
+        assert_eq!(
+            found[0]["provenance"]["native_receipt_references"],
+            json!([])
+        );
+        assert!(
+            found[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"reused_action_id\":true")
+        );
+    }
     #[test]
     fn program_outcomes_and_source_versions_are_retrievable_without_promoting_exit_zero() {
         let dir = tempfile::tempdir().unwrap();
