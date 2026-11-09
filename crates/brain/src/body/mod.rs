@@ -1,5 +1,6 @@
 //! Replaceable container-local safety behavior, independent of model/terminal work.
 mod aerial;
+pub mod decision;
 pub mod geometry;
 mod recovery;
 mod tactics;
@@ -32,12 +33,16 @@ pub struct Config {
     pub enabled: bool,
     #[serde(default = "period")]
     pub period_ms: u64,
+    /// Opt-in diagnostic cap per body startup. Zero avoids production logging.
+    #[serde(default)]
+    pub decision_samples: u16,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
             period_ms: period(),
+            decision_samples: 0,
         }
     }
 }
@@ -179,6 +184,10 @@ impl Handle {
     ) -> Result<Self> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         ensure((50..=1000).contains(&cfg.period_ms), "Invalid body cadence")?;
+        ensure(
+            cfg.decision_samples <= 128,
+            "At most128 diagnostic body decisions permitted",
+        )?;
         ensure(
             (0.9..=4.2).contains(&finite_waypoint_axis),
             "Invalid body waypoint range",
@@ -436,6 +445,7 @@ async fn controller(
     finite_waypoint_axis: f64,
     through_supported: bool,
 ) -> Result<()> {
+    let mut decision_samples = cfg.decision_samples;
     let mut entropy = [0u8; 16];
     std::io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut entropy)?;
     let epoch = crate::digest(&entropy);
@@ -731,6 +741,17 @@ async fn controller(
                                 max_ticks: 60,
                             }
                         };
+                        let decision = (decision_samples > 0).then(|| {
+                            decision::Snapshot::capture(
+                                &observed,
+                                &rejected_routes,
+                                &stationary_projectiles,
+                                &trail,
+                                finite_waypoint_axis,
+                                &admitted,
+                                &route,
+                            )
+                        });
                         let mut r = send(&client, j, action).await?;
                         // A definite pre-dispatch capability refusal can use
                         // the precise alternative. Never replay uncertain input.
@@ -752,6 +773,16 @@ async fn controller(
                             .await?;
                         }
                         let dispatched_id = r.action_id.clone();
+                        if let Some(decision) = decision {
+                            decision_samples -= 1;
+                            let bytes = serde_json::to_vec(&decision)?;
+                            if bytes.len() <= decision::MAX_BYTES {
+                                j.event("body_decision",json!({"action_id":dispatched_id,"snapshot":decision,
+                                    "snapshot_sha256":crate::digest(&bytes),"scope":"Client policy inputs only; native receipts remain authoritative"}))?;
+                            } else {
+                                j.event("body_decision_omitted",json!({"action_id":dispatched_id,"bytes":bytes.len(),"limit":decision::MAX_BYTES,"reason":"Diagnostic input exceeds bounded record; no complete replay claim"}))?;
+                            }
+                        }
                         if r.outcome == Outcome::Running {
                             owned_control = dispatched_id.clone();
                             owned_water_control = water_emergency;

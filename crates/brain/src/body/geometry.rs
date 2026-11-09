@@ -149,7 +149,7 @@ pub fn can_pass_waypoint(o: &Observation, route: &Escape) -> bool {
 }
 /// A bounded prediction returned by the installed movement adapter. It still
 /// needs fresh action admission and observed completion, like every movement.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct Admitted {
     pub target: [f64; 3],
     pub jump: bool,
@@ -798,6 +798,86 @@ mod tests {
             player: json!({"position":[0.5,1.,0.5]}),
             world: json!({"blocks":blocks,"entities":[{"visible":true,"hostile":true,"position":[2.5,1.,0.5]}]}),
             menu: Value::Null,
+        }
+    }
+    #[test]
+    fn a_known_cover_corner_is_reached_instead_of_repeated_exposed_retreat() {
+        // Source-only policy counterexample, with geometry translated from the
+        // declared arena. Not a reconstruction of unrecorded decision inputs.
+        let mut o = world();
+        o.player = json!({"position":[0.1189,1.,-0.7871],"on_ground":true});
+        o.world["entities"] = json!([{"visible":true,"hostile":true,
+            "ranged_attack":true,"position":[10.6578,1.,0.297]}]);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&b["position"]).unwrap();
+            if p[0] == -3. && (1. ..=3.).contains(&p[1]) && (-2. ..=2.).contains(&p[2]) {
+                b["block"] = json!("minecraft:stone_bricks");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let enemy = point(&o.world["entities"][0]["position"]).unwrap();
+        let obstacles = boxes(&o);
+        let mut steps = Vec::new();
+        for _ in 0..3 {
+            let p = point(&o.player["position"]).unwrap();
+            if covered(p, enemy, &obstacles) {
+                break;
+            }
+            let Some(route) = evade(&o) else {
+                break;
+            };
+            let p = [route.target.x, route.target.y, route.target.z];
+            steps.push(p);
+            o.player["position"] = json!(p);
+        }
+        assert!(
+            covered(point(&o.player["position"]).unwrap(), enemy, &obstacles),
+            "Known reachable cover was not reached within three finite waypoints: {steps:?}"
+        );
+    }
+    #[test]
+    fn bounded_decision_capture_replays_real_policy_fields_and_history() {
+        let mut o = world();
+        let blocked = [[1, 1, 1]];
+        let stationary = ["uuid:embedded".to_string()];
+        let trail = [[0.5, 1., 0.5], [-0.5, 1., -0.5]];
+        let admitted = [Admitted {
+            target: [-1.5, 1., 0.5],
+            jump: false,
+        }];
+        for mode in ["ranged", "melee", "water", "unknown"] {
+            if mode == "water" {
+                o = pool();
+            }
+            if mode == "unknown" {
+                o = world();
+                o.world["blocks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|b| b["position"][0] != -2);
+            }
+            if mode == "ranged" {
+                o.world["entities"][0]["ranged_attack"] = json!(true);
+            }
+            if mode == "melee" {
+                o.world["entities"][0]["ranged_attack"] = json!(false);
+            }
+            let route =
+                evade_with_native(&o, &blocked, &stationary, &trail, 3.5, &admitted).unwrap();
+            let snapshot = super::super::decision::Snapshot::capture(
+                &o,
+                &blocked,
+                &stationary,
+                &trail,
+                3.5,
+                &admitted,
+                &route,
+            );
+            let bytes = serde_json::to_vec(&snapshot).unwrap();
+            assert!(bytes.len() <= super::super::decision::MAX_BYTES);
+            let restored: super::super::decision::Snapshot =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored.replay()["matches_recorded_choice"], true, "{mode}");
         }
     }
     #[test]

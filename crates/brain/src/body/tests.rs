@@ -123,6 +123,7 @@ async fn stalled_native_query_does_not_stop_observation_or_close_threat_defense(
             Config {
                 enabled: true,
                 period_ms: 50,
+                decision_samples: 0,
             },
             shared,
             stop,
@@ -331,6 +332,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
             Config {
                 enabled: true,
                 period_ms: 50,
+                decision_samples: 0,
             },
             shared,
             stop,
