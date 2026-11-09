@@ -109,7 +109,7 @@ final class NativeObservation {
         physics.put("fall_flying",player.isFallFlying());physics.put("flying",player.getAbilities().flying);own.put("physics",physics);
         var mining=(dev.minecraftsdk.mixin.GameModeAccessor)player.gameMode;var target=mining.sdk$miningPosition();own.put("mining",Map.of("active",mining.sdk$mining(),"block",List.of(target.getX(),target.getY(),target.getZ())));own.put("accepted_chat",NativeChat.snapshot(player));
         var chat=NativeChat.inbox(player);
-        return Map.of("revision",Integer.toString(server.getTickCount()),"player",own,"world",Map.of("game_time",world.getGameTime(),"day_time",world.getDayTime(),"blocks",blocks,"entities",entities,"unknown_columns",unknown,"chat",chat.get("messages"),"chat_epoch",chat.get("epoch"),"chat_dropped",chat.get("dropped"),"sample_clock",sampleClock),"menu",Map.of("menu_id",menu.containerId,"state_id",menu.getStateId(),"type",menu==player.inventoryMenu?"minecraft:inventory":BuiltInRegistries.MENU.getKey(menu.getType()).toString(),"slots",slots,"carried",stack(menu.getCarried(),player)));
+        return Map.of("revision",Integer.toString(server.getTickCount()),"player",own,"world",Map.of("game_time",world.getGameTime(),"day_time",world.getDayTime(),"blocks",blocks,"entities",entities,"unknown_columns",unknown,"chat",chat.get("messages"),"chat_epoch",chat.get("epoch"),"chat_dropped",chat.get("dropped"),"sample_clock",sampleClock,"auditory",NativeHearing.snapshot(player)),"menu",Map.of("menu_id",menu.containerId,"state_id",menu.getStateId(),"type",menu==player.inventoryMenu?"minecraft:inventory":BuiltInRegistries.MENU.getKey(menu.getType()).toString(),"slots",slots,"carried",stack(menu.getCarried(),player)));
     }
     private NativeObservation(){}
 }
