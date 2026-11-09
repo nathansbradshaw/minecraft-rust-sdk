@@ -39,3 +39,25 @@ provides a bounded read-only diagnostic for 1–30 seconds. Connect and disconne
 with `mc-sdk`; retain private profile/output files. It reports only observations
 and hashes and cannot prove a body response or Survival. Validate native hearing
 and negative controls before implementing sound-triggered tactical behavior.
+
+The default reference body requires this capability and a valid initial frame;
+older modules fail startup clearly. Its independent thread keeps up to 32 recent
+emissions for 600 native ticks and gives reasoning the most recent eight. Facts
+and cursor are persisted in the character's private body journal. A separate,
+four-entry alarm memory prevents unrelated sound bursts from erasing an active
+priming cue. Listener, life, dimension, server clock and sound epoch changes
+clear old hypotheses; repeated observations never extend their lifetime.
+
+A creeper priming sound permits a precautionary blast hypothesis for 40 ticks
+using 12-block clearance because charge state is unknown. TNT priming uses 100
+ticks and eight blocks. These are client policy leases, not observed countdowns
+or proof of a stationary explosive. The body uses existing finite movement over
+known support and cancels travel toward the emission origin. Water, terrain,
+visible threats and projectile handling remain active. No entity row, hidden
+target or present-day pose is manufactured from a sound.
+
+Footsteps, bow shots and other cues reach reasoning as auditory facts. Automatic
+bow-source tracking, voice transcription and general sound investigation are not
+implemented. Source checks establish neither reaction timing nor survival: native
+heard-but-unseen response trials, benign/stale controls and sustained coding-load
+trials are separate acceptance requirements.
