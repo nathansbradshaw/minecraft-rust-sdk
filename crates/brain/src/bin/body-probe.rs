@@ -8,6 +8,9 @@ use std::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "navigation-worker" {
+        return minecraft_sdk_brain::navigation::worker(Path::new(&args[1])).await;
+    }
     if args.len() == 2 && args[0] == "inspect-observation" {
         let bytes = private_read(Path::new(&args[1]), 1024 * 1024)?;
         let observed: minecraft_sdk::Observation = serde_json::from_slice(&bytes)?;
@@ -23,8 +26,10 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if args.len() != 3 || !matches!(args[1].as_str(), "blocked" | "compile" | "exposed") {
-        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
+    if !((args.len() == 3 && matches!(args[1].as_str(), "blocked" | "compile" | "exposed"))
+        || (args.len() == 4 && args[1] == "navigate"))
+    {
+        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
     }
     let seconds: u64 = args[2].parse()?;
     if !(1..=600).contains(&seconds) {
@@ -41,7 +46,7 @@ async fn main() -> Result<()> {
     brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
         "scope":"Full SDK observation for this diagnostic; body may already be acting. Not an earlier frozen-trial scene.",
         "observation":initial_scene}))?;
-    brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"body_enabled":brain.body.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler. Exposed mode is a deliberate no-defense positive control, never an agent success."}))?;
+    brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"body_enabled":brain.body.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler. Navigate mode uses an operator-declared traversal with real adapter interval priming. Exposed mode is a deliberate no-defense positive control, never an agent success."}))?;
     let run=async {
         if args[1]=="compile" {
             let compiler_started=Instant::now();
@@ -49,6 +54,22 @@ async fn main() -> Result<()> {
             brain.journal.event("body_probe_compiler",json!({"result":result,"elapsed_ms":compiler_started.elapsed().as_millis(),"success_is_not_survival_proof":true}))?;
             // A failed compiler is also a required resilience case. Preserve its
             // error and keep the body running for the declared trial duration.
+        } else if args[1]=="navigate" {
+            let goal=private_read(Path::new(&args[3]),10000)?;
+            let goal=std::str::from_utf8(&goal)?;
+            // Prime the real adapter's read interval, retaining its exact
+            // response. The SDK must handle the next transient page itself.
+            for _ in 0..2 {
+                let page=brain.client.read_observation(&minecraft_sdk::ObservationQuery {
+                    capability:"minecraft:movement_options".into(),
+                    input:json!({"limit":1,"offset":0}),
+                }).await?;
+                brain.journal.event("body_probe_movement_preview",json!({"response":page,
+                    "scope":"Unmodified adapter response; read-only interval priming, not a generated plan"}))?;
+            }
+            let result=minecraft_sdk_brain::navigation::execute(&mut brain,goal).await?;
+            brain.journal.event("body_probe_navigation",json!({"result":result,
+                "scope":"Operator-declared traversal diagnostic, not autonomous competence or hostile survival"}))?;
         } else if args[1]=="exposed" {
             let deadline=tokio::time::Instant::from_std(started+Duration::from_secs(seconds));
             let mut cadence=tokio::time::interval(Duration::from_millis(500));

@@ -6,6 +6,24 @@ The matching adapter must advertise `minecraft:movement_options`. It computes
 paged, read-only predictions using the same collision, gravity and cancellation
 admission as finite controls. No prediction is an executed game effect.
 
+A busy control or the adapter's read interval can produce a valid pending page:
+`origin: null`, an empty `scene` and `options`, `complete: false`, and no next
+offset. The navigator waits for its bounded `retry_after_ms` within the original
+operation deadline. It does not treat this as version incompatibility, dispatch
+a movement, or replay a pending action. Ready pages still require a scene and
+valid origin. Reports include the journal's cumulative `preview_waits` count;
+that client counter is diagnostic evidence, not authoritative gameplay proof.
+The reference Survival body's background escape discovery also retries pending
+pages without waiting for the character to move or blocking urgent defense.
+
+For a declared zero-inference native diagnostic, run
+`body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json` inside the isolated
+worker. It starts the body, primes the real preview interval with read-only
+queries, executes the normal navigation helper, and retains responses and
+results. Supply an observed, permitted goal and retain native receipts. This
+operator-supplied traversal does not establish autonomous planning or hostile
+Survival competence.
+
 For direct diagnostic queries, `minecraft:movement_options` accepts `offset`,
 an optional nearby `target`, and `limit` (1–64, default 64). For example,
 `{"offset":0,"limit":4}` bounds a page to four evaluated candidates and at most

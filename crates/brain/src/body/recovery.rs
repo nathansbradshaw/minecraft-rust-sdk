@@ -75,6 +75,7 @@ struct Page {
     options: Vec<Route>,
     complete: bool,
     next_offset: Option<usize>,
+    retry_after_ms: Option<u64>,
 }
 
 pub(super) struct Discovery {
@@ -203,15 +204,31 @@ impl Discovery {
     }
     fn accept(&mut self, value: Value, o: &Observation, axis: f64) -> Result<()> {
         let page: Page = serde_json::from_value(value)?;
-        let origin = page.origin.ok_or("Native escape origin unavailable")?;
-        let p = geometry::point(&o.player["position"]).ok_or("Player pose unavailable")?;
         ensure(
             page.format == "minecraft-movement-options-v1"
-                && !page.scene.is_empty()
                 && page.scene.len() <= 128
                 && page.options.len() <= 64,
             "Invalid native escape page",
         )?;
+        let Some(origin) = page.origin else {
+            ensure(
+                page.scene.is_empty()
+                    && page.options.is_empty()
+                    && !page.complete
+                    && page.next_offset.is_none()
+                    && page.retry_after_ms.is_some(),
+                "Invalid pending native escape page",
+            )?;
+            // A busy adapter must not retire discovery until the next pose
+            // change. Retry the same read page while urgent defense continues.
+            self.routes.clear();
+            self.received = None;
+            self.next_query = Instant::now()
+                + Duration::from_millis(page.retry_after_ms.unwrap().clamp(25, 5000));
+            return Ok(());
+        };
+        ensure(!page.scene.is_empty(), "Native escape scene unavailable")?;
+        let p = geometry::point(&o.player["position"]).ok_or("Player pose unavailable")?;
         ensure(
             origin.dimension == o.player["dimension"].as_str().unwrap_or_default()
                 && origin.position.iter().all(|n| n.is_finite())
@@ -287,6 +304,47 @@ mod tests {
             "options":[{"target":[-0.5,2.,0.5],"jump":true,"duration_ticks":16,
                 "max_ticks":100,"touched_blocks":["minecraft:stone","minecraft:air"]}],
             "complete":true,"next_offset":null})
+    }
+    #[test]
+    fn busy_escape_preview_preserves_discovery_and_retries_without_a_pose_change() {
+        let o = observation();
+        let pending = json!({"format":"minecraft-movement-options-v1","origin":null,
+            "scene":"","options":[],"complete":false,"next_offset":null,
+            "retry_after_ms":250,"busy":true});
+        let mut d = Discovery::default();
+        d.routes.push(Admitted {
+            target: [-0.5, 2., 0.5],
+            jump: true,
+        });
+        d.received = Some(Instant::now());
+        let start = Instant::now();
+        d.accept(pending.clone(), &o, 3.5).unwrap();
+        assert!(!d.done);
+        assert!(
+            d.routes.is_empty(),
+            "A pending page cannot validate stale controls"
+        );
+        assert!(d.received.is_none());
+        assert!(d.next_query >= start + Duration::from_millis(250));
+        d.accept(page(), &o, 3.5).unwrap();
+        assert_eq!(d.routes.len(), 1);
+        for field in [
+            "complete",
+            "scene",
+            "next_offset",
+            "retry_after_ms",
+            "format",
+        ] {
+            let mut malformed = pending.clone();
+            malformed[field] = match field {
+                "complete" => json!(true),
+                "scene" => json!("unexpected"),
+                "next_offset" => json!(8),
+                "format" => json!("future-v2"),
+                _ => Value::Null,
+            };
+            assert!(Discovery::default().accept(malformed, &o, 3.5).is_err());
+        }
     }
     #[test]
     fn short_oscillation_is_not_retreat_and_new_lives_or_clocks_reset_the_window() {
