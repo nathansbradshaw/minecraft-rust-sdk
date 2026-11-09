@@ -8,6 +8,9 @@ use std::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "navigation-worker" {
+        return minecraft_sdk_brain::navigation::worker(Path::new(&args[1])).await;
+    }
     if args.len() == 2 && args[0] == "inspect-observation" {
         let bytes = private_read(Path::new(&args[1]), 1024 * 1024)?;
         let observed: minecraft_sdk::Observation = serde_json::from_slice(&bytes)?;
