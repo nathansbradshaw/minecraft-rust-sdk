@@ -1,9 +1,8 @@
 # Run a bounded operator fixture
 
-Implementation status: source-only draft awaiting the coordinated test/build.
-`launch` is deliberately disabled until owned remote-process/container
-finalization and archive integration are complete. The isolated RCON list fast
-path is available for the operator's bounded read-only installation check:
+The operator commands prepare, run and close one frozen fixture. Their receipts
+record failures and incomplete cleanup; they never award gameplay success.
+The isolated RCON list fast path checks the installation without an actor:
 
 ```sh
 mc-sdk-bench rcon-list 127.0.0.1:25575 /private/operator-only/rcon.password
@@ -41,8 +40,7 @@ SHA-256 of the reviewed fixture, with real allocated UUIDs and pinned artifacts;
 placeholders fail validation. Each command is attempted once in that directory.
 A failed command is retained, not replaced with a successful-looking attempt.
 
-The automatic `run` path requires RCON and immediately chains stage and launch;
-it remains disabled alongside standalone launch until integration verification.
+The automatic `run` path requires RCON and immediately chains stage and launch.
 It performs expensive SDK/artifact/filesystem preflight before connecting, then
 rechecks only the frozen container generation and local fixture at launch.
 Prepare/check everything before connecting. Do not insert a manual idle window

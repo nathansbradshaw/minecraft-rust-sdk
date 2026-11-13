@@ -28,8 +28,14 @@ pub(super) fn take_interrupt() -> bool {
 
 pub fn run(args: Vec<OsString>) -> Result<()> {
     unsafe {
-        libc::signal(libc::SIGINT, interrupt_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, interrupt_signal as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            interrupt_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            interrupt_signal as *const () as libc::sighandler_t,
+        );
     }
     if args.first().is_some_and(|a| a == "rcon-list") {
         ensure(
@@ -106,10 +112,6 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         "stage" if args.len() == 4 => stage(&mut runner, &fixture, case, hash)?,
         "run" if args.len() == 4 => {
             ensure(
-                false,
-                "run disabled until owned finalization integration is verified",
-            )?;
-            ensure(
                 fixture.operator_rcon.is_some(),
                 "automatic run requires private typed RCON; no connected manual gap",
             )?;
@@ -124,10 +126,6 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             )?;
         }
         "launch" if args.len() == 4 => {
-            ensure(
-                false,
-                "launch disabled until owned remote finalization and archive integration are verified",
-            )?;
             launch(&mut runner, &mut SystemRunner::new(), &fixture, case, hash)?;
         }
         "nativecapture" if (7..=11).contains(&args.len()) => capture::native(

@@ -34,11 +34,11 @@ impl Runner for Fake {
         out.stdout = secrets.scrub(&out.stdout);
         out.stderr = secrets.scrub(&out.stderr);
         for line in out.stdout.split(|b| *b == b'\n') {
-            if let Ok(v) = serde_json::from_slice(line) {
-                if on_line(&v).is_err() {
-                    out.success = false;
-                    break;
-                }
+            if let Ok(v) = serde_json::from_slice(line)
+                && on_line(&v).is_err()
+            {
+                out.success = false;
+                break;
             }
         }
         Ok(out)
@@ -341,8 +341,14 @@ fn fake_stage_connects_exact_id_and_leaves_console_handoff_pending() {
         calls: Vec::new(),
     };
     stage(&mut fake, &s.f, &s.case, &"c".repeat(64)).unwrap();
+    let connects: Vec<_> = fake
+        .calls
+        .iter()
+        .filter(|a| a.first().is_some_and(|a| a == "connect"))
+        .collect();
+    assert_eq!(connects.len(), 1);
     assert_eq!(
-        fake.calls[9],
+        *connects[0],
         vec![
             "connect",
             s.f.host_profile().unwrap().to_str().unwrap(),
