@@ -1040,6 +1040,26 @@ fn trajectory(
     }
     Err("No collision-safe trajectory reaches the requested supported waypoint".into())
 }
+fn require_native_integration(discovery: &Value) -> AnyResult<()> {
+    if discovery["minecraft_version"] != "1.21.1"
+        || discovery["platform"] != "neoforge"
+        || discovery["online_mode"] != true
+        || !discovery["native_observation_features"]
+            .as_array()
+            .is_some_and(|v| {
+                [
+                    "minecraft:physics_facts",
+                    "minecraft:native_action_effects",
+                    "minecraft:life_identity",
+                ]
+                .iter()
+                .all(|required| v.iter().any(|c| c == required))
+            })
+    {
+        return Err("Unsupported native integration: alpha.15 physics, native action effects and minecraft:life_identity are required".into());
+    }
+    Ok(())
+}
 fn main() -> AnyResult<()> {
     let path = std::env::args_os()
         .nth(1)
@@ -1056,23 +1076,7 @@ fn main() -> AnyResult<()> {
     }
     let native = Native::new(&config)?;
     let discovery = native.call("discover", json!({}))?;
-    if discovery["minecraft_version"] != "1.21.1"
-        || discovery["platform"] != "neoforge"
-        || discovery["online_mode"] != true
-        || !discovery["native_observation_features"]
-            .as_array()
-            .is_some_and(|v| {
-                [
-                    "minecraft:physics_facts",
-                    "minecraft:native_action_effects",
-                    "minecraft:life_identity",
-                ]
-                .iter()
-                .all(|required| v.iter().any(|c| c == required))
-            })
-    {
-        return Err("Unsupported native integration: physics, native action effects and minecraft:life_identity are required".into());
-    }
+    require_native_integration(&discovery)?;
     let mut players: HashMap<String, Player> = HashMap::new();
     let mut identities: HashMap<String, (String, String, String)> = HashMap::new();
     let mut channel: Option<(String, u64)> = None;
@@ -1894,6 +1898,26 @@ fn compact(action: &Action, o: &Observation) -> Value {
 #[cfg(test)]
 mod movement_tests {
     use super::*;
+    #[test]
+    fn native_compatibility_rejects_the_pre_life_identity_module() {
+        let mut discovery = json!({
+            "minecraft_version":"1.21.1","platform":"neoforge","online_mode":true,
+            "native_observation_features":["minecraft:physics_facts","minecraft:native_action_effects"]
+        });
+        assert!(
+            require_native_integration(&discovery)
+                .unwrap_err()
+                .to_string()
+                .contains("minecraft:life_identity")
+        );
+        discovery["native_observation_features"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("minecraft:life_identity"));
+        assert!(require_native_integration(&discovery).is_ok());
+        discovery["online_mode"] = json!(false);
+        assert!(require_native_integration(&discovery).is_err());
+    }
     #[test]
     fn respawn_requires_same_character_and_new_native_life_not_a_new_entity_id() {
         let before = Observation {
