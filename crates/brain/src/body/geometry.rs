@@ -201,16 +201,66 @@ fn perceived(entity: &Value) -> bool {
 /// Submersion needs protection independently of inference. A natively confirmed
 /// breathing surface swimmer may keep its finite input; unknown facts retain
 /// the conservative escape policy. No health/shelter prerequisite gates thought.
+pub(super) fn breathing_recovered(o: &Observation) -> bool {
+    o.player["eyes_in_water"] == false
+        && o.player["air"]
+            .as_i64()
+            .zip(o.player["max_air"].as_i64())
+            .is_some_and(|(air, max)| max > 0 && air >= max)
+}
 pub fn water_danger(o: &Observation) -> bool {
     if o.player["in_water"] != true {
         return false;
     }
-    let breathing = o.player["eyes_in_water"] == false
-        && o.player["air"]
+    !breathing_recovered(o)
+}
+/// Let an already admitted, short foreground swim finish toward observed
+/// breathable space. Unknown/low air and stale or releasing controls retain
+/// immediate protection. This grants no new control and never suppresses
+/// hostile, fire or projectile preemption.
+pub(super) fn bounded_surface_swim(o: &Observation, owned_control: &str) -> bool {
+    let active = &o.player["control"];
+    let Some(id) = active["action_id"].as_str().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if id == owned_control
+        || active["outcome"] != "running"
+        || active["cancel_requested"] == true
+        || active["progress"]["releasing"] == true
+        || active["progress"]["elapsed_ms"]
+            .as_u64()
+            .is_none_or(|n| n > 1500)
+        || o.player["eyes_in_water"].as_bool().is_none()
+        || !o.player["air"]
             .as_i64()
             .zip(o.player["max_air"].as_i64())
-            .is_some_and(|(air, max)| max > 0 && air >= max);
-    !breathing
+            .is_some_and(|(air, max)| max > 0 && air >= (max / 2).max(100))
+    {
+        return false;
+    }
+    let Some(target) = point(&active["target"]) else {
+        return false;
+    };
+    let Some(start) = point(&o.player["position"]) else {
+        return false;
+    };
+    if (0..3).any(|i| !target[i].is_finite() || (target[i] - start[i]).abs() > 4.2) {
+        return false;
+    }
+    let eye = [
+        target[0].floor(),
+        (target[1] + 1.62).floor(),
+        target[2].floor(),
+    ];
+    o.world["blocks"].as_array().is_some_and(|rows| {
+        rows.iter().any(|b| {
+            point(&b["position"]) == Some(eye)
+                && !hazardous(b)
+                && b["collision"].as_array().is_some_and(Vec::is_empty)
+                && b["fluid"]["water"] != true
+                && b["fluid"]["lava"] != true
+        })
+    })
 }
 
 /// Local policy, not permission or a path-completion claim. Prefer an observed
@@ -218,7 +268,18 @@ pub fn water_danger(o: &Observation) -> bool {
 /// is allowed along this route, but unknown cells, other hazards and collisions
 /// are not. The adapter separately admits the real held-input trajectory.
 fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
-    if !water_danger(o) {
+    water_escape_inner(o, blocked, false)
+}
+/// Finish an owned recovery to dry support after taking a breath. This does not
+/// initiate a body policy for an ordinary surface swimmer.
+pub(super) fn shore_after_breath(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
+    if o.player["in_water"] != true || !breathing_recovered(o) {
+        return None;
+    }
+    water_escape_inner(o, blocked, true)
+}
+fn water_escape_inner(o: &Observation, blocked: &[[i32; 3]], dry_only: bool) -> Option<Escape> {
+    if !dry_only && !water_danger(o) {
         return None;
     }
     let start = point(&o.player["position"])?;
@@ -276,19 +337,35 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
     for p in candidates {
         let horizontal = (p[0] - start[0]).hypot(p[2] - start[2]);
         let rise = p[1] - start[1];
+        // Near a vertical bank, a diagonal or ground-jump arc intersects its
+        // face before the feet clear the lip. Water input can first raise the
+        // player alongside the wall, then cross it. Require every cell along
+        // both legs; the native trajectory planner still admits the real input.
+        let rise_then_cross = rise > 0.1
+            && horizontal > 0.1
+            && (0..=24).all(|i| {
+                let t = f64::from(i) / 24.;
+                passable([start[0], start[1] + rise * t, start[2]])
+                    && passable([
+                        start[0] + (p[0] - start[0]) * t,
+                        p[1],
+                        start[2] + (p[2] - start[2]) * t,
+                    ])
+            });
         if horizontal > 3.
             || !(-0.05..=2.01).contains(&rise)
             || (horizontal < 0.1 && rise < 0.1)
             || blocked.contains(&target_key(p))
-            || ![0., 0.6].into_iter().any(|arc| {
-                (0..=24).all(|i| {
-                    let t = f64::from(i) / 24.;
-                    let mut q =
-                        std::array::from_fn(|axis| start[axis] + (p[axis] - start[axis]) * t);
-                    q[1] += arc * (std::f64::consts::PI * t).sin();
-                    passable(q)
-                })
-            })
+            || !(rise_then_cross
+                || [0., 0.6].into_iter().any(|arc| {
+                    (0..=24).all(|i| {
+                        let t = f64::from(i) / 24.;
+                        let mut q =
+                            std::array::from_fn(|axis| start[axis] + (p[axis] - start[axis]) * t);
+                        q[1] += arc * (std::f64::consts::PI * t).sin();
+                        passable(q)
+                    })
+                }))
         {
             continue;
         }
@@ -299,6 +376,9 @@ fn water_escape(o: &Observation, blocked: &[[i32; 3]]) -> Option<Escape> {
         ];
         let breathable = block(&cells, eye).is_some_and(|b| !hazardous(b));
         let dry = supported(&cells, p, &obstacles) && clear(&cells, p, &obstacles);
+        if dry_only && !dry {
+            continue;
+        }
         if !breathable && !dry && rise < 0.1 {
             continue;
         }
@@ -1473,6 +1553,73 @@ mod tests {
         assert!(water_danger(&o), "recover air before yielding protection");
     }
     #[test]
+    fn admitted_short_surface_swim_has_a_bounded_air_reserve() {
+        let mut o = pool();
+        o.player["eyes_in_water"] = json!(true);
+        o.player["air"] = json!(260);
+        o.player["control"] = json!({"action_id":"foreground-swim","outcome":"running",
+            "target":[0.5,2.,0.5],"progress":{"elapsed_ms":500,"releasing":false}});
+        assert!(bounded_surface_swim(&o, "body-own"));
+        assert!(
+            water_danger(&o),
+            "grace does not erase the raw water danger"
+        );
+        assert!(
+            !bounded_surface_swim(&o, "foreground-swim"),
+            "body-owned inputs are not foreground"
+        );
+        for (field, value) in [
+            ("air", json!(99)),
+            ("max_air", Value::Null),
+            ("eyes_in_water", Value::Null),
+        ] {
+            let mut invalid = o.clone();
+            invalid.player[field] = value;
+            assert!(!bounded_surface_swim(&invalid, "body-own"), "{field}");
+        }
+        for (field, value) in [
+            ("elapsed_ms", json!(1501)),
+            ("elapsed_ms", Value::Null),
+            ("releasing", json!(true)),
+        ] {
+            let mut invalid = o.clone();
+            invalid.player["control"]["progress"][field] = value;
+            assert!(!bounded_surface_swim(&invalid, "body-own"), "{field}");
+        }
+        o.player["control"]["cancel_requested"] = json!(true);
+        assert!(!bounded_surface_swim(&o, "body-own"));
+    }
+    #[test]
+    fn surface_swim_grace_requires_observed_breathable_destination() {
+        let mut o = pool();
+        o.player["eyes_in_water"] = json!(true);
+        o.player["air"] = json!(260);
+        o.player["control"] = json!({"action_id":"foreground-swim","outcome":"running",
+            "target":[0.5,2.,0.5],"progress":{"elapsed_ms":500}});
+        for id in ["minecraft:water", "minecraft:lava", "minecraft:stone"] {
+            let mut bad = o.clone();
+            for row in bad.world["blocks"].as_array_mut().unwrap() {
+                if row["position"] == json!([0, 3, 0]) {
+                    row["block"] = json!(id);
+                    row["collision"] = if id == "minecraft:stone" {
+                        json!([[0., 0., 0., 1., 1., 1.]])
+                    } else {
+                        json!([])
+                    };
+                }
+            }
+            assert!(!bounded_surface_swim(&bad, "body-own"), "{id}");
+        }
+        o.world["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|b| b["position"] != json!([0, 3, 0]));
+        assert!(
+            !bounded_surface_swim(&o, "body-own"),
+            "unknown destination is not air"
+        );
+    }
+    #[test]
     fn water_without_hostiles_still_requires_a_breathing_route() {
         let o = pool();
         assert!(!threatened(&o));
@@ -1523,6 +1670,71 @@ mod tests {
         assert!(route.reason.contains("dry support"));
         o.player["in_water"] = json!(false);
         assert!(evade(&o).is_none());
+    }
+    #[test]
+    fn recovered_breath_can_finish_owned_recovery_on_a_known_dry_bank() {
+        let mut o = pool();
+        o.player["position"] = json!([0.5, 2., 0.5]);
+        o.player["eyes_in_water"] = json!(false);
+        o.player["air"] = json!(300);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            let p = &b["position"];
+            if p[0].as_i64().unwrap() >= 2 && p[1] == 1 {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            } else if p[0].as_i64().unwrap() >= 2 && p[1] == 2 {
+                b["block"] = json!("minecraft:air");
+            }
+        }
+        assert!(!water_danger(&o));
+        assert!(
+            evade(&o).is_none(),
+            "ordinary surface swimmers are left to their program"
+        );
+        let route = shore_after_breath(&o, &[]).expect("owned recovery can finish to dry support");
+        assert_eq!(route.reason, "leave water for observed dry support");
+        assert!(route.target.x >= 2.);
+        assert!(
+            shore_after_breath(
+                &o,
+                &[target_key([route.target.x, route.target.y, route.target.z])]
+            )
+            .is_some()
+        );
+        o.player["in_water"] = json!(false);
+        assert!(shore_after_breath(&o, &[]).is_none());
+    }
+    #[test]
+    fn water_recovery_can_rise_beside_a_close_vertical_bank_before_crossing() {
+        let mut o = pool();
+        // Geometry copied in relative coordinates from the failed native
+        // shoreline: the leading body edge is less than2mm from the bank face.
+        o.player["position"] = json!([0.6981825844881, 1.19439882780125, 0.5]);
+        o.player["eyes_in_water"] = json!(true);
+        o.player["air"] = json!(296);
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][0].as_i64().unwrap() >= 1
+                && (1..=2).contains(&b["position"][1].as_i64().unwrap())
+            {
+                b["block"] = json!("minecraft:sand");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let route = evade(&o).expect("observed rise-then-cross bank candidate");
+        assert_eq!(route.reason, "leave water for observed dry support");
+        assert!(route.target.x >= 1.);
+        assert_eq!(route.target.y, 3.);
+        // Overhead obstruction invalidates the staged lift too.
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"] == json!([0, 3, 0]) {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        assert!(
+            evade(&o).is_none(),
+            "do not rise through an obstructing ceiling"
+        );
     }
     #[test]
     fn a_bank_beyond_one_control_pulls_the_surfacing_waypoint_toward_shore() {

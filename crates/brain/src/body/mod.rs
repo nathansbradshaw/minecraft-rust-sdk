@@ -468,6 +468,9 @@ async fn controller(
     let mut safe_since = Instant::now();
     let mut owned_control = String::new();
     let mut owned_water_control = false;
+    let mut owned_water_shore = false;
+    let mut allowed_surface_control = String::new();
+    let mut breathing_release_requested = String::new();
     let mut owned_projectiles = Vec::new();
     let mut cycles = 0u64;
     let mut rejected_routes = Vec::new();
@@ -633,7 +636,14 @@ async fn controller(
         let heard_danger = !heard_blasts.is_empty();
         let trail = retreat_trail.update(&observed, threatened || incoming);
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
-        let water_emergency = geometry::water_danger(&observed);
+        let surface_swim = geometry::bounded_surface_swim(&observed, &owned_control);
+        let water_emergency = geometry::water_danger(&observed) && !surface_swim;
+        if surface_swim && active["action_id"].as_str() != Some(&allowed_surface_control) {
+            allowed_surface_control = active["action_id"].as_str().unwrap_or_default().into();
+            j.event("body_surface_swim_continues",json!({"action_id":allowed_surface_control,
+                "air":observed.player["air"],"target":active["target"],
+                "scope":"Bounded admitted foreground input toward known breathing space; no new input or safety guarantee"}))?;
+        }
         let stalled = retreat_progress.stalled(&observed, threatened);
         let urgent = dead
             || heard_danger
@@ -659,7 +669,7 @@ async fn controller(
         // immediately restores the fast route without waiting for the query.
         let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
         let escape = if active["outcome"] != "running" && !awaiting_native {
-            geometry::evade_policy(
+            let defensive = geometry::evade_policy(
                 &policy_observed,
                 &rejected_routes,
                 &stationary_projectiles,
@@ -667,7 +677,12 @@ async fn controller(
                 finite_waypoint_axis,
                 &admitted,
                 cfg.experimental_ranged_boundary_turns,
-            )
+            );
+            defensive.or_else(|| {
+                owned_water_control
+                    .then(|| geometry::shore_after_breath(&policy_observed, &rejected_routes))
+                    .flatten()
+            })
         } else {
             None
         };
@@ -885,7 +900,10 @@ async fn controller(
                         }
                         if r.outcome == Outcome::Running {
                             owned_control = dispatched_id.clone();
-                            owned_water_control = water_emergency;
+                            owned_water_shore =
+                                route.reason == "leave water for observed dry support";
+                            owned_water_control = water_emergency
+                                || (observed.player["in_water"] == true && owned_water_shore);
                             owned_projectiles = incoming_projectiles.clone();
                         } else {
                             rejected_routes.push(key);
@@ -920,13 +938,47 @@ async fn controller(
                 last_attack = Instant::now();
                 j.event("body_defensive_attack",json!({"entity":entity,"action_id":receipt.action_id,"outcome":receipt.outcome,"native_effect_verified":receipt.evidence["native_effect_verified"],"observed_control":active,"reason":"cooldown-ready defense without pausing escape; server validates sight/reach and damage"}))?;
             }
-        } else if shared.urgent() && safe_since.elapsed() > Duration::from_secs(3) {
+        } else if shared.urgent()
+            && owned_water_control
+            && !owned_water_shore
+            && geometry::breathing_recovered(&observed)
+            && active["action_id"].as_str() == Some(&owned_control)
+            && active["outcome"] == "running"
+        {
+            // Release breathing-only input once, then wait for native release.
+            // A three-second hold here lets the character sink before handoff.
+            if active["cancel_requested"] != true && breathing_release_requested != owned_control {
+                let _guard = shared.mutation.lock().await;
+                breathing_release_requested = owned_control.clone();
+                let r = send(
+                    &client,
+                    j,
+                    Action::CancelControl {
+                        action_id: owned_control.clone(),
+                    },
+                )
+                .await?;
+                j.event(
+                    "body_breathing_input_released",
+                    json!({"action_id":owned_control,
+                    "cancel_action_id":r.action_id,"outcome":r.outcome,"replayed":false}),
+                )?;
+            }
+        } else if shared.urgent()
+            && (safe_since.elapsed() > Duration::from_secs(3)
+                || (owned_water_control
+                    && geometry::breathing_recovered(&observed)
+                    && active["outcome"] != "running"
+                    && active["input_released"] == true))
+        {
             if body_sprint {
                 let _guard = shared.mutation.lock().await;
                 send(&client, j, Action::Sprint { enabled: false }).await?;
                 body_sprint = false;
             }
             shared.emergency.store(false, Ordering::Release);
+            owned_water_control = false;
+            owned_water_shore = false;
             *shared.reason.lock().map_err(|_| "Body state unavailable")? =
                 "safe; ordinary program may resume".into();
             j.event(
