@@ -1787,12 +1787,13 @@ fn verified_effect(action: &Action, before: &Observation, after: &Observation) -
             })
         }
         Action::Look { yaw, pitch } => {
-            after.player["yaw"]
+            after.player["yaw"].as_f64().is_some_and(|y| {
+                // Java normalizes facing across the +/-180 degree seam.
+                // Compare the shortest yaw arc, including full rotations.
+                ((y - f64::from(*yaw) + 180.).rem_euclid(360.) - 180.).abs() < 0.5
+            }) && after.player["pitch"]
                 .as_f64()
-                .is_some_and(|y| (y - f64::from(*yaw)).abs() < 0.5)
-                && after.player["pitch"]
-                    .as_f64()
-                    .is_some_and(|p| (p - f64::from(*pitch)).abs() < 0.5)
+                .is_some_and(|p| (p - f64::from(*pitch)).abs() < 0.5)
         }
         Action::SelectSlot { slot } => after.player["selected"] == *slot,
         Action::Sprint { enabled } => after.player["sprinting"] == *enabled,
@@ -2009,6 +2010,100 @@ mod movement_tests {
             !verified_effect(&Action::Respawn, &before, &after),
             "old providers cannot silently certify a life change"
         );
+    }
+    fn look_observation(yaw: f64, pitch: f64) -> Observation {
+        Observation {
+            revision: "look-fixture".into(),
+            player: json!({"uuid":"character","entity_id":308,"life_id":"same-life",
+                "yaw":yaw,"pitch":pitch}),
+            world: Value::Null,
+            menu: Value::Null,
+        }
+    }
+    #[test]
+    fn look_verifies_equivalent_native_yaw_across_wrap_and_full_turns() {
+        let before = look_observation(0., 0.);
+        // Reproduce C04: requested +180, native -180, same life and pitch.
+        for (requested, observed) in [
+            (180., -180.),
+            (-180., 180.),
+            (900., -180.),
+            (-900., 180.),
+            (0., 720.),
+            (720., 0.),
+            (179.75, -179.9),
+        ] {
+            assert!(
+                verified_effect(
+                    &Action::Look {
+                        yaw: requested,
+                        pitch: 58.3
+                    },
+                    &before,
+                    &look_observation(observed, 58.3)
+                ),
+                "{requested} vs {observed}"
+            );
+        }
+    }
+    #[test]
+    fn look_still_requires_actual_yaw_and_pitch_with_original_strict_tolerance() {
+        let before = look_observation(0., 0.);
+        let action = Action::Look {
+            yaw: 180.,
+            pitch: 58.3,
+        };
+        assert!(!verified_effect(
+            &action,
+            &before,
+            &look_observation(0., 0.)
+        ));
+        assert!(!verified_effect(
+            &action,
+            &before,
+            &look_observation(-179., 58.3)
+        ));
+        assert!(!verified_effect(
+            &action,
+            &before,
+            &look_observation(-180., 57.3)
+        ));
+        assert!(
+            !verified_effect(&action, &before, &look_observation(-180., 418.3)),
+            "pitch does not wrap"
+        );
+        let action = Action::Look { yaw: 0., pitch: 0. };
+        for (yaw, pitch) in [(0.5, 0.), (-0.5, 0.), (0., 0.5), (0., -0.5)] {
+            assert!(!verified_effect(
+                &action,
+                &before,
+                &look_observation(yaw, pitch)
+            ));
+        }
+        assert!(verified_effect(
+            &action,
+            &before,
+            &look_observation(-0.49, 0.49)
+        ));
+    }
+    #[test]
+    fn look_wrap_does_not_bypass_character_life_or_observed_rotation_guards() {
+        let before = look_observation(0., 0.);
+        let action = Action::Look {
+            yaw: 180.,
+            pitch: 58.3,
+        };
+        for (key, value) in [
+            ("uuid", json!("other-character")),
+            ("life_id", json!("new-life")),
+            ("life_id", Value::Null),
+            ("yaw", Value::Null),
+            ("pitch", Value::Null),
+        ] {
+            let mut after = look_observation(-180., 58.3);
+            after.player[key] = value;
+            assert!(!verified_effect(&action, &before, &after), "{key}");
+        }
     }
     #[test]
     fn correction_reports_authorized_absolute_position_and_observed_support() {
