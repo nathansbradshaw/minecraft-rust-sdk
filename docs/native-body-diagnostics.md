@@ -1,6 +1,6 @@
 # Native body diagnostic admission
 
-`body-probe CONFIG blocked|compile|exposed SECONDS STIMULUS` optionally gates a
+`body-probe CONFIG blocked|compile|exposed|task|task-exposed SECONDS STIMULUS` optionally gates a
 diagnostic on an actual SDK observation. Use a private stimulus JSON file:
 
 ```json
@@ -14,6 +14,7 @@ diagnostic on an actual SDK observation. Use a private stimulus JSON file:
   "player_health": 20.0,
   "player_food": 20,
   "main_hand": "minecraft:bow",
+  "ranged_attack": true,
   "day_time_range": [13000, 20500],
   "timeout_secs": 300
 }
@@ -29,11 +30,15 @@ does not expose the server console to bot programs.
 
 The probe stays connected with the protective body and model calls disabled
 while awaiting the stimulus. It admits only the declared observed UUID, type,
-pose, health, visible ranged weapon and optional natural day window, while the
+pose, health, visibility, declared attack kind/weapon and optional natural day window, while the
 player still has its expected pose, health, food and empty inventory. A present
 but displaced/dead/wrong stimulus, an unexpected visible hostile, changed player
 state, or timeout ends the attempt with a retained error and session cleanup.
 No timed trial starts and no in-run repair is attempted.
+Omitting `ranged_attack` preserves the original `true` requirement. An ordinary
+unarmed melee enemy can declare `false` and `main_hand: "minecraft:air"`; its
+exact UUID, type, health, visibility and hostile fact remain required, and other
+visible hostiles still reject admission.
 
 `body_probe_stimulus_admitted` retains the actual SDK start observation and native
 clock. The body then starts on the same character session, followed by the full
@@ -41,6 +46,34 @@ declared test duration. `compile` runs the real Rust compiler; retain its comple
 artifact output and prove native movement overlaps that interval. Body death
 and ordinary respawn still fail Survival acceptance. A healthy run with a weak
 or mismatched stimulus cannot establish matched-pressure performance.
+
+`task` runs the existing `Brain::run` with the operator's configured goal,
+workspace, tools and model limits. `task-exposed` runs that same engine without
+the protective body. Its independent read-only observer reuses the already
+connected session saved by `Brain::open`; it never reconnects or starts a body.
+The observer makes ordinary cached observation reads, so repeated native clocks
+and gaps remain explicit. These modes report `models_called: null`; match the
+original brain/model journals and provider accounting for actual request counts.
+There is no new quota or synthetic compiler work. Retain genuine generated source,
+compiler invocation/output and native receipts to establish useful work/overlap.
+
+The task future is bounded by the remaining declared window. Early return keeps
+observing until the full window ends, but that tail is not labeled active work.
+`body_probe_task_finished` retains completion, error or timeout and its UTC bounds;
+engine return alone does not verify goal success. Task error/timeout fails the
+probe after ordinary cleanup. Cancellation does not prove remote provider/native
+work stopped; preserve original pending action IDs rather than replaying them.
+Cleanup and existing SDK HTTP deadlines can extend past the declared window.
+
+Continuity start/sample events include local UTC milliseconds. Initial and final
+`body_probe_native_clock_calibration` records each bracket exactly one existing
+fresh-observation request with UTC before/after and native UUID/life/epoch/nanos.
+They are unordered witnesses, separate from the ordered sampler; a slower response
+cannot create a false clock regression. Each request has a one-second caller
+budget, no retry and no cached fallback. Errors remain incomplete evidence. UTC
+brackets bound mapping uncertainty; they do not guarantee clock synchronization,
+continuous health coverage, an emergency abort, or compiler overlap. Death/life
+changes still fail, and independently saved death statistics remain required.
 
 Without a stimulus file, the existing diagnostic modes remain available. Their
 after-startup scene can already include enemy or character movement; it is not

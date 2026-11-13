@@ -7,7 +7,9 @@ use std::{
 };
 mod probe_admission;
 mod probe_continuity;
+mod probe_workload;
 mod shore_probe;
+use probe_workload::Mode;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -39,12 +41,9 @@ async fn main() -> Result<()> {
         println!("{}", snapshot.replay());
         return Ok(());
     }
-    if !((matches!(args.len(), 3 | 4)
-        && matches!(args[1].as_str(), "blocked" | "compile" | "exposed"))
-        || (args.len() == 4 && matches!(args[1].as_str(), "navigate" | "shore")))
-    {
-        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe PRIVATE_CONFIG.json shore SECONDS PRIVATE_SPEC.json | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
-    }
+    let mode = args.get(1).and_then(|value| Mode::parse(value))
+        .filter(|mode| mode.accepts_arity(args.len()))
+        .ok_or("body-probe PRIVATE_CONFIG.json blocked|compile|exposed|task|task-exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe PRIVATE_CONFIG.json shore SECONDS PRIVATE_SPEC.json | body-probe inspect-observation PRIVATE_OBSERVATION.json")?;
     let seconds: u64 = args[2].parse()?;
     if !(1..=600).contains(&seconds) {
         return Err("Diagnostic duration must be 1–600 seconds".into());
@@ -60,13 +59,14 @@ async fn main() -> Result<()> {
     };
     // Exposed is a positive pressure control: the same ordinary character and
     // admission path, deliberately without the independent protective body.
-    let enable_body = args[1] != "exposed";
+    let enable_body = mode.body_enabled();
     cfg.body.enabled = enable_body && admission.is_none();
     cfg.conversation = false;
     cfg.await_chat_goal = false;
     let mut brain = Brain::open(cfg).await?;
     let mut continuity = None;
     let mut final_scene = None;
+    let mut task_outcome = None;
     let run=async {
         if let Some(spec)=&admission {
             brain.observed=probe_admission::wait(&mut brain,spec).await?;
@@ -76,15 +76,18 @@ async fn main() -> Result<()> {
                 brain.body=Some(minecraft_sdk_brain::body::Handle::start_for_server(profile,brain.cfg.body.clone(),&brain.cfg.state,brain.observed.clone(),&brain.server)?);
             }
         }
-        continuity=Some(probe_continuity::Monitor::start(&brain)?);
+        continuity=Some(probe_continuity::Monitor::start(&brain, mode == Mode::TaskExposed).await?);
         let started = Instant::now();
         let initial_scene = brain.client.observe().await?;
         brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
             "scope":"Full SDK observation; body may already be acting. Optional stimulus admission is the earlier start-state witness.",
             "observation":initial_scene}))?;
-        brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"body_enabled":brain.body.is_some(),"stimulus_admission":admission.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler. Navigate mode uses an operator-declared traversal with real adapter interval priming. Exposed mode is a deliberate no-defense positive control, never an agent success."}))?;
+        brain.journal.event("body_probe_started",json!({"utc_ms":probe_continuity::utc_ms()?,"mode":args[1],"seconds":seconds,"models_called":mode.models_called(),"body_enabled":brain.body.is_some(),"stimulus_admission":admission.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the configured compiler command, not proof of useful coding. Task modes run the existing Brain::run with the operator goal; exact model counts, useful output and real compiler overlap require original journals/provider evidence. Exposed modes deliberately omit the body, never an agent success."}))?;
         if let Some(spec)=&shore {
             shore_probe::run(&mut brain,spec,seconds).await?;
+        } else if mode.is_task() {
+            task_outcome = Some(probe_workload::run(&mut brain,
+                Duration::from_secs(seconds).saturating_sub(started.elapsed())).await?);
         } else if args[1]=="compile" {
             let compiler_started=Instant::now();
             let result=tools::terminal(&mut brain,"cargo build --offline --message-format=json").await?;
@@ -133,14 +136,14 @@ async fn main() -> Result<()> {
         if shore.is_none() && started.elapsed()<Duration::from_secs(seconds) {tokio::time::sleep(Duration::from_secs(seconds)-started.elapsed()).await;}
         let observed=brain.client.observe().await?;
         final_scene=Some(observed.clone());
-        brain.journal.event("body_probe_finished",json!({"elapsed_ms":started.elapsed().as_millis(),"health":observed.player["health"],"food":observed.player["food"],"position":observed.player["position"],"revision":observed.revision,"body":brain.body.as_ref().map(|b|b.shared.view()),"models_called":0,"ordinary_respawn_is_not_survival_success":true}))?;
+        brain.journal.event("body_probe_finished",json!({"utc_ms":probe_continuity::utc_ms()?,"elapsed_ms":started.elapsed().as_millis(),"health":observed.player["health"],"food":observed.player["food"],"position":observed.player["position"],"revision":observed.revision,"body":brain.body.as_ref().map(|b|b.shared.view()),"models_called":mode.models_called(),"task_workload":task_outcome,"ordinary_respawn_is_not_survival_success":true}))?;
         brain.journal.event("body_probe_scene",json!({"phase":"before_body_stop",
             "scope":"Full SDK observation; final session disconnect and saved player state follow separately",
             "observation":observed}))?;
         Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
     }.await;
     let continuity = match continuity {
-        Some(monitor) => Some(monitor.finish(final_scene).await),
+        Some(monitor) => Some(monitor.finish(final_scene, &brain.client).await),
         None => None,
     };
     let body_stopped = if let Some(body) = brain.body.take() {
@@ -158,5 +161,11 @@ async fn main() -> Result<()> {
         summary.no_observed_lifecycle_failure(),
         "Probe observed a death or identity-continuity failure; inspect continuity journal, sample coverage and independent death statistics",
     )?;
+    if let Some(outcome) = task_outcome {
+        ensure(
+            outcome.workload_completed && !outcome.timed_out,
+            "Operator task failed or timed out; inspect body_probe_task_finished and original model/tool journals",
+        )?;
+    }
     Ok(())
 }
