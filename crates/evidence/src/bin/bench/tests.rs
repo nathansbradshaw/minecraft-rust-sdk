@@ -542,3 +542,113 @@ fn closed_child_pipes_do_not_escape_process_deadline() {
     assert!(out.timed_out && !out.success);
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[test]
+fn prelaunch_rcon_init_failure_attempts_one_host_disconnect() {
+    let mut s = setup();
+    let hash = "c".repeat(64);
+    let observed = observation(&s.f);
+    let password =
+        s.f.workspace
+            .parent()
+            .unwrap()
+            .join("operator-rcon.password");
+    write(&password, b"short"); // Fails locally before any socket connection.
+    s.f.operator_rcon = Some(config::OperatorRcon {
+        address: "127.0.0.1:0".parse().unwrap(),
+        password_file: password,
+    });
+    let mut host = json(s.f.host_profile().unwrap(), 16384).unwrap();
+    host["session"] =
+        json!({"session_id":"staged-existing-session-token","adapter_version":"test"});
+    fs::write(
+        s.f.host_profile().unwrap(),
+        serde_json::to_vec(&host).unwrap(),
+    )
+    .unwrap();
+    sync_session(&s.f, false).unwrap();
+    save(&s.case.join("stage.json"),&json!({"fixture_sha256":hash,"player_uuid":s.f.player_uuid,"life_id":observed["player"]["life_id"],"connected":true})).unwrap();
+    let mut replies = preflight_replies(&s.f);
+    replies.push_back(output(json!({"disconnected":true}).to_string(), true));
+    let mut fake = Fake {
+        replies,
+        calls: vec![],
+    };
+    let mut control = Fake {
+        replies: VecDeque::new(),
+        calls: vec![],
+    };
+    assert!(launch(&mut fake, &mut control, &s.f, &s.case, &hash).is_err());
+    assert_eq!(
+        fake.calls
+            .iter()
+            .filter(|a| a.first().is_some_and(|v| v == "disconnect"))
+            .count(),
+        1
+    );
+    assert!(!s.case.join("handler.stdout").exists());
+    assert_eq!(
+        json(&s.case.join("prelaunch-failure.json"), 16384).unwrap()["native_absence_verified"],
+        false
+    );
+}
+#[test]
+fn preexisting_or_unwritable_intent_cannot_block_disconnect() {
+    for unwritable in [false, true] {
+        let s = setup();
+        let blocked = s.case.join("unwritable-ledger");
+        let case = if unwritable {
+            write(&blocked, b"owned regular file, not a directory");
+            blocked.as_path()
+        } else {
+            write(
+                &s.case.join("launch-disconnect-intent.json"),
+                b"original retained intent",
+            );
+            s.case.as_path()
+        };
+        let mut fake = Fake {
+            replies: VecDeque::from([output(json!({"disconnected":true}).to_string(), true)]),
+            calls: vec![],
+        };
+        let mut attempted = false;
+        let result = disconnect_launch(&mut fake, &s.f, case, &mut attempted);
+        assert!(attempted);
+        assert_eq!(fake.calls.len(), 1);
+        assert_eq!(fake.calls[0][0], "disconnect");
+        if unwritable {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(
+                read(&s.case.join("launch-disconnect-intent.json"), 1024).unwrap(),
+                b"original retained intent"
+            );
+        }
+        assert!(disconnect_launch(&mut fake, &s.f, case, &mut attempted).is_err());
+        assert_eq!(fake.calls.len(), 1);
+    }
+}
+#[test]
+fn damaged_internal_profile_or_missing_model_key_cannot_block_host_cleanup() {
+    let s = setup();
+    fs::write(s.f.profile(), b"{}").unwrap();
+    fs::remove_file(s.f.model_key().unwrap()).unwrap();
+    let mut fake = Fake {
+        replies: VecDeque::from([output(json!({"disconnected":true}).to_string(), true)]),
+        calls: vec![],
+    };
+    let mut attempted = false;
+    // The request succeeds; internal session synchronization remains explicitly incomplete.
+    assert!(disconnect_launch(&mut fake, &s.f, &s.case, &mut attempted).is_err());
+    assert_eq!(fake.calls.len(), 1);
+    assert_eq!(
+        fake.calls[0],
+        vec!["disconnect", s.f.host_profile().unwrap().to_str().unwrap()]
+    );
+    let status = json(&s.case.join("launch-disconnect.status.json"), 16384).unwrap();
+    assert_eq!(status["request_attempted"], true);
+    assert_eq!(status["api_acknowledged"], true);
+    assert_eq!(status["session_sync_cleared"], false);
+    assert_eq!(status["native_absence_verified"], false);
+}

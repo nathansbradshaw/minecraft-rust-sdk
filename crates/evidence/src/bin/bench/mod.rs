@@ -441,10 +441,7 @@ fn stage(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resul
         Ok(())
     })();
     if result.is_err() {
-        let closed = sdk(runner, f, case, "stage-error-disconnect", "disconnect", &[]);
-        if closed.as_ref().is_ok_and(|v| v["disconnected"] == true) {
-            let _ = sync_session(f, true);
-        }
+        let _ = cleanup_disconnect(runner, f, case, "stage-error-disconnect");
     }
     result
 }
@@ -512,26 +509,103 @@ fn launch(
     case: &Path,
     hash: &str,
 ) -> Result<()> {
-    let result = launch_inner(runner, control, f, case, hash);
-    if result.is_err() && !case.join("launch-disconnect-intent.json").exists() {
-        let _ = disconnect_launch(runner, f, case);
-        save(
+    let mut disconnect_attempted = false;
+    let result = launch_inner(runner, control, f, case, hash, &mut disconnect_attempted);
+    if result.is_err() && !disconnect_attempted {
+        let _ = disconnect_launch(runner, f, case, &mut disconnect_attempted);
+        let _ = save(
             &case.join("prelaunch-failure.json"),
             &json!({"ordinary_disconnect_attempted":true,"native_absence_verified":false,"certifies_goal_completion":false}),
-        )?;
+        );
     }
     result
 }
-fn disconnect_launch(runner: &mut dyn Runner, f: &Fixture, case: &Path) -> Result<Value> {
-    save(
-        &case.join("launch-disconnect-intent.json"),
-        &json!({"player_uuid":f.player_uuid,"attempted_utc_ms":utc_ms()?,"automatic_retry":false}),
+fn disconnect_launch(
+    runner: &mut dyn Runner,
+    f: &Fixture,
+    case: &Path,
+    attempted: &mut bool,
+) -> Result<Value> {
+    ensure(
+        !*attempted,
+        "ordinary disconnect already attempted in this invocation",
     )?;
-    let result = sdk(runner, f, case, "launch-disconnect", "disconnect", &[]);
-    if result.as_ref().is_ok_and(|v| v["disconnected"] == true) {
-        sync_session(f, true)?;
+    *attempted = true;
+    let _ = save(
+        &case.join("launch-disconnect-intent.json"),
+        &json!({"player_uuid":f.player_uuid,"attempted_utc_ms":utc_ms().ok(),"automatic_retry":false}),
+    );
+    cleanup_disconnect(runner, f, case, "launch-disconnect")
+}
+fn cleanup_host_profile(f: &Fixture) -> Result<Secrets> {
+    canonical(f.host_profile()?)?;
+    let profile = json(f.host_profile()?, 16384)?;
+    ensure(
+        profile["instance_id"] == f.instance_id
+            && profile["credential"]["player_uuid"] == f.player_uuid
+            && profile["credential"]["bot_id"]
+                .as_str()
+                .is_some_and(minecraft_sdk_core::valid_id),
+        "valid scoped operator profile required for cleanup",
+    )?;
+    let key = profile["credential"]["key"]
+        .as_str()
+        .filter(|s| s.len() >= 16)
+        .ok_or("scoped operator credential missing")?;
+    let mut values = vec![key.to_owned()];
+    if let Some(session) = profile["session"]["session_id"].as_str() {
+        values.push(session.to_owned());
     }
-    result
+    Ok(Secrets(values))
+}
+/// Cleanup is independent of writable evidence, internal profile and model allocation.
+fn cleanup_disconnect(
+    runner: &mut dyn Runner,
+    f: &Fixture,
+    case: &Path,
+    label: &str,
+) -> Result<Value> {
+    let mut secrets = cleanup_host_profile(f)?;
+    f.sdk.verify()?;
+    runner.ca(f.ca_file.as_ref().map(|ca| ca.file.path.as_path()));
+    let mut out = runner.run(
+        &f.sdk.path,
+        &["disconnect".into(), f.host_profile()?.display().to_string()],
+        30,
+        &secrets,
+        &mut |_| Ok(()),
+    )?;
+    let refreshed = cleanup_host_profile(f);
+    if let Ok(new) = refreshed {
+        secrets.0.extend(new.0);
+    } else {
+        let _ = save(
+            &case.join(format!("{label}.output-withheld.json")),
+            &json!({"request_attempted":true,"output_withheld":true,"native_absence_verified":false}),
+        );
+        return Err("operator profile invalid after cleanup; raw output withheld".into());
+    }
+    out.stdout = secrets.scrub(&out.stdout);
+    out.stderr = secrets.scrub(&out.stderr);
+    let api = serde_json::from_slice::<Value>(&out.stdout).ok();
+    let acknowledged = out.success && api.as_ref().is_some_and(|v| v["disconnected"] == true);
+    let synced = acknowledged && sync_session(f, true).is_ok();
+    let persisted=(||->Result<()>{
+        let mut stdout=create(&case.join(format!("{label}.stdout")))?;stdout.write_all(&out.stdout)?;stdout.sync_all()?;
+        let mut stderr=create(&case.join(format!("{label}.stderr")))?;stderr.write_all(&out.stderr)?;stderr.sync_all()?;
+        save(&case.join(format!("{label}.status.json")),&json!({"request_attempted":true,"api_acknowledged":acknowledged,"session_sync_cleared":synced,"exit_code":out.exit_code,"signal":out.signal,"timed_out":out.timed_out,"interrupted":out.interrupted,"native_absence_verified":false,"automatic_retry":false}))
+    })().is_ok();
+    if !persisted {
+        println!(
+            "{}",
+            json!({"event":"bench_disconnect_evidence_incomplete","player_uuid":f.player_uuid,"request_attempted":true,"api_acknowledged":acknowledged,"native_absence_verified":false,"uncertainty_retained":true})
+        );
+    }
+    ensure(
+        persisted && acknowledged && synced,
+        "cleanup failed/incomplete; no retry, original uncertainty retained",
+    )?;
+    api.ok_or_else(|| "cleanup acknowledgement missing".into())
 }
 fn launch_inner(
     runner: &mut dyn Runner,
@@ -539,6 +613,7 @@ fn launch_inner(
     f: &Fixture,
     case: &Path,
     hash: &str,
+    disconnect_attempted: &mut bool,
 ) -> Result<()> {
     preflight(runner, f, case, "launch-preflight")?;
     let stage = json(&case.join("stage.json"), 16384)?;
@@ -677,7 +752,7 @@ fn launch_inner(
         container_stopped = remote::stop(control, f, case).unwrap_or(false);
     }
     // Ordinary scoped disconnection is attempted even after emergency container stop.
-    let disconnected = disconnect_launch(runner, f, case);
+    let disconnected = disconnect_launch(runner, f, case, disconnect_attempted);
     let post_hash = if container_stopped {
         Err("post-stop container artifact hashes unavailable".into())
     } else {
