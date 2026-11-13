@@ -25,7 +25,7 @@ pub(super) fn fixture(endpoint: &str) -> (tempfile::TempDir, Brain) {
             platform: "fixture".into(),
             adapter_version: "fixture".into(),
             ready: true,
-            capabilities: vec![],
+            capabilities: vec!["minecraft:movement".into(), "minecraft:inventory".into()],
             limits: json!({}),
         },
         body: None,
@@ -98,6 +98,72 @@ async fn reply(socket: &mut tokio::net::TcpStream, status: &str, value: Value) {
         )
         .await
         .unwrap();
+}
+#[tokio::test]
+async fn unadvertised_direct_action_never_reaches_http_or_changes_pending_intentions() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_root, mut brain) = fixture(&format!("http://{}/", listener.local_addr().unwrap()));
+    let action = || Action::Extension {
+        capability: "fixture:optional".into(),
+        input: json!({"operation":"fixture"}),
+    };
+    for previous in ["", "existing-durable-intention"] {
+        brain.journal.set("pending_action", previous).unwrap();
+        let error = brain.act(action()).await.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<minecraft_sdk::ApiError>()
+                .unwrap()
+                .code,
+            ErrorCode::UnsupportedCapability
+        );
+        assert_eq!(
+            brain.journal.get("pending_action").unwrap().as_deref(),
+            Some(previous)
+        );
+        let intents: i64 = brain
+            .journal
+            .db
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='action_intent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            intents, 0,
+            "unsupported requests never become durable intentions"
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err(),
+        "no unsupported request reached HTTP admission"
+    );
+    // Fresh positive-control bookkeeping: advertising a capability permits the
+    // same typed action to reach the authoritative SDK boundary normally.
+    brain.journal.set("pending_action", "").unwrap();
+    brain.server.capabilities.push("fixture:optional".into());
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (line, input) = request(&mut socket).await;
+        assert!(line.starts_with("POST ") && line.contains("/actions"));
+        let admitted: ActionRequest = serde_json::from_value(input).unwrap();
+        assert!(
+            matches!(admitted.action, Action::Extension { capability, .. } if capability == "fixture:optional")
+        );
+        reply(&mut socket, "200 OK", json!({"action_id":admitted.action_id,"outcome":"observed","adapter_version":"fixture","evidence":{},"error":null})).await;
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (line, _) = request(&mut socket).await;
+        assert!(line.starts_with("GET ") && line.contains("/observation"));
+        reply(&mut socket,"200 OK",json!({"revision":"after","player":{"uuid":"actor","inventory":[]},"world":{},"menu":{}})).await;
+    });
+    assert_eq!(
+        brain.act(action()).await.unwrap()["receipt"]["outcome"],
+        "observed"
+    );
+    upstream.await.unwrap();
 }
 #[tokio::test]
 async fn invalid_local_action_does_not_poison_the_next_action_or_hide_uncertainty() {

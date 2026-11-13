@@ -17,6 +17,11 @@ unrelated or missing receipts retain the fence. This does not bound HTTP dispatc
 latency. Transport regressions verify snapshot invalidation and recovery through
 exact-ID status; they do not establish eating.
 
+Direct brain actions reject a capability missing from verified server discovery
+before recording an intention or acquiring the mutation gate. This does not
+change existing pending IDs. Proxy requests and other pre-admission errors still
+need a matching terminal receipt; a missing receipt never clears the food fence.
+
 ## Native fixture
 
 Coordinate a separate disposable Survival character and service window with the

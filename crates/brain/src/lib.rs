@@ -766,6 +766,21 @@ impl Brain {
         // A local schema/range failure never reached gateway admission. Record
         // durable pending identity only after this same SDK validator accepts it.
         action.validate()?;
+        if !self
+            .server
+            .capabilities
+            .iter()
+            .any(|capability| capability == action.capability())
+        {
+            return Err(minecraft_sdk::ApiError::new(
+                ErrorCode::UnsupportedCapability,
+                format!(
+                    "Action capability is not installed: {}",
+                    action.capability()
+                ),
+            )
+            .into());
+        }
         let safety = self.body.as_ref().map(|h| h.shared.clone());
         let _guard = if let Some(s) = &safety {
             ensure(
