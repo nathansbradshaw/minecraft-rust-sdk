@@ -99,3 +99,30 @@ crafting table, sticks, one plank, one cobblestone and two dirt blocks. No route
 gameplay script, items, healing or rollback was supplied during the task. The
 quiet episode establishes neither empty-start progression nor hostile Survival
 competence, and does not isolate the contribution of individual changes.
+
+## Bounded provider-error investigation
+
+The direct controller can investigate a typed provider 5xx once through the
+other allocated model. Eligible classes are `provider_failed`,
+`provider_unavailable`, `provider_timeout`, and `model_unavailable_no_retry`.
+This changes the context and model; it does not resend the failed request.
+Authentication, schema, permission, quota and opaque worker errors do not grant
+this transition. Existing broker admission, transport and daily limits apply.
+
+The journal consumes the episode before transport. A consumed episode without
+an accepted answer remains blocked after restart. An accepted answer pins
+ordinary work to that healthy role until the goal, editable workspace source,
+worker or request contract changes. Ambient observations do not reset it; an
+unavailable healthy allocation cannot fall back to the known failed role.
+Any later nonquota error blocks that episode. No allowance is restored.
+
+Automatic recovery requires a separate state directory so journal activity is
+excluded from the source binding. A legacy configuration with state equal to
+the workspace keeps responsive observation and explicit blocked reasoning;
+journal writes cannot turn into automatic model retries.
+
+Inspect `provider_investigation_reserved`, `provider_investigation_result`,
+`provider_investigation_failed`, and `provider_investigation_blocked` events.
+Reservation records the original typed failure and consumed lease. Tests cover
+the real direct-controller helper, role gate and local HTTP transport, including
+SDK refresh during inference; they do not establish provider or gameplay success.
