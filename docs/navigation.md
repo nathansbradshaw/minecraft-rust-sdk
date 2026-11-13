@@ -57,6 +57,8 @@ replayed. An old journal without cached pages remains compatible.
 coordinates from observations and character parameters from the relevant
 integration. Reaching this distance does not prove visibility, mining, pickup
 or inventory gain; the caller still chooses and verifies an interaction.
+A valid mining pose can remain outside item pickup range; this helper does not
+automatically approach drops after a block changes.
 
 The client explores a directed local graph. It may walk, jump or descend through
 already traversable routes; it does not open doors, break terrain, build bridges,

@@ -70,6 +70,18 @@ intention to the observed menu ID and revision, refusing a missing slot or bad
 revision. Observe again between interactions. The server still rejects stale
 state and enforces its normal player permissions; a client view is not authority.
 
+`SelectSlot` accepts hotbar indices0–8; a storage index cannot select its stack.
+For an ordinary own-inventory exchange, use a fresh observation to find the
+source menu row whose `player_inventory` is true and `inventory_slot` identifies
+the desired stored stack. In `ClickSlot` with `click_mode::SWAP`, `slot` is that
+row's menu `slot`, while `button` is the destination hotbar index0–8. Do not
+substitute the player-inventory index for the menu slot or assume a menu layout.
+Keep the cursor empty and follow normal server slot rules. A successful ordinary
+swap places the displaced hotbar stack in the source slot; preserve it rather
+than dropping it. Inspect the original receipt and fresh native state to verify
+both stacks' item/count/components and the empty cursor before selecting the
+hotbar index if needed. Stop for inspection on a mismatch, without replay.
+
 `menu::item_count(&observation, item_id)` counts exact IDs in player inventory.
 Menu result slots and carried cursor stacks are excluded. Compare actual before
 and after observations and receipts before reporting acquisition or crafting.
