@@ -1,11 +1,12 @@
 //! Declared native execution-independence diagnostic, not a competence benchmark.
-use minecraft_sdk_brain::{Brain, Config, Result, private_read, tools};
+use minecraft_sdk_brain::{Brain, Config, Result, ensure, private_read, tools};
 use serde_json::json;
 use std::{
     path::Path,
     time::{Duration, Instant},
 };
 mod probe_admission;
+mod probe_continuity;
 mod shore_probe;
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,6 +65,8 @@ async fn main() -> Result<()> {
     cfg.conversation = false;
     cfg.await_chat_goal = false;
     let mut brain = Brain::open(cfg).await?;
+    let mut continuity = None;
+    let mut final_scene = None;
     let run=async {
         if let Some(spec)=&admission {
             brain.observed=probe_admission::wait(&mut brain,spec).await?;
@@ -73,6 +76,7 @@ async fn main() -> Result<()> {
                 brain.body=Some(minecraft_sdk_brain::body::Handle::start_for_server(profile,brain.cfg.body.clone(),&brain.cfg.state,brain.observed.clone(),&brain.server)?);
             }
         }
+        continuity=Some(probe_continuity::Monitor::start(&brain)?);
         let started = Instant::now();
         let initial_scene = brain.client.observe().await?;
         brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
@@ -115,6 +119,7 @@ async fn main() -> Result<()> {
                 }
                 let Ok(observed)=tokio::time::timeout_at(deadline,brain.client.observe()).await else { break; };
                 let observed=observed?;
+                if let Some(monitor)=&continuity { monitor.sample(&observed)?; }
                 brain.journal.event("exposed_native_sample",json!({"elapsed_ms":started.elapsed().as_millis(),
                     "revision":observed.revision,"sample_clock":observed.world["sample_clock"],
                     "health":observed.player["health"],"food":observed.player["food"],
@@ -127,21 +132,31 @@ async fn main() -> Result<()> {
         }
         if shore.is_none() && started.elapsed()<Duration::from_secs(seconds) {tokio::time::sleep(Duration::from_secs(seconds)-started.elapsed()).await;}
         let observed=brain.client.observe().await?;
+        final_scene=Some(observed.clone());
         brain.journal.event("body_probe_finished",json!({"elapsed_ms":started.elapsed().as_millis(),"health":observed.player["health"],"food":observed.player["food"],"position":observed.player["position"],"revision":observed.revision,"body":brain.body.as_ref().map(|b|b.shared.view()),"models_called":0,"ordinary_respawn_is_not_survival_success":true}))?;
         brain.journal.event("body_probe_scene",json!({"phase":"before_body_stop",
             "scope":"Full SDK observation; final session disconnect and saved player state follow separately",
             "observation":observed}))?;
         Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
     }.await;
+    let continuity = match continuity {
+        Some(monitor) => Some(monitor.finish(final_scene).await),
+        None => None,
+    };
     let body_stopped = if let Some(body) = brain.body.take() {
         body.stop().await
     } else {
         Ok(())
     };
     let disconnected = brain.client.disconnect().await;
-    brain.journal.event("body_probe_exit",json!({"disconnected":disconnected.is_ok(),"error":run.as_ref().err().map(ToString::to_string),"body_stop_error":body_stopped.as_ref().err().map(ToString::to_string),"disconnect_error":disconnected.as_ref().err().map(ToString::to_string)}))?;
+    brain.journal.event("body_probe_exit",json!({"disconnected":disconnected.is_ok(),"error":run.as_ref().err().map(ToString::to_string),"body_stop_error":body_stopped.as_ref().err().map(ToString::to_string),"disconnect_error":disconnected.as_ref().err().map(ToString::to_string),"sampled_continuity":continuity.as_ref().and_then(|r|r.as_ref().ok()),"continuity_error":continuity.as_ref().and_then(|r|r.as_ref().err()).map(ToString::to_string),"cleanup_interval":"outside sampled interval; independently verify saved death statistics"}))?;
     run?;
     body_stopped?;
     disconnected?;
+    let summary = continuity.ok_or("Probe continuity evidence unavailable")??;
+    ensure(
+        summary.no_observed_lifecycle_failure(),
+        "Probe observed a death or identity-continuity failure; inspect continuity journal, sample coverage and independent death statistics",
+    )?;
     Ok(())
 }
