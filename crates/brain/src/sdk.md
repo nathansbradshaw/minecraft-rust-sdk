@@ -74,9 +74,21 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   inventory transfer and entity interactions as well as finite controls.
   Observed verifies the requested effect. Cancelled, Expired, Failed and Rejected
   are feedback, not success. Reobserve/replan after defensive cancellation.
-- Observed dig start proves mining began; observed finish proves a block-state
-  change. Neither proves item acquisition. Player inventory is the evidence for
-  retained drops; visible item-entity positions are observations, not inventory.
+- Observed DigStage::Start proves mining began or an observed block-state change.
+  Start plus sleeping does not finish a noninstant block. After an Observed Start,
+  if the fresh target still needs finishing, submit one DigStage::Finish with its
+  own durable ID. Drain that ID with action_status/wait_for_action while Running.
+  Observed Finish proves a block-state change, not pickup.
+  Inspect Uncertain through its original ID and explicit reconciliation; never
+  duplicate the mutation. Reconciliation does not prove the historical effect.
+  mining.active=false is not completion proof: Finish can queue delayed native
+  destruction. Even an Expired observer does not exclude a later block change.
+- A block-state change does not prove retained loot; tool and server drop rules
+  still apply. Pickup happens automatically near dropped item entities when
+  inventory capacity and pickup delay allow it; Interact is not a pickup action.
+  When minecraft:fresh_observation is advertised, use menu::observe_fresh and
+  compare menu::item_count before/after.
+  Visible item entities and a successful mining-range movement are not inventory.
 - StartUseItem { hand:Hand, max_ticks:u16 } holds use for a finite native-tick
   budget; CancelUseItem { action_id:String } releases that action's held input.
   Legacy UseItem is also bounded by the deployment control budget. Using an item
@@ -101,6 +113,9 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   take its output or establish inventory gain. Inspect observation.menu.slots and
   use menu::click_slot(&observation, slot, button, click_mode::QUICK_MOVE) with a
   fresh observation when appropriate. The caller chooses slots and verifies effects.
+  SelectSlot accepts hotbar indices0..8, not storage indices. To equip a stored
+  stack, use an observed menu-slot SWAP and verify the displaced stack as well;
+  docs/menus.md describes the slot mapping and fresh postconditions.
   menu::item_count(&observation, item_id) counts retained player inventory only,
   excluding a prepared output or carried cursor stack. Do not print every air slot.
   The default brain menu.non_player_stacks view preserves bounded occupied slot
@@ -163,7 +178,9 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   block_search query accepts a runtime block ID or tag, radius, limit and offset.
   It returns only loaded blocks hit by an unobstructed targeting ray. Follow
   next_offset until complete, respecting retry_after_ms. A partial page with no
-  matches is not proof that the area contains no resources. It cannot load code.
+  matches is not proof that the area contains no resources. A match need not be
+  within interaction range. Its item is the block's item form, not a loot promise.
+  It cannot load code.
 - If advertised, minecraft:movement_options returns paged, collision/gravity-
   admitted local waypoints. These are predictions; only executed receipts prove
   movement. Direct query input accepts offset, optional nearby target and limit
