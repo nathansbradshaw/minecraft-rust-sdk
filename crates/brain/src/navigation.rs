@@ -267,6 +267,13 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
     }
     result["position_before"] = before;
     result["position_after"] = brain.observed.player["position"].clone();
+    let body_after = brain
+        .body
+        .as_ref()
+        .map(|h| h.shared.view())
+        .unwrap_or(Value::Null);
+    result["navigation_scheduling"] = json!({"before":before_control,
+        "after":control_basis(&brain.observed,&body_after)});
     if scheduling_preempted(&result) {
         brain.journal.set(
             "navigation_pause",
