@@ -468,6 +468,9 @@ mod tests {
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // BSD may inherit the listener's nonblocking mode. The
+                        // fixture uses the same blocking I/O contract as Client.
+                        stream.set_nonblocking(false).unwrap();
                         f(stream);
                         return;
                     }
