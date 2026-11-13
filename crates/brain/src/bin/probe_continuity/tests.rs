@@ -235,3 +235,102 @@ fn nonpositive_health_counter_covers_observed_actor_across_changed_lives() {
     );
     assert!(!summary.no_observed_lifecycle_failure());
 }
+
+#[test]
+fn observer_reuses_the_original_session_and_rejects_missing_or_foreign_bindings() {
+    let baseline = sample(20., 100);
+    let mut profile = Profile {
+        endpoint: "https://fixture.invalid/".into(),
+        instance_id: "original-instance".into(),
+        credential: minecraft_sdk::Credential {
+            bot_id: "fixture".into(),
+            player_uuid: "fixture-actor".into(),
+            key: "fixture-key".into(),
+        },
+        session: Some(minecraft_sdk::Session {
+            session_id: "already-connected-controller".into(),
+            adapter_version: "fixture".into(),
+        }),
+    };
+    let reused = observer_profile(&profile, &baseline, "original-instance").unwrap();
+    assert_eq!(
+        reused.session.unwrap().session_id,
+        "already-connected-controller"
+    );
+    assert_eq!(
+        profile.session.as_ref().unwrap().session_id,
+        "already-connected-controller"
+    );
+    assert!(observer_profile(&profile, &baseline, "foreign-instance").is_err());
+    profile.credential.player_uuid = "foreign-actor".into();
+    assert!(observer_profile(&profile, &baseline, "original-instance").is_err());
+    profile.credential.player_uuid = "fixture-actor".into();
+    profile.session = None;
+    assert!(observer_profile(&profile, &baseline, "original-instance").is_err());
+}
+
+#[test]
+fn fresh_calibration_preserves_utc_bracket_and_native_binding_without_ordering_it() {
+    let calibration = Calibration::bracket("initial", 1000, 1120, Ok(sample(4., 300)));
+    assert_eq!(
+        (calibration.utc_before_ms, calibration.utc_after_ms),
+        (1000, 1120)
+    );
+    let facts = calibration.facts.as_ref().unwrap();
+    assert_eq!(facts.binding.life_id, "original-life");
+    assert_eq!(facts.binding.clock_epoch, "jvm:original-life");
+    assert_eq!(facts.native_nanos, "300");
+    let mut tracker = Tracker::new(&sample(20., 100)).unwrap();
+    tracker.observe(&sample(18., 500), at(150));
+    // The separately retained calibration predates the last ordered sample.
+    tracker.calibration(&calibration);
+    let summary = tracker.finish(at(150), true);
+    assert_eq!(summary.final_sample.native_nanos, "500");
+    assert_eq!(summary.sampled_original_life_min_health, 4.);
+    assert!(summary.incomplete_reasons.is_empty());
+}
+
+#[test]
+fn unordered_calibration_observing_zero_health_fails_without_clock_regression() {
+    let mut tracker = Tracker::new(&sample(20., 100)).unwrap();
+    tracker.observe(&sample(18., 500), at(150));
+    tracker.calibration(&Calibration::bracket(
+        "final",
+        1000,
+        1120,
+        Ok(sample(0., 300)),
+    ));
+    let summary = tracker.finish(at(150), true);
+    assert_eq!(summary.final_sample.health, 18.);
+    assert_eq!(summary.final_sample.native_nanos, "500");
+    assert_eq!(summary.sampled_original_life_min_health, 0.);
+    assert_eq!(summary.observed_actor_nonpositive_health_samples, 1);
+    assert!(
+        summary
+            .failure_reasons
+            .contains("observed_actor_nonpositive_health")
+    );
+    assert!(!summary.no_observed_lifecycle_failure());
+    assert!(
+        !summary
+            .incomplete_reasons
+            .contains("ordered_sample_clock_out_of_order")
+    );
+}
+
+#[test]
+fn failed_calibrations_keep_error_and_bracket_without_healthy_fallback() {
+    let failed = Calibration::bracket("initial", 1000, 1100, Err("native read timed out".into()));
+    assert!(failed.facts.is_none());
+    assert!(failed.error.unwrap().contains("timed out"));
+    let backwards = Calibration::bracket("final", 1100, 1000, Ok(sample(20., 200)));
+    assert!(backwards.facts.is_none());
+    assert!(backwards.error.unwrap().contains("backwards"));
+    let mut invalid = sample(20., 200);
+    invalid.player["life_id"] = Value::Null;
+    assert!(
+        Calibration::bracket("final", 1000, 1100, Ok(invalid))
+            .facts
+            .is_none()
+    );
+}

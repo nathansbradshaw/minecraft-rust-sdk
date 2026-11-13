@@ -17,8 +17,13 @@ pub struct Spec {
     player_health: f64,
     player_food: u64,
     main_hand: String,
+    #[serde(default = "ranged_by_default")]
+    ranged_attack: bool,
     day_time_range: Option<[u64; 2]>,
     timeout_secs: u64,
+}
+fn ranged_by_default() -> bool {
+    true
 }
 fn point(value: &Value) -> Option<[f64; 3]> {
     let p = value.as_array()?;
@@ -129,12 +134,13 @@ impl Spec {
         ensure(
             enemy["type"] == self.entity_type
                 && enemy["visible"] == true
+                && enemy["hostile"] == true
                 && enemy["health"]
                     .as_f64()
                     .is_some_and(|h| (h - self.entity_health).abs() < 0.001)
                 && enemy["main_hand"]["item"] == self.main_hand
-                && enemy["ranged_attack"] == true,
-            "Stimulus type,visibility,health or ranged weapon does not match",
+                && enemy["ranged_attack"] == self.ranged_attack,
+            "Stimulus type,visibility,hostility,health,weapon or attack kind does not match",
         )?;
         Ok(true)
     }
@@ -223,5 +229,34 @@ mod tests {
         let mut extra = serde_json::to_value(spec()).unwrap();
         extra["command"] = json!("operator console");
         assert!(serde_json::from_value::<Spec>(extra).is_err());
+    }
+    #[test]
+    fn legacy_specs_require_ranged_but_explicit_melee_preserves_all_other_bindings() {
+        let legacy = spec();
+        assert!(legacy.ranged_attack);
+        let mut s = spec();
+        s.ranged_attack = false;
+        s.entity_type = "minecraft:zombie".into();
+        s.main_hand = "minecraft:air".into();
+        let mut o = observation();
+        o.world["entities"][0]["type"] = json!("minecraft:zombie");
+        o.world["entities"][0]["ranged_attack"] = json!(false);
+        o.world["entities"][0]["main_hand"]["item"] = json!("minecraft:air");
+        assert!(s.check(&o).unwrap());
+        s.ranged_attack = true;
+        assert!(
+            s.check(&o).is_err(),
+            "attack kind alone must reject a mismatch"
+        );
+        s.ranged_attack = false;
+        assert!(legacy.check(&o).is_err());
+        o.world["entities"][0]["hostile"] = json!(false);
+        assert!(s.check(&o).is_err());
+        o.world["entities"][0]["hostile"] = json!(true);
+        o.world["entities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"uuid":"other","hostile":true,"visible":true}));
+        assert!(s.check(&o).is_err());
     }
 }
