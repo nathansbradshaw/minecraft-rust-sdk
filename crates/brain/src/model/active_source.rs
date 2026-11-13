@@ -23,11 +23,14 @@ fn source(context: &Value) -> Option<Value> {
         return None;
     }
     let state = fs::canonicalize(scope["excluded_state"].as_str()?).ok()?;
-    let output = Path::new(experiment["result"]["output_files"]["stdout"]["path"].as_str()?);
-    if output.parent()?.file_name()?.to_str()? != "terminal-output"
-        || fs::canonicalize(output.parent()?.parent()?).ok()? != state
-    {
-        return None;
+    let is_lua = experiment["tool"] == "run" && experiment["result"]["language"] == "lua";
+    if !is_lua {
+        let output = Path::new(experiment["result"]["output_files"]["stdout"]["path"].as_str()?);
+        if output.parent()?.file_name()?.to_str()? != "terminal-output"
+            || fs::canonicalize(output.parent()?.parent()?).ok()? != state
+        {
+            return None;
+        }
     }
     // Use exactly the engine's exclusion scope. Output/journal churn within a
     // nested state directory is not a source edit; a real source edit still is.
@@ -50,6 +53,11 @@ fn source(context: &Value) -> Option<Value> {
     view["scope"] = json!(
         "Complete current client source identified by a hash-bound retained Cargo stream and unchanged workspace/goal. Available across reference reads during this coding session. This supplies editable source, not a compile, gameplay or completion claim, and grants no model turns."
     );
+    if is_lua {
+        view["scope"] = json!(
+            "Complete current Lua source hash-bound to a recorded run and unchanged workspace/goal. An invalid update may have been rejected; this is editable source, not a gameplay or activation claim."
+        );
+    }
     (serde_json::to_vec(&view).ok()?.len() <= VIEW_BUDGET).then_some(view)
 }
 
@@ -93,6 +101,27 @@ pub(super) fn prepare(context: &mut Value, enabled: bool) -> bool {
 mod tests {
     use super::*;
     use crate::digest;
+
+    #[test]
+    fn lua_source_is_retained_only_for_the_recorded_current_hash_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("program");
+        let state = dir.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        let text = "return {version=1,step=function(ctx) return {state=ctx.state,done=true} end}";
+        fs::write(root.join("behavior.lua"), text).unwrap();
+        let fingerprint =
+            crate::progress::workspace_fingerprint_excluding_state(&root, &state).unwrap();
+        let mut context = json!({"workspace":root,"workspace_source_scope":{"format":"workspace-excluding-state-v1","excluded_state":state},"goal_revision":"goal","last_tool_result":{"goal_revision":"goal"},"last_experiment":{"tool":"run","command":"behavior.lua","goal_revision":"goal","source_sha256":fingerprint,"result":{"language":"lua","lua_source":{"source_sha256":digest(text.as_bytes())}}}});
+        assert_eq!(source(&context).unwrap()["content"], text);
+        context["last_experiment"]["result"]["lua_source"]["source_sha256"] = json!("stale");
+        assert!(source(&context).is_none());
+        context["last_experiment"]["result"]["lua_source"]["source_sha256"] =
+            json!(digest(text.as_bytes()));
+        context["last_experiment"]["command"] = json!("../program/behavior.lua");
+        assert!(source(&context).is_none());
+    }
 
     struct Fixture {
         dir: tempfile::TempDir,

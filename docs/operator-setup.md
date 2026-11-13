@@ -99,9 +99,11 @@ Follow [runner-admin-setup.md](runner-admin-setup.md). Build the proxy and codin
 targets from `deploy/Dockerfile`, resolve immutable image digests, and configure
 each bot using `deploy/runner.example.json` and a reviewed exact endpoint allowlist.
 Provision one bot-scoped key per workspace. The coding image includes `mc-sdk`,
-Rust and read-only SDK source at `/opt/minecraft-sdk`. Copy
-`examples/coding-bot/` into the writable workspace; its default program leaves
-the character stopped. Connect only when a controller is ready, and disconnect
+Rust and read-only SDK source at `/opt/minecraft-sdk`. For the reference Rust
+Brain, install its reviewed binary and copy `examples/lua/behavior.lua` into the
+writable workspace; the `run` tool executes Lua directly with hot reload. The
+legacy `examples/coding-bot/` Cargo project remains available for Rust SDK clients.
+Connect only when a controller is ready, and disconnect
 when its work is done.
 
 Allocate model access separately per bot through local inference or an explicit

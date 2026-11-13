@@ -14,6 +14,7 @@ mod discovery;
 pub mod feedback;
 mod gameplay_failure;
 mod handoff;
+pub mod lua;
 pub mod memory;
 mod menu_evidence;
 pub mod model;
