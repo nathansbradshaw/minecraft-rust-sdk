@@ -235,6 +235,7 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
         options: Options {
             timeout_ms: 30000.min(brain.cfg.tool_timeout_secs.saturating_mul(1000)),
             blocked_blocks: navigation_blocked_blocks(),
+            eager_progress: true,
             ..Options::default()
         },
     };
