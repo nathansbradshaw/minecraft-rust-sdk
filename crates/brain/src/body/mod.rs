@@ -470,9 +470,19 @@ fn may_resume_after_danger(
     owned_water_shore: bool,
 ) -> bool {
     let active = &observed.player["control"];
+    // Explicit reconciliation publishes present idle readiness separately from
+    // the action's unchanged uncertain historical receipt. It is not a native
+    // terminal outcome or evidence that the original movement succeeded.
+    let reconciled_idle = active["action_id"].as_str() == Some(owned_control)
+        && active["outcome"] == "idle"
+        && active["historical_outcome"] == "uncertain"
+        && active["reconciliation"]["settled"] == true
+        && active["reconciliation"]["historical_effect_verified"] == false
+        && active["reconciliation"]["replayed"] == false;
     let released = active["input_released"] == true
-        && serde_json::from_value::<Outcome>(active["outcome"].clone())
-            .is_ok_and(|outcome| outcome.terminal());
+        && (reconciled_idle
+            || serde_json::from_value::<Outcome>(active["outcome"].clone())
+                .is_ok_and(|outcome| outcome.terminal()));
     // Wall time cannot retire native input: a lagging server may still be
     // finishing the bank leg after three seconds. Only its own terminal,
     // released observation completes that handoff. A replacement control or

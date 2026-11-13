@@ -1,6 +1,83 @@
 use super::*;
 
 #[test]
+fn reconciled_owned_shore_hands_off_without_certifying_its_historical_effect() {
+    let observation = Observation {
+        revision: "settled-after-interruption".into(),
+        menu: Value::Null,
+        world: json!({"game_time":10}),
+        player: json!({"eyes_in_water":false,"air":300,"max_air":300,
+            "control":{"action_id":"owned-shore","outcome":"idle","input_released":true,
+                "historical_outcome":"uncertain","reconciliation":{"settled":true,
+                    "historical_effect_verified":false,"replayed":false}}}),
+    };
+    let before = observation.clone();
+    assert!(may_resume_after_danger(
+        &observation,
+        Duration::from_millis(50),
+        "owned-shore",
+        true,
+        true
+    ));
+    assert!(may_resume_after_danger(
+        &observation,
+        Duration::from_secs(30),
+        "owned-shore",
+        true,
+        true
+    ));
+    assert_eq!(
+        serde_json::to_value(&observation).unwrap(),
+        serde_json::to_value(before).unwrap(),
+        "readiness does not rewrite native observations or historical uncertainty"
+    );
+    assert!(
+        serde_json::from_value::<Outcome>(observation.player["control"]["outcome"].clone())
+            .is_err(),
+        "idle remains scheduling metadata, not a successful action outcome"
+    );
+    for (pointer, value) in [
+        ("/outcome", json!("uncertain")),
+        ("/input_released", json!(false)),
+        ("/input_released", Value::Null),
+        ("/historical_outcome", json!("observed")),
+        ("/historical_outcome", Value::Null),
+        ("/reconciliation", Value::Null),
+        ("/reconciliation/settled", json!(false)),
+        ("/reconciliation/settled", Value::Null),
+        ("/reconciliation/historical_effect_verified", json!(true)),
+        ("/reconciliation/historical_effect_verified", Value::Null),
+        ("/reconciliation/replayed", json!(true)),
+        ("/reconciliation/replayed", Value::Null),
+    ] {
+        let mut malformed = observation.clone();
+        *malformed.player["control"].pointer_mut(pointer).unwrap() = value;
+        assert!(
+            !may_resume_after_danger(
+                &malformed,
+                Duration::from_secs(30),
+                "owned-shore",
+                true,
+                true
+            ),
+            "unconfirmed idle field {pointer} must not release owned shore urgency"
+        );
+    }
+    let mut replacement = observation.clone();
+    replacement.player["control"]["action_id"] = json!("another-control");
+    assert!(
+        !may_resume_after_danger(
+            &replacement,
+            Duration::from_millis(50),
+            "owned-shore",
+            true,
+            true
+        ),
+        "another control's reconciliation cannot claim this immediate handoff"
+    );
+}
+
+#[test]
 fn shore_handoff_requires_terminal_native_release_despite_elapsed_wall_time() {
     let mut observed = Observation {
         revision: "same-native-sample".into(),
