@@ -152,9 +152,23 @@ pub(crate) fn resume_context(
         "scope":"Expected navigation scheduling pause; no success, failed-program diagnosis or new allowance. Resume navigation only after changed, ready body/control facts. Other code, observations and chat remain available."}),
     )
 }
-pub(crate) async fn defer_if_paused(
+fn guard_paused_choice(choice: &mut crate::model::Choice, resume: &Value) -> bool {
+    if choice.tool != "navigate" || resume["paused"] != true {
+        return false;
+    }
+    // This is an explicit local scheduling report, not a model success claim
+    // or a failed gameplay experiment. Normal inspection/diagnosis accounting
+    // still bounds a nonconforming worker that repeatedly selects this tool.
+    choice.tool = "report".into();
+    choice.input = "Local scheduler withheld an unavailable navigation attempt; no SDK mutation was submitted. Navigation requires changed, ready body/control facts. Choose another observation, code, terminal, memory or goal operation while protection continues.".into();
+    choice.path.clear();
+    choice.summary = "Local scheduling report: navigation remains paused".into();
+    choice.experiment = false;
+    true
+}
+pub(crate) fn defer_if_paused(
     brain: &mut Brain,
-    choice: &crate::model::Choice,
+    choice: &mut crate::model::Choice,
 ) -> Result<bool> {
     if choice.tool != "navigate" || brain.body.is_none() {
         return Ok(false);
@@ -164,36 +178,15 @@ pub(crate) async fn defer_if_paused(
         .as_ref()
         .map(|h| h.shared.view())
         .unwrap_or(Value::Null);
-    if resume_context(&brain.journal, &brain.observed, &body)?["paused"] != true {
+    let resume = resume_context(&brain.journal, &brain.observed, &body)?;
+    if resume["paused"] != true {
         return Ok(false);
     }
     let revision = brain.journal.get("goal_revision")?;
-    let source = crate::progress::workspace_fingerprint_excluding_state(
-        &brain.cfg.workspace,
-        &brain.cfg.state,
-    )?;
-    let worker = crate::worker::revision(&brain.cfg)?;
     brain.journal.event("navigation_resume_deferred",json!({"goal_revision":revision,
-        "execution":"No SDK mutation or new diagnosis; body/chat continue while waiting for changed control facts, source, worker or task"}))?;
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        brain.refresh().await?;
-        let body = brain
-            .body
-            .as_ref()
-            .map(|h| h.shared.view())
-            .unwrap_or(Value::Null);
-        if brain.journal.get("goal_revision")? != revision
-            || resume_context(&brain.journal, &brain.observed, &body)?["ready"] == true
-            || crate::progress::workspace_fingerprint_excluding_state(
-                &brain.cfg.workspace,
-                &brain.cfg.state,
-            )? != source
-            || crate::worker::revision(&brain.cfg)? != worker
-        {
-            return Ok(true);
-        }
-    }
+        "requested_tool":"navigate","scheduled_tool":"report",
+        "execution":"No SDK mutation. Main reasoning continues with navigation excluded until changed ready control facts; coding and chat remain available."}))?;
+    Ok(guard_paused_choice(choice, &resume))
 }
 pub(crate) fn resumable_slice(result: &Value) -> bool {
     result["navigation_slice"]["format"] == "navigation-slice-v1"
@@ -291,6 +284,59 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_navigation_becomes_a_nonexecuting_report_without_blocking_other_work() {
+        let requested = crate::model::Choice {
+            tool: "navigate".into(),
+            input:
+                r#"{"kind":"position","dimension":"fixture:world","target":[1,2,3],"distance":1}"#
+                    .into(),
+            path: String::new(),
+            summary: "try navigation again".into(),
+            notes: String::new(),
+            experiment: false,
+        };
+        let paused = json!({"paused":true,"ready":false});
+        let mut withheld = requested.clone();
+        assert!(guard_paused_choice(&mut withheld, &paused));
+        assert_eq!(withheld.tool, "report");
+        assert!(!withheld.experiment);
+        assert!(!crate::progress::executed(
+            &withheld.tool,
+            &json!({"recorded":"progress report"}),
+            "same",
+            "same"
+        ));
+        assert_eq!(
+            crate::progress::next_inspection_count(0, true, false),
+            1,
+            "A nonconforming worker does not get unlimited unaccounted navigation polls"
+        );
+        for tool in [
+            "write",
+            "edit",
+            "run",
+            "terminal",
+            "observe",
+            "query",
+            "sdk",
+            "status",
+            "reconcile",
+            "goal",
+        ] {
+            let mut alternative = requested.clone();
+            alternative.tool = tool.into();
+            let before = serde_json::to_value(&alternative).unwrap();
+            assert!(!guard_paused_choice(&mut alternative, &paused));
+            assert_eq!(serde_json::to_value(alternative).unwrap(), before, "{tool}");
+        }
+        let mut ready = requested.clone();
+        assert!(!guard_paused_choice(
+            &mut ready,
+            &json!({"paused":false,"ready":true})
+        ));
+        assert_eq!(ready.tool, "navigate");
+    }
     fn preempted_result() -> Value {
         let goal: Goal = serde_json::from_value(json!({"kind":"position",
             "dimension":"fixture:world","target":[1.,64.,2.],"distance":1.}))
