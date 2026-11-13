@@ -119,6 +119,11 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   Native player.life_id is required and persisted; a life change stops the journal
   even if menu IDs match. Old providers or version 1 journals require inspection,
   never replacement action IDs. Use the matching life-identity module/adapter.
+  The adapter must also advertise minecraft:fresh_observation. The helper uses
+  menu::observe_fresh(&client) for its existing reads: one explicit bounded native
+  query, without cached fallback or polling. Full terrain/entities are included,
+  so this is heavier than the cached default body observation. Fresh revisions
+  can still change before a click; rejection stops rather than rebasing or retrying.
   LocalPreempted means no submission and permits a later retry. Pending/NotReady
   can still be running; Uncertain/Reconciled/NeedsInspection require original-ID
   inspection/reconciliation and fresh facts. Do not discard state to retry. A

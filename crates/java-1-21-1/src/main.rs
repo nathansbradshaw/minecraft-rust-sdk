@@ -3,6 +3,7 @@ mod chat;
 mod control;
 mod effects;
 mod fluids;
+mod fresh_observation;
 mod mining;
 mod motion;
 mod recipes;
@@ -1198,6 +1199,7 @@ fn dispatch(
                     "minecraft:commands",
                     "minecraft:respawn",
                     routes::CAPABILITY,
+                    fresh_observation::CAPABILITY,
                 ]
                 .into_iter()
                 .filter(|c| {
@@ -1225,6 +1227,7 @@ fn dispatch(
                 limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"finite_move_waypoint_blocks":motion::FINITE_WAYPOINT_AXIS,"move_up_blocks":4,"move_down_blocks":4,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":({
                     let mut schemas=discovery["observation_query_schemas"].as_object().cloned().unwrap_or_default();
                     schemas.insert(routes::CAPABILITY.into(),routes::schema());
+                    schemas.insert(fresh_observation::CAPABILITY.into(),fresh_observation::schema());
                     Value::Object(schemas)
                 })}),
             })),
@@ -1296,6 +1299,56 @@ fn dispatch(
                         ErrorCode::SessionRequired,
                         "Player is not connected",
                     ));
+                }
+                if query.capability == fresh_observation::CAPABILITY {
+                    let player = players.get(&request.bot_id).ok_or_else(|| {
+                        ApiError::new(ErrorCode::SessionRequired, "Player disconnected")
+                    })?;
+                    if !player.alive.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            ErrorCode::SessionRequired,
+                            "Character connection ended; reconnect without replay",
+                        ));
+                    }
+                    let cached = player.physics.observe().map_err(|_| {
+                        ApiError::new(
+                            ErrorCode::NotReady,
+                            "Character controller observation unavailable",
+                        )
+                    })?;
+                    if cached.player["uuid"] != request.player_uuid {
+                        return Err(ApiError::new(
+                            ErrorCode::Conflict,
+                            "Fresh observation does not belong to this controller",
+                        ));
+                    }
+                    let mut observation =
+                        fresh_observation::read(native, &request.player_uuid, &query.input)?;
+                    if !player.alive.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            ErrorCode::SessionRequired,
+                            "Character connection ended during fresh observation",
+                        ));
+                    }
+                    // Preserve current controller metadata without replacing this
+                    // explicit native snapshot with a cached/effect sample.
+                    if cached.player["life_id"] == observation.player["life_id"]
+                        && cached.world["sample_clock"]["epoch"]
+                            == observation.world["sample_clock"]["epoch"]
+                    {
+                        if let Some(metadata) = cached.player.get("physical_controller") {
+                            observation.player["physical_controller"] = metadata.clone();
+                        }
+                        if let Some(job) = &player.control {
+                            observation.player["control"] = job.observation();
+                        }
+                        if let Some(job) = &player.interaction {
+                            observation.player["interaction"] = job.observation();
+                        }
+                    }
+                    return Ok(AdapterResponse::ObservationData(json!({
+                        "format":fresh_observation::FORMAT,"observation":observation
+                    })));
                 }
                 if query.capability == routes::CAPABILITY {
                     routes::validate(&query.input).map_err(|e| {

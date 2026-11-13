@@ -156,7 +156,7 @@ async fn main() -> AnyResult<()> {
     }
     let client = Client::with_profile(&profile)?;
     client.verify_instance(&profile.instance_id).await?;
-    let current = client.observe().await?;
+    let current = menu::observe_fresh(&client).await?;
     let binding_path = directory.join("binding.json");
     let binding: Binding = if binding_path.exists() {
         let b: Binding = serde_json::from_slice(&fs::read(&binding_path)?)?;
@@ -213,7 +213,7 @@ async fn main() -> AnyResult<()> {
                             let Ok(receipt)=client.action_status(id).await else { continue; };
                             if receipt.action_id!=id { return Err("Pending receipt identity changed".into()); }
                             drop(future);
-                            let after=client.observe().await?;
+                            let after=menu::observe_fresh(&client).await?;
                             save(&report_path,&json!({"kind":"operator_fixture_client_future_interrupted","batch":index,"original_request":request,"original_status":receipt,"prior_reports":reports,"after":after,"note":"Original request is recorded by the gateway and may already be terminal. Resume same plan/directory; never replay or invent replacement IDs. This observation does not establish interruption of native execution."}))?;
                             println!("Interrupted the client future after durable local and gateway request persistence; resume this exact plan and directory.");
                             return Ok(());
@@ -232,7 +232,7 @@ async fn main() -> AnyResult<()> {
             && result.output_count == Some(batch.count);
         reports.push(result);
         if !completed || !expected {
-            let after = client.observe().await?;
+            let after = menu::observe_fresh(&client).await?;
             save(
                 &directory.join(format!("stopped-{index}.json")),
                 &json!({"kind":"operator_fixture_stopped","reports":reports,"after":after}),
@@ -245,7 +245,7 @@ async fn main() -> AnyResult<()> {
     if args[3] == "interrupt" {
         return Err("All batches settled before interruption was observed; no interruption claim, preserve completed journals".into());
     }
-    let after = client.observe().await?;
+    let after = menu::observe_fresh(&client).await?;
     same_life(&after, &binding)?;
     save(
         &report_path,

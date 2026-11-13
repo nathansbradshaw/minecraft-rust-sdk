@@ -72,6 +72,11 @@ struct Fixture {
     reused: bool,
     respawn_after_prepare: bool,
     missing_life: bool,
+    no_fresh_capability: bool,
+    reject_take: bool,
+    fresh_format: Option<&'static str>,
+    cached_menu_state: Option<i32>,
+    fresh_menu_state: Option<i32>,
     posts: Vec<ActionRequest>,
     methods: Vec<String>,
     receipts: BTreeMap<String, Receipt>,
@@ -128,19 +133,40 @@ async fn peer(fixture: Fixture) -> Peer {
                 let mut state = server.lock().unwrap();
                 state.methods.push(first.into());
                 if path == "/v1/server" {
-                    json!({"api_version":API_VERSION,"instance_id":"instance","minecraft_version":"fixture","platform":"fixture","adapter_version":"fixture","ready":true,"capabilities":[],"limits":{}})
-                } else if path.ends_with("/observations") {
+                    json!({"api_version":API_VERSION,"instance_id":"instance","minecraft_version":"fixture","platform":"fixture","adapter_version":"fixture","ready":true,"capabilities":if state.no_fresh_capability {vec![]}else{vec![FRESH_OBSERVATION_CAPABILITY]},"limits":{}})
+                } else if path.ends_with("/observations") || path.ends_with("/observations/query") {
+                    let fresh = path.ends_with("/observations/query");
+                    if fresh {
+                        assert!(!state.no_fresh_capability);
+                        assert_eq!(method, "POST");
+                        let request: ObservationQuery = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(request.capability, FRESH_OBSERVATION_CAPABILITY);
+                        assert_eq!(request.input, json!({}));
+                    }
                     let mut o = observation(state.step);
+                    if let Some(revision) = if fresh {
+                        state.fresh_menu_state
+                    } else {
+                        state.cached_menu_state
+                    } {
+                        o.menu["state_id"] = json!(revision);
+                    }
                     if state.respawn_after_prepare && state.step > 0 {
                         o.player["life_id"] = json!("new-life");
                     }
                     if state.missing_life {
                         o.player.as_object_mut().unwrap().remove("life_id");
                     }
-                    serde_json::to_value(o).unwrap()
+                    if fresh {
+                        json!({"format":state.fresh_format.unwrap_or("minecraft-fresh-observation-v1"),"observation":o})
+                    } else {
+                        serde_json::to_value(o).unwrap()
+                    }
                 } else if method == "POST" && path.ends_with("/actions") {
                     let request: ActionRequest = serde_json::from_slice(&bytes).unwrap();
                     let prepare = matches!(&request.action, Action::Craft { .. });
+                    let rejected = state.reject_take
+                        && matches!(&request.action, Action::ClickSlot { slot: 0, .. });
                     match &request.action {
                         Action::Craft {
                             make_all, recipe, ..
@@ -152,14 +178,24 @@ async fn peer(fixture: Fixture) -> Peer {
                             }
                         }
                         Action::ClickSlot {
-                            slot, mode, button, ..
+                            slot,
+                            mode,
+                            button,
+                            state_id,
+                            ..
                         } => {
                             assert_eq!(*mode, click_mode::PICKUP);
                             assert_eq!(*button, 0);
-                            match (*slot, state.step) {
-                                (0, 1) => state.step = 2,
-                                (3, 2) => state.step = 3,
-                                other => panic!("unexpected click{other:?}"),
+                            assert_eq!(
+                                *state_id,
+                                state.fresh_menu_state.unwrap_or(i32::from(state.step))
+                            );
+                            if !rejected {
+                                match (*slot, state.step) {
+                                    (0, 1) => state.step = 2,
+                                    (3, 2) => state.step = 3,
+                                    other => panic!("unexpected click{other:?}"),
+                                }
                             }
                         }
                         _ => panic!("unexpected action"),
@@ -167,7 +203,9 @@ async fn peer(fixture: Fixture) -> Peer {
                     let mut receipt = receipt(
                         &request.action_id,
                         prepare,
-                        if state.uncertain {
+                        if rejected {
+                            Outcome::Rejected
+                        } else if state.uncertain {
                             Outcome::Uncertain
                         } else if state.running {
                             Outcome::Running
@@ -175,6 +213,12 @@ async fn peer(fixture: Fixture) -> Peer {
                             Outcome::Observed
                         },
                     );
+                    if rejected {
+                        receipt.error = Some(error(
+                            ErrorCode::Conflict,
+                            "Menu revision changed; observe again",
+                        ));
+                    }
                     if state.reused {
                         receipt.evidence["gateway_delivery"] = json!({"action_id_already_recorded":true,"new_intention_dispatched":false});
                     }
@@ -209,6 +253,155 @@ async fn peer(fixture: Fixture) -> Peer {
         stop,
         task,
     }
+}
+
+#[tokio::test]
+async fn cached_menu_19_is_not_used_for_the_fresh_menu_21_pickup_over_http() {
+    let peer = peer(Fixture {
+        cached_menu_state: Some(19),
+        fresh_menu_state: Some(21),
+        ..Fixture::default()
+    })
+    .await;
+    assert_eq!(peer.client.observe().await.unwrap().menu["state_id"], 19);
+    let dir = Temp::new();
+    let result = craft_once(
+        &peer.client,
+        "fixture:recipe",
+        "fresh",
+        &dir.path(),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status, CraftStatus::Completed);
+    assert_eq!(result.current_inventory_count, Some(4));
+    {
+        let fixture = peer.state.lock().unwrap();
+        assert_eq!(fixture.posts.len(), 3);
+        assert!(matches!(
+            &fixture.posts[1].action,
+            Action::ClickSlot {
+                state_id: 21,
+                slot: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            fixture
+                .methods
+                .iter()
+                .filter(|m| m.starts_with("GET ") && m.contains("/observations "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .methods
+                .iter()
+                .filter(|m| m.starts_with("POST ") && m.contains("/observations/query "))
+                .count(),
+            7
+        );
+    }
+    assert_eq!(
+        peer.client.observe().await.unwrap().menu["state_id"],
+        19,
+        "Explicit foreground reads do not change the default cached path"
+    );
+    peer.stop().await;
+}
+
+#[tokio::test]
+async fn absent_fresh_capability_fails_before_observation_journal_or_mutation() {
+    let peer = peer(Fixture {
+        no_fresh_capability: true,
+        ..Fixture::default()
+    })
+    .await;
+    let dir = Temp::new();
+    let error = craft_once(
+        &peer.client,
+        "fixture:recipe",
+        "no-fresh",
+        &dir.path(),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert!(!dir.path().exists());
+    {
+        let fixture = peer.state.lock().unwrap();
+        assert!(fixture.posts.is_empty());
+        assert_eq!(fixture.methods, vec!["GET /v1/server HTTP/1.1"]);
+    }
+    peer.stop().await;
+}
+
+#[tokio::test]
+async fn genuinely_stale_fresh_click_is_retained_as_rejected_without_rebase_or_retry() {
+    let peer = peer(Fixture {
+        reject_take: true,
+        fresh_menu_state: Some(21),
+        ..Fixture::default()
+    })
+    .await;
+    let dir = Temp::new();
+    for _ in 0..2 {
+        let result = craft_once(
+            &peer.client,
+            "fixture:recipe",
+            "stale-fresh",
+            &dir.path(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, CraftStatus::Stopped);
+        assert_eq!(result.action_id.as_deref(), Some("stale-fresh-take"));
+        assert_eq!(result.receipt_outcome, Some(Outcome::Rejected));
+        assert_eq!(result.error.unwrap().code, ErrorCode::Conflict);
+    }
+    {
+        let fixture = peer.state.lock().unwrap();
+        assert_eq!(fixture.posts.len(), 2);
+        assert!(matches!(
+            &fixture.posts[1].action,
+            Action::ClickSlot {
+                state_id: 21,
+                slot: 0,
+                ..
+            }
+        ));
+    }
+    let state: State = serde_json::from_slice(&fs::read(dir.path()).unwrap()).unwrap();
+    assert_eq!(state.pending.unwrap().action_id, "stale-fresh-take");
+    assert_eq!(state.phase, CraftPhase::Take);
+    peer.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_fresh_snapshot_version_stops_before_journal_or_mutation() {
+    let peer = peer(Fixture {
+        fresh_format: Some("minecraft-fresh-observation-v999"),
+        ..Fixture::default()
+    })
+    .await;
+    let dir = Temp::new();
+    let error = craft_once(
+        &peer.client,
+        "fixture:recipe",
+        "wrong-format",
+        &dir.path(),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert!(!dir.path().exists());
+    assert!(peer.state.lock().unwrap().posts.is_empty());
+    peer.stop().await;
 }
 
 #[tokio::test]

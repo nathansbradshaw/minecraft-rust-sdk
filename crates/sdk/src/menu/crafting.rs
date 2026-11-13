@@ -1,6 +1,6 @@
 //! One prepared recipe batch, taken into the cursor and stored in own inventory.
 //! This client composition is not a server transaction or native certification.
-use super::{click_slot, item_count, prepare_recipe};
+use super::{FRESH_OBSERVATION_CAPABILITY, click_slot, item_count, observe_fresh, prepare_recipe};
 use crate::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -443,7 +443,11 @@ fn advance(state: &mut State, receipt: &Receipt, o: &Observation) -> Result<()> 
 ///
 /// No recipe IDs, server address or menu layout is built in. This requires a
 /// matching native recipe-preparation verifier and an initially empty grid and
-/// cursor. Native `player.life_id` is required; the journal binds its initial
+/// cursor. The adapter must advertise `minecraft:fresh_observation`; each
+/// existing observation is one explicit bounded native query, with no polling
+/// or cached fallback. Full terrain/entities are included. The default cached
+/// body read remains separate; genuinely concurrent revision changes still stop.
+/// Native `player.life_id` is required; the journal binds its initial
 /// life and refuses continuation after death/respawn even if menu IDs match.
 /// Pre-life-identity integrations and version 1 journals require operator
 /// inspection rather than silent migration. Dynamic/custom component semantics
@@ -469,13 +473,14 @@ pub async fn craft_once(
     tokio::time::timeout_at(deadline,async {
         let info=client.discover().await?;
         if client.expected_instance.as_deref().is_some_and(|id|id!=info.instance_id) {return Err(error(ErrorCode::Conflict,"Gateway instance changed before crafting"));}
+        if !info.capabilities.iter().any(|c|c==FRESH_OBSERVATION_CAPABILITY) {return Err(error(ErrorCode::UnsupportedCapability,"Journaled crafting requires advertised minecraft:fresh_observation; cached observations are not a fallback"));}
         let own=client.credential.as_ref().ok_or_else(||error(ErrorCode::Unauthorized,"Authenticated craft character required"))?.player_uuid.clone();
-        let initial=client.observe().await?;
+        let initial=observe_fresh(client).await?;
         let life_id=initial.player["life_id"].as_str().filter(|s|!s.is_empty()).ok_or_else(||error(ErrorCode::UnsupportedCapability,"Native per-life identity required for crafting"))?;
         actor(&initial,&own,life_id)?;
         let mut journal=Journal::open(path,&info.instance_id,&own,life_id,recipe,prefix)?;
         loop {
-            let observation=client.observe().await?;actor(&observation,&own,&journal.state.life_id)?;
+            let observation=observe_fresh(client).await?;actor(&observation,&own,&journal.state.life_id)?;
             if journal.state.phase==CraftPhase::Completed {
                 let current=journal.state.output.as_ref().map(|o|item_count(&observation,&o.item)).transpose()?;
                 return Ok(journal.report(CraftStatus::AlreadyCompleted,None,current,None));
@@ -502,7 +507,7 @@ pub async fn craft_once(
                 let status=match receipt.outcome {Outcome::Prepared|Outcome::Dispatched|Outcome::Running=>CraftStatus::Pending,Outcome::Uncertain|Outcome::Reconciled|Outcome::Observed=>CraftStatus::NeedsInspection,_=>CraftStatus::Stopped};
                 return Ok(journal.report(status,Some(&receipt),None,None));
             }
-            let after=client.observe().await?;actor(&after,&own,&journal.state.life_id)?;
+            let after=observe_fresh(client).await?;actor(&after,&own,&journal.state.life_id)?;
             advance(&mut journal.state,&receipt,&after)?;journal.save()?;
             if journal.state.phase==CraftPhase::Completed {
                 let current=journal.state.output.as_ref().map(|o|item_count(&after,&o.item)).transpose()?;

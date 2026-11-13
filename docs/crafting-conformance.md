@@ -14,6 +14,17 @@ Old integration alpha.14 lacks life identity; use the matching alpha.15 or later
 module/adapter pair. Version 1 craft journals stop for operator inspection;
 never delete them or replace their IDs to force completion.
 
+The Rust adapter must additionally advertise `minecraft:fresh_observation`.
+`menu::observe_fresh(&client)` requests its versioned foreground snapshot with
+strictly empty input. Each existing helper observation becomes exactly one
+bounded direct native query, with no polling or cached fallback. The default
+cached body observation path stays unchanged. This optional Rust query uses the
+existing native module; no additional Java capability or version is required.
+It includes full terrain and entities, so it costs more than a cached read.
+Fresh menu revisions can still change before dispatch. Genuine concurrent
+changes, rejected clicks and uncertain outcomes remain stops; the helper never
+rebases a requested revision or invents replacement mutation IDs.
+
 `craft_conformance` is an operator fixture for a separately assigned, exclusively
 owned, already-connected character. Coordinate character and service ownership
 before running it. It never connects a character, supplies items, opens a menu,
