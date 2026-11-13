@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1";
 mod active_source;
+mod context_attestation;
 mod repair;
 /// Inspect a source-bound coding repair without inference, execution or writes.
 pub fn compiler_repair_preview(context: &Value) -> Value {
@@ -315,12 +316,14 @@ impl Model {
         prompt: &str,
         tokens: u32,
     ) -> Result<(String, Value)> {
-        let context = serde_json::to_string(context)?;
+        let serialized_context = serde_json::to_string(context)?;
         ensure(
-            context.len() <= 32768,
+            serialized_context.len() <= 32768,
             "Model context exceeds its declared budget",
         )?;
-        let body = json!({"model":model,"stream":false,"purpose":purpose,"options":{"num_predict":tokens},"format":format,"messages":[{"role":"system","content":prompt},{"role":"user","content":context}]});
+        let context_sha256 = crate::digest(serialized_context.as_bytes());
+        let attestation = context_attestation::summarize(context, &context_sha256);
+        let body = json!({"model":model,"stream":false,"purpose":purpose,"options":{"num_predict":tokens},"format":format,"messages":[{"role":"system","content":prompt},{"role":"user","content":serialized_context}]});
         let started = std::time::Instant::now();
         let (envelope, response_bytes, attempts) = self.request_transport(&body).await?;
         ensure(envelope["done"] == true, "Incomplete model response")?;
@@ -329,7 +332,7 @@ impl Model {
             .ok_or("Model content missing")?;
         Ok((
             content.to_owned(),
-            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium"|"high")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":crate::digest(context.as_bytes()),"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
+            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium"|"high")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":context_sha256,"context_attestation":attestation,"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
         ))
     }
     async fn request_transport(&self, body: &Value) -> Result<(Value, usize, u8)> {
@@ -422,6 +425,91 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn accepted_usage_attests_the_exact_final_context_without_changing_the_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let context = context_attestation::fixture();
+        let expected = serde_json::to_string(&context).unwrap();
+        let expected_request = expected.clone();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            let size = String::from_utf8(header)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(size < 32768);
+            let mut bytes = vec![0; size];
+            socket.read_exact(&mut bytes).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["messages"][1]["content"], expected_request);
+            assert!(
+                body.get("context_attestation").is_none(),
+                "Metadata must not alter the broker request schema"
+            );
+            let sent = body["messages"][1]["content"].as_str().unwrap().to_owned();
+            let reply = json!({"done":true,"message":{"content":"{}"}}).to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            sent
+        });
+        let model = Model {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint,
+        };
+        let (_, usage) = model
+            .request(
+                &context,
+                "fixture",
+                "plan",
+                json!({}),
+                "PROMPT_SENTINEL",
+                16,
+            )
+            .await
+            .unwrap();
+        let sent = upstream.await.unwrap();
+        assert_eq!(sent, expected);
+        let expected_hash = crate::digest(sent.as_bytes());
+        assert_eq!(usage["context_sha256"], expected_hash);
+        assert_eq!(
+            usage["context_attestation"]["context_sha256"],
+            expected_hash
+        );
+        assert_eq!(
+            usage["context_attestation"]["complete_source_with_reference_page"],
+            true
+        );
+        let metadata = usage.to_string();
+        for private in [
+            "SOURCE_SENTINEL",
+            "SDK_REFERENCE_SENTINEL",
+            "PRIVATE_PATH_SENTINEL",
+            "SECRET_SENTINEL",
+            "PROMPT_SENTINEL",
+        ] {
+            assert!(!metadata.contains(private));
+        }
+    }
     #[test]
     fn navigation_pause_excludes_only_navigation_from_the_reasoning_schema() {
         let mut format = session_schema(false);
