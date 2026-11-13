@@ -198,6 +198,28 @@ pub fn threatened(o: &Observation) -> bool {
 fn perceived(entity: &Value) -> bool {
     entity["visible"] == true || entity["client_memory"]["kind"] == "last_visible_ranged_threat"
 }
+/// The same close-threat rule gates selection and preemption. Recalled hidden
+/// poses cannot become current visible enemies through this predicate.
+pub(super) fn toward_close_threat(o: &Observation, target: [f64; 3]) -> bool {
+    let Some(start) = point(&o.player["position"]) else {
+        return false;
+    };
+    o.world["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["visible"] == true && e["hostile"] == true)
+        .filter_map(|e| {
+            point(&e["position"]).map(|enemy| {
+                let distance = (0..3).map(|i| (start[i] - enemy[i]).powi(2)).sum::<f64>();
+                (enemy, distance)
+            })
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .is_some_and(|(enemy, distance)| {
+            distance < 25. && (0..3).map(|i| (target[i] - enemy[i]).powi(2)).sum::<f64>() < distance
+        })
+}
 /// Submersion needs protection independently of inference. A natively confirmed
 /// breathing surface swimmer may keep its finite input; unknown facts retain
 /// the conservative escape policy. No health/shelter prerequisite gates thought.
@@ -741,6 +763,7 @@ pub(super) fn evade_policy(
     if !burning
         && !projectile_danger
         && !blast_escape
+        && admitted.is_empty()
         && let Some(plan) = cover::plan(o, blocked, waypoint_axis)
     {
         return match plan {
@@ -950,6 +973,12 @@ pub(super) fn evade_policy(
             }
         }
     }
+    // Native recovery options describe paths actually predicted for this
+    // current pose/physics. Do not outrank them with the geometric guesses
+    // whose held-input feasibility already failed in this recovery scene.
+    if !admitted.is_empty() {
+        candidates.clear();
+    }
     for (p, native_jump) in candidates
         .into_iter()
         .map(|p| (p, None))
@@ -958,6 +987,9 @@ pub(super) fn evade_policy(
         let dy = p[1] - start[1];
         let length = ((p[0] - start[0]).powi(2) + (p[2] - start[2]).powi(2)).sqrt();
         for jump in [false, true] {
+            if toward_close_threat(o, p) {
+                continue;
+            }
             if native_jump.is_some_and(|j| j != jump) {
                 continue;
             }
@@ -1099,6 +1131,80 @@ mod tests {
             }
         }
         (o, vec![[0.3524, 1., -0.6502]])
+    }
+    #[test]
+    fn smoke02_191_derived_recovery_uses_a_native_option_instead_of_an_unproven_guess() {
+        // Translated player/threat/options from native F smoke02 decision191.
+        // Floor is synthesized; foliage and version physics are omitted. This
+        // checks candidate authority, not an exact world replay or survival.
+        let mut o = world();
+        o.player = json!({"position":[0.5,1.,0.5],"on_ground":true});
+        o.world["entities"] = json!([{"visible":false,"hostile":true,"ranged_attack":true,
+            "position":[-1.435897210272,1.4,1.17490669445],
+            "client_memory":{"kind":"last_visible_ranged_threat"}}]);
+        let admitted: Vec<_> = [
+            [0.5, 1., 1.5],
+            [-0.5, 1., 0.5],
+            [0.5, 1., -0.5],
+            [-0.5, 1., -0.5],
+        ]
+        .into_iter()
+        .map(|target| Admitted {
+            target,
+            jump: false,
+        })
+        .collect();
+        let route = evade_with_native(&o, &[], &[], &[], 3.5, &admitted)
+            .expect("an admitted outward route");
+        assert!(
+            admitted
+                .iter()
+                .any(|r| r.target == [route.target.x, route.target.y, route.target.z])
+        );
+        assert!(route.reason.contains("native-predicted"));
+    }
+    #[test]
+    fn smoke02_217_derived_selection_cannot_issue_its_own_immediate_preemption() {
+        // Translated native217 poses on synthesized floor; no world capture or
+        // omitted physics is presented as an executed movement/survival trial.
+        let mut o = world();
+        o.player = json!({"position":[0.5,1.,0.5],"on_ground":true});
+        o.world["entities"] = json!([{"visible":true,"hostile":true,"ranged_attack":true,
+            "position":[-1.5007283081725,1.,4.4756279051355]}]);
+        let self_cancelling = [1.5715136106223, 1., 3.0868626910316];
+        assert!(toward_close_threat(&o, self_cancelling));
+        let outward = [0.5, 1., -0.5];
+        let options = [
+            Admitted {
+                target: self_cancelling,
+                jump: true,
+            },
+            Admitted {
+                target: outward,
+                jump: false,
+            },
+        ];
+        let route = evade_with_native(&o, &[], &[], &[], 3.5, &options).unwrap();
+        let selected = [route.target.x, route.target.y, route.target.z];
+        assert_eq!(selected, outward);
+        assert!(
+            !toward_close_threat(&o, selected),
+            "unchanged scene must not cancel its own choice"
+        );
+        assert!(
+            evade_with_native(&o, &[], &[], &[], 3.5, &options[..1]).is_none(),
+            "no admissible alternative is not gameplay progress"
+        );
+        o.world["entities"][0]["position"] = json!([-0.5, 1., -1.5]);
+        assert!(
+            toward_close_threat(&o, selected),
+            "a changed visible threat still preempts"
+        );
+        o.world["entities"][0]["visible"] = json!(false);
+        assert!(
+            !toward_close_threat(&o, selected),
+            "hidden pose does not grant privileged perception"
+        );
     }
     #[test]
     fn a_known_corner_turn_preserves_circulation_in_rotated_worlds() {

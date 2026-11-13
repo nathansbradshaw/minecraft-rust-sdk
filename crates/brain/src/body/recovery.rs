@@ -10,6 +10,54 @@ use std::{
 };
 use tokio::task::JoinHandle;
 
+fn basis(o: &Observation) -> String {
+    crate::digest(
+        json!({"actor":o.player["uuid"],"life":o.player["life_id"],
+        "entity":o.player["entity_id"],"dimension":o.player["dimension"],
+        "clock":o.world["sample_clock"]["epoch"],
+        "position":geometry::point(&o.player["position"]).map(geometry::target_key),
+        "speed":o.player["movement_speed"],"physics":o.player["physics"],
+        "yaw":o.player["yaw"],"sprinting":o.player["sprinting"],
+        "on_ground":o.player["on_ground"],"velocity":o.player["velocity"],
+        "sneaking":o.player["sneaking"],"blocks":o.world["blocks"]})
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+/// A definite native refusal invalidates geometric guesses for this scene.
+/// Uncertainty never authorizes a retry or retires the original durable ID.
+#[derive(Default)]
+pub(super) struct Required {
+    rejected_basis: Option<String>,
+}
+impl Required {
+    pub fn for_threat(&mut self, o: &Observation, threatened: bool, water_emergency: bool) -> bool {
+        self.active(o) && threatened && !water_emergency && o.player["on_ground"] == true
+    }
+    pub fn active(&mut self, o: &Observation) -> bool {
+        if self
+            .rejected_basis
+            .as_ref()
+            .is_some_and(|old| old != &basis(o))
+        {
+            self.rejected_basis = None;
+        }
+        self.rejected_basis.is_some()
+    }
+    pub fn movement_rejected(&mut self, o: &Observation, receipt: &minecraft_sdk::Receipt) {
+        if receipt.outcome == minecraft_sdk::Outcome::Rejected
+            && minecraft_sdk::valid_id(&receipt.action_id)
+            && receipt
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == minecraft_sdk::ErrorCode::UnsupportedCapability)
+        {
+            self.rejected_basis = Some(basis(o));
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Progress {
     lane: Option<(String, String, String, i64)>,
@@ -87,6 +135,7 @@ pub(super) struct Discovery {
     next_query: Instant,
     routes: Vec<Admitted>,
     received: Option<Instant>,
+    prefix_busy_retries: u8,
 }
 impl Default for Discovery {
     fn default() -> Self {
@@ -99,6 +148,7 @@ impl Default for Discovery {
             next_query: Instant::now(),
             routes: Vec::new(),
             received: None,
+            prefix_busy_retries: 0,
         }
     }
 }
@@ -121,6 +171,7 @@ impl Discovery {
         self.done = false;
         self.routes.clear();
         self.received = None;
+        self.prefix_busy_retries = 0;
         // Keep the request spacing even across movement/scene changes.
     }
     pub fn waiting(&self) -> bool {
@@ -131,6 +182,7 @@ impl Discovery {
         client: Arc<Client>,
         o: &Observation,
         enabled: bool,
+        first_prefix_only: bool,
         axis: f64,
         j: &Journal,
     ) -> Result<Vec<Admitted>> {
@@ -138,15 +190,7 @@ impl Discovery {
             self.reset(String::new());
             return Ok(Vec::new());
         }
-        let basis = crate::digest(
-            json!({"actor":o.player["uuid"],"entity":o.player["entity_id"],
-            "dimension":o.player["dimension"],"clock":o.world["sample_clock"]["epoch"],
-            "position":geometry::point(&o.player["position"]).map(geometry::target_key),
-            "speed":o.player["movement_speed"],"physics":o.player["physics"],
-            "sneaking":o.player["sneaking"],"blocks":o.world["blocks"]})
-            .to_string()
-            .as_bytes(),
-        );
+        let basis = basis(o);
         if basis != self.basis {
             self.reset(basis);
         }
@@ -168,6 +212,16 @@ impl Discovery {
                     "origin":o.player["position"],"revision":o.revision,
                     "scope":"Adapter predictions; native action admission and observed effect still required"}))?;
             }
+            if first_prefix_only {
+                // Busy is readiness, not an empty completed prefix. Honor its
+                // existing bounded retry hint once for this exact basis; never
+                // page a ready response or repeatedly poll unchanged failures.
+                if self.received.is_some() || self.done || self.prefix_busy_retries >= 1 {
+                    self.done = true;
+                } else {
+                    self.prefix_busy_retries += 1;
+                }
+            }
         }
         if self
             .received
@@ -180,7 +234,7 @@ impl Discovery {
             self.next_query = Instant::now() + Duration::from_millis(500);
             j.event("body_native_escape_query",json!({"offset":offset,"limit":8,
                 "revision":o.revision,"origin":o.player["position"],
-                "reason":"No two-block defensive displacement over80advancing native ticks",
+                "reason":if first_prefix_only{"Native held-input movement rejected; inspect one current prefix"}else{"No two-block defensive displacement over80advancing native ticks"},
                 "execution":"Read-only background query; body observations and urgent defense continue"}))?;
             self.task = Some(tokio::spawn(async move {
                 match tokio::time::timeout(
@@ -290,6 +344,76 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_definite_typed_rejection_requires_native_and_every_basis_change_retires_it() {
+        let o = observation();
+        let receipt = |outcome, code, id: &str| minecraft_sdk::Receipt {
+            action_id: id.into(),
+            outcome,
+            adapter_version: "fixture".into(),
+            evidence: Value::Null,
+            error: Some(minecraft_sdk::ApiError::new(code, "fixture")),
+        };
+        for (outcome, code, id) in [
+            (
+                minecraft_sdk::Outcome::Uncertain,
+                minecraft_sdk::ErrorCode::UnsupportedCapability,
+                "unknown",
+            ),
+            (
+                minecraft_sdk::Outcome::Rejected,
+                minecraft_sdk::ErrorCode::Conflict,
+                "conflict",
+            ),
+            (
+                minecraft_sdk::Outcome::Rejected,
+                minecraft_sdk::ErrorCode::UnsupportedCapability,
+                "invalid/id",
+            ),
+        ] {
+            let mut required = Required::default();
+            required.movement_rejected(&o, &receipt(outcome, code, id));
+            assert!(!required.active(&o));
+        }
+        let refusal = receipt(
+            minecraft_sdk::Outcome::Rejected,
+            minecraft_sdk::ErrorCode::UnsupportedCapability,
+            "rejected-move",
+        );
+        let mut unrelated = Required::default();
+        unrelated.movement_rejected(&o, &refusal);
+        let mut burning = o.clone();
+        burning.world["entities"] = json!([]);
+        burning.player["fire_ticks"] = json!(20);
+        assert!(
+            !unrelated.for_threat(&burning, false, false),
+            "old rejection must not suppress unrelated fire recovery without a threat"
+        );
+        assert!(
+            !unrelated.for_threat(&o, true, true),
+            "breathing recovery retains immediate authority"
+        );
+        assert!(unrelated.for_threat(&o, true, false));
+        for (pointer, value) in [
+            ("/player/uuid", json!("other")),
+            ("/player/life_id", json!("new-life")),
+            ("/player/dimension", json!("minecraft:the_nether")),
+            ("/player/yaw", json!(90.)),
+            ("/player/physics", json!({"changed":true})),
+            ("/player/sprinting", json!(true)),
+            ("/player/position", json!([1.5, 1., 0.5])),
+            ("/world/blocks", json!([{"changed":true}])),
+        ] {
+            let mut required = Required::default();
+            required.movement_rejected(&o, &refusal);
+            assert!(required.active(&o));
+            let mut value_o = serde_json::to_value(&o).unwrap();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            value_o.pointer_mut(parent).unwrap()[key] = value;
+            let changed = serde_json::from_value(value_o).unwrap();
+            assert!(!required.active(&changed), "{pointer}");
+        }
+    }
     fn observation() -> Observation {
         serde_json::from_value(json!({"revision":"fixture","player":{
             "uuid":"own","entity_id":1,"dimension":"minecraft:overworld",
@@ -344,6 +468,117 @@ mod tests {
                 _ => Value::Null,
             };
             assert!(Discovery::default().accept(malformed, &o, 3.5).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn rejection_prefix_retries_busy_readiness_once_then_consumes_ready_or_stops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for ready in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(
+                Client::with_profile(&minecraft_sdk::Profile {
+                    endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+                    instance_id: "fixture".into(),
+                    credential: minecraft_sdk::Credential {
+                        bot_id: "own".into(),
+                        player_uuid: "own".into(),
+                        key: "fixture".into(),
+                    },
+                    session: None,
+                })
+                .unwrap()
+                .without_local_arbiter(),
+            );
+            let server = tokio::spawn(async move {
+                for index in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        headers.push(socket.read_u8().await.unwrap());
+                        assert!(headers.len() < 8192);
+                    }
+                    let headers = std::str::from_utf8(&headers).unwrap();
+                    assert!(headers.starts_with("POST /v1/bots/own/observations/query "));
+                    let size = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    assert!(size < 16384);
+                    let mut bytes = vec![0; size];
+                    socket.read_exact(&mut bytes).await.unwrap();
+                    let query: ObservationQuery = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(query.capability, "minecraft:movement_options");
+                    assert_eq!(
+                        query.input,
+                        json!({"offset":0,"limit":8}),
+                        "never page a ready prefix"
+                    );
+                    let value = if index == 1 && ready {
+                        let mut p = page();
+                        p["complete"] = json!(false);
+                        p["next_offset"] = json!(8);
+                        p
+                    } else {
+                        json!({"format":"minecraft-movement-options-v1","origin":null,"scene":"",
+                            "options":[],"complete":false,"next_offset":null,"retry_after_ms":250,"busy":true})
+                    };
+                    let body = value.to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(80), listener.accept())
+                        .await
+                        .is_err(),
+                    "at most one same-basis readiness retry, no full paging or storm"
+                );
+            });
+            let root = tempfile::tempdir().unwrap();
+            let j = Journal::open(&root.path().join("body.sqlite")).unwrap();
+            let mut d = Discovery::default();
+            let o = observation();
+            d.tick(client.clone(), &o, true, true, 3.5, &j)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while d.waiting() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    d.tick(client.clone(), &o, true, true, 3.5, &j)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!d.done);
+            assert_eq!(d.prefix_busy_retries, 1);
+            assert!(d.routes.is_empty());
+            assert!(
+                d.next_query > Instant::now(),
+                "honor the busy response's bounded retry hint"
+            );
+            tokio::time::sleep(Duration::from_millis(260)).await;
+            d.tick(client.clone(), &o, true, true, 3.5, &j)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while d.waiting() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    d.tick(client.clone(), &o, true, true, 3.5, &j)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(d.done);
+            assert_eq!(d.routes.len(), usize::from(ready));
+            d.tick(client, &o, true, true, 3.5, &j).await.unwrap();
+            assert!(!d.waiting());
+            server.await.unwrap();
         }
     }
     #[test]
@@ -459,7 +694,9 @@ mod tests {
         let mut d = Discovery::default();
         let o = observation();
         let start = Instant::now();
-        d.tick(client.clone(), &o, true, 3.5, &j).await.unwrap();
+        d.tick(client.clone(), &o, true, false, 3.5, &j)
+            .await
+            .unwrap();
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(d.waiting());
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
@@ -473,7 +710,7 @@ mod tests {
             String::from_utf8_lossy(&request[..n])
                 .starts_with("POST /v1/bots/own/observations/query")
         );
-        d.tick(client, &o, false, 3.5, &j).await.unwrap();
+        d.tick(client, &o, false, false, 3.5, &j).await.unwrap();
         assert!(!d.waiting());
         assert!(d.routes.is_empty());
         assert_eq!(

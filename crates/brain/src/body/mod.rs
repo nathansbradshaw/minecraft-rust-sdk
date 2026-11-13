@@ -581,6 +581,7 @@ async fn controller(
     let mut last_motion_assessment = (Vec::new(), Vec::new());
     let mut retreat_progress = recovery::Progress::default();
     let mut native_escape = recovery::Discovery::default();
+    let mut native_required = recovery::Required::default();
     let mut last_meal = None;
     let mut owned_meal: Option<(String, tactics::Meal)> = None;
     loop {
@@ -735,18 +736,26 @@ async fn controller(
                 .into_iter()
                 .flatten()
                 .any(|e| e["visible"] == true && geometry::primed_blast(e).is_some());
-        let discover = stalled
-            && !urgent
+        let require_native = native_required.for_threat(&observed, threatened, water_emergency);
+        let discover = (require_native || (stalled && !urgent))
             && threatened
             && observed.player["on_ground"] == true
             && active["outcome"] != "running";
         let admitted = native_escape
-            .tick(client.clone(), &observed, discover, finite_waypoint_axis, j)
+            .tick(
+                client.clone(),
+                &observed,
+                discover,
+                require_native,
+                finite_waypoint_axis,
+                j,
+            )
             .await?;
         // Finish the old finite input before discovery. During the short
         // read-only query keep observing and defending; any new urgent danger
         // immediately restores the fast route without waiting for the query.
-        let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
+        let awaiting_native =
+            (require_native || (discover && native_escape.waiting())) && admitted.is_empty();
         let escape = if active["outcome"] != "running" && !awaiting_native {
             let defensive = geometry::evade_policy(
                 &policy_observed,
@@ -841,14 +850,8 @@ async fn controller(
                 cancelled_item_use = id.into();
                 j.event("body_preempted_item_use",json!({"action_id":id,"cancel_action_id":receipt.action_id,"outcome":receipt.outcome,"reason":"release held input before urgent survival work","replayed":false}))?;
             }
-            let toward_threat = nearby.is_some_and(|(enemy, d)| {
-                d < 5.
-                    && geometry::point(&active["target"])
-                        .zip(geometry::point(&enemy["position"]))
-                        .is_some_and(|(t, e)| {
-                            (0..3).map(|i| (t[i] - e[i]).powi(2)).sum::<f64>() < d * d
-                        })
-            });
+            let toward_threat = geometry::point(&active["target"])
+                .is_some_and(|target| geometry::toward_close_threat(&observed, target));
             let toward_heard_blast = geometry::point(&active["target"]).is_some_and(|target| {
                 heard_blasts.iter().any(|(origin, _)| {
                     (0..3).map(|i| (target[i] - origin[i]).powi(2)).sum::<f64>()
@@ -988,6 +991,7 @@ async fn controller(
                                 || (observed.player["in_water"] == true && owned_water_shore);
                             owned_projectiles = incoming_projectiles.clone();
                         } else {
+                            native_required.movement_rejected(&observed, &r);
                             rejected_routes.push(key);
                             j.event("body_route_failure",json!({"target":key,"outcome":r.outcome,"error":r.error,"next_action":"try a different observed route; investigate if none works"}))?;
                         }
