@@ -135,6 +135,7 @@ pub(super) struct Discovery {
     next_query: Instant,
     routes: Vec<Admitted>,
     received: Option<Instant>,
+    prefix_busy_retries: u8,
 }
 impl Default for Discovery {
     fn default() -> Self {
@@ -147,6 +148,7 @@ impl Default for Discovery {
             next_query: Instant::now(),
             routes: Vec::new(),
             received: None,
+            prefix_busy_retries: 0,
         }
     }
 }
@@ -169,6 +171,7 @@ impl Discovery {
         self.done = false;
         self.routes.clear();
         self.received = None;
+        self.prefix_busy_retries = 0;
         // Keep the request spacing even across movement/scene changes.
     }
     pub fn waiting(&self) -> bool {
@@ -210,9 +213,14 @@ impl Discovery {
                     "scope":"Adapter predictions; native action admission and observed effect still required"}))?;
             }
             if first_prefix_only {
-                // Rejection recovery consumes one bounded prefix, not a full
-                // route search or an unchanged-scene request loop.
-                self.done = true;
+                // Busy is readiness, not an empty completed prefix. Honor its
+                // existing bounded retry hint once for this exact basis; never
+                // page a ready response or repeatedly poll unchanged failures.
+                if self.received.is_some() || self.done || self.prefix_busy_retries >= 1 {
+                    self.done = true;
+                } else {
+                    self.prefix_busy_retries += 1;
+                }
             }
         }
         if self
@@ -460,6 +468,117 @@ mod tests {
                 _ => Value::Null,
             };
             assert!(Discovery::default().accept(malformed, &o, 3.5).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn rejection_prefix_retries_busy_readiness_once_then_consumes_ready_or_stops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for ready in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(
+                Client::with_profile(&minecraft_sdk::Profile {
+                    endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+                    instance_id: "fixture".into(),
+                    credential: minecraft_sdk::Credential {
+                        bot_id: "own".into(),
+                        player_uuid: "own".into(),
+                        key: "fixture".into(),
+                    },
+                    session: None,
+                })
+                .unwrap()
+                .without_local_arbiter(),
+            );
+            let server = tokio::spawn(async move {
+                for index in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        headers.push(socket.read_u8().await.unwrap());
+                        assert!(headers.len() < 8192);
+                    }
+                    let headers = std::str::from_utf8(&headers).unwrap();
+                    assert!(headers.starts_with("POST /v1/bots/own/observations/query "));
+                    let size = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    assert!(size < 16384);
+                    let mut bytes = vec![0; size];
+                    socket.read_exact(&mut bytes).await.unwrap();
+                    let query: ObservationQuery = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(query.capability, "minecraft:movement_options");
+                    assert_eq!(
+                        query.input,
+                        json!({"offset":0,"limit":8}),
+                        "never page a ready prefix"
+                    );
+                    let value = if index == 1 && ready {
+                        let mut p = page();
+                        p["complete"] = json!(false);
+                        p["next_offset"] = json!(8);
+                        p
+                    } else {
+                        json!({"format":"minecraft-movement-options-v1","origin":null,"scene":"",
+                            "options":[],"complete":false,"next_offset":null,"retry_after_ms":250,"busy":true})
+                    };
+                    let body = value.to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(80), listener.accept())
+                        .await
+                        .is_err(),
+                    "at most one same-basis readiness retry, no full paging or storm"
+                );
+            });
+            let root = tempfile::tempdir().unwrap();
+            let j = Journal::open(&root.path().join("body.sqlite")).unwrap();
+            let mut d = Discovery::default();
+            let o = observation();
+            d.tick(client.clone(), &o, true, true, 3.5, &j)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while d.waiting() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    d.tick(client.clone(), &o, true, true, 3.5, &j)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!d.done);
+            assert_eq!(d.prefix_busy_retries, 1);
+            assert!(d.routes.is_empty());
+            assert!(
+                d.next_query > Instant::now(),
+                "honor the busy response's bounded retry hint"
+            );
+            tokio::time::sleep(Duration::from_millis(260)).await;
+            d.tick(client.clone(), &o, true, true, 3.5, &j)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while d.waiting() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    d.tick(client.clone(), &o, true, true, 3.5, &j)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(d.done);
+            assert_eq!(d.routes.len(), usize::from(ready));
+            d.tick(client, &o, true, true, 3.5, &j).await.unwrap();
+            assert!(!d.waiting());
+            server.await.unwrap();
         }
     }
     #[test]
