@@ -22,6 +22,17 @@ can require a mod adapter; omitted alternatives or ingredients remain unknown.
 Respect `retry_after_ms`, `next_offset` and `complete`. Pages are live across data
 reloads; an output-filter miss cannot exclude dynamic recipes.
 
+Ingredient rows may include the native boolean `empty`. Only `empty: true`
+identifies an intentionally blank cell, including padding inside a shaped recipe.
+An empty `matching_stacks` array alone does not establish a blank or impossible
+ingredient. False, missing, null or non-boolean `empty` values leave empty
+representatives unknown; older providers remain supported.
+`recipes::material_summary` preserves this flag as true, false or null in each
+group and keeps different flags separate even when representatives match. Its
+ingredient indices retain shaped padding positions; blank-cell occurrences are
+not material requirements. The summary still does not allocate supplies, derive
+a material budget or prove custom matching, menu fit or craftability.
+
 The alpha.11 adapter requires that matching server capability before dispatching
 recipe-book crafting. It rejects an unknown ID or a recipe absent from this
 character's book before sending a gameplay packet. It does not claim that a
