@@ -176,6 +176,11 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   player:1.62; use an appropriate interaction range). Choose the block from fresh
   observations. The helper uses a persistent local graph and finite controls;
   it never mines, teleports, breaks obstacles or chooses your task.
+  In generated programs, use navigation::Options { eager_progress:true,
+  ..Default::default() } for short handoffs between validated movement steps.
+  This opt-in can act on a fresh, strictly improving preview prefix instead of
+  waiting for the entire local graph; native admission and full-search fallback
+  still apply. The brain's navigate tool already enables it.
   After no_known_route, the brain's observe tool accepts {"view":"terrain"}.
   This read-only view groups current observed cells around the character into
   support, feet, head and above_head layers, with absolute positions and native
