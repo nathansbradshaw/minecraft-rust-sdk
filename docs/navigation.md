@@ -68,10 +68,11 @@ is a report about the explored graph, not proof that the world has no route.
 `Options::eager_progress` is an experimental opt-in, disabled by default. The
 reference brain enables it to reduce idle time between finite controls. A fresh
 partial preview may supply a strictly goal-improving, policy-permitted edge;
-the client may dispatch it before reading every local candidate. Already arrived
-frontiers are skipped, including when another controller has returned the player
-to an earlier pose. When no prefix edge qualifies, bounded graph search remains
-available. This changes client route selection, never ordinary native admission,
+the client may dispatch it before reading every local candidate. Eager shortcuts
+skip already arrived frontiers, including after another controller returns the
+player to an earlier pose. Full bounded graph search can revisit partial nodes
+to finish their unread candidates and find detours. This changes client route
+selection, never ordinary native admission,
 body preemption, goal tolerances or pending-ID reconciliation.
 
 Partial nodes remain unexpanded. The resumable read cursor is retained, and a
