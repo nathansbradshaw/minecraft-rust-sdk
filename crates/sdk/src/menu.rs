@@ -1,5 +1,8 @@
-//! Build typed intentions from observed menu state. No dispatch or replay.
+//! Typed menu builders and optional journaled recipe-output composition.
 use crate::*;
+mod crafting;
+pub use crafting::{CraftPhase, CraftReport, CraftStatus, craft_once};
+
 fn unavailable(message: &str) -> ApiError {
     ApiError::new(ErrorCode::NotReady, message)
 }
