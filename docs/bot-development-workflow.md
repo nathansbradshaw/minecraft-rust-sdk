@@ -73,7 +73,12 @@ cargo run --offline --locked -p minecraft-sdk-xtask --bin bot-dev -- \
   capture .state/dev-runs/scenario-001 120 -- /absolute/owned-launcher ARGUMENT
 ```
 
-Arguments are passed directly, without shell interpolation. The child receives
+Arguments are passed directly, without shell interpolation. Capture accepts
+an outer deadline of1–1500seconds. For a1200second gameplay trial, use1210seconds
+around a separately bounded1200second launcher to retain shutdown evidence. This
+does not extend the gameplay acceptance window. Validate the launcher command
+and its prerequisites before connecting a character.
+The child receives
 `BOT_DEV_CAPTURE_DIR`, an absolute private artifact directory. A cooperating
 launcher can write observation JSON, receipts or screenshots there. The runner
 hashes up to 64 ordinary files/64 MiB, rejects symlinks from the artifact manifest,

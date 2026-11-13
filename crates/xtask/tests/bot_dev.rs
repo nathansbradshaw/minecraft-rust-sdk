@@ -9,6 +9,49 @@ fn report(path: &std::path::Path) -> Value {
 }
 
 #[test]
+fn gameplay_deadline_launches_and_out_of_bounds_never_spawns() {
+    let root = tempfile::tempdir().unwrap();
+    for seconds in ["1210", "1500"] {
+        let path = root.path().join(seconds);
+        let output = Command::new(binary())
+            .args([
+                "capture",
+                path.to_str().unwrap(),
+                seconds,
+                "--",
+                binary(),
+                "fixture-worker",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let captured = report(&path);
+        assert_eq!(
+            captured["timeout_ms"],
+            seconds.parse::<u64>().unwrap() * 1000
+        );
+        assert_eq!(captured["exit_code"], 2);
+        assert_eq!(captured["timed_out"], false);
+    }
+    for seconds in ["0", "1501"] {
+        let absent = root.path().join(seconds);
+        let output = Command::new(binary())
+            .args([
+                "capture",
+                absent.to_str().unwrap(),
+                seconds,
+                "--",
+                binary(),
+                "fixture-worker",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!absent.exists());
+    }
+}
+
+#[test]
 fn replay_returns_success_only_for_the_expected_reproduced_failure() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("new-parent/nested/replay");
