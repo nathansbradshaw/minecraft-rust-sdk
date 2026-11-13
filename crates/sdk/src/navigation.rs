@@ -247,7 +247,7 @@ impl Journal {
                 "Another navigation invocation owns this journal",
             )
         })?;
-        let state = if path.exists() {
+        let mut state = if path.exists() {
             let m = fs::symlink_metadata(path).map_err(local)?;
             if !m.is_file() || m.file_type().is_symlink() || m.len() > 16 * 1024 * 1024 {
                 return Err(local("Expected a bounded regular navigation state file"));
@@ -291,6 +291,21 @@ impl Journal {
                 expansion: None,
             }
         };
+        // Older clients classified cancellation as a geometric failure. Repair
+        // only edges whose retained history contains cancellation alone; keep
+        // every edge with another outcome and preserve all intention history.
+        let mut cancelled_only: BTreeSet<_> = state
+            .history
+            .iter()
+            .filter(|attempt| attempt.outcome == Some(Outcome::Cancelled))
+            .map(attempt_edge_key)
+            .collect();
+        for attempt in &state.history {
+            if attempt.outcome != Some(Outcome::Cancelled) {
+                cancelled_only.remove(&attempt_edge_key(attempt));
+            }
+        }
+        state.blocked.retain(|edge| !cancelled_only.contains(edge));
         let j = Self {
             path: path.to_owned(),
             state,
@@ -361,6 +376,16 @@ fn observed_pose(o: &Observation) -> Result<Origin> {
 }
 fn blocked_key(from: &str, to: &str, scene: &str) -> String {
     format!("{from}>{to}@{scene}")
+}
+fn attempt_edge_key(attempt: &Attempt) -> String {
+    blocked_key(
+        &attempt
+            .source_node
+            .clone()
+            .unwrap_or_else(|| key(attempt.origin)),
+        &key(attempt.target),
+        &attempt.scene,
+    )
 }
 fn current_node(state: &State, observed: &Observation, position: [f64; 3]) -> String {
     // A verified arrival can coast across the graph's rounding boundary after
@@ -481,6 +506,7 @@ pub async fn navigate(
 }
 async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Report> {
     loop {
+        let mut cancelled = false;
         if let Some(pending) = &j.state.pending {
             let id = pending.request.action_id.clone();
             let receipt = match client.action_status(&id).await {
@@ -543,16 +569,14 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 "entity_id":receipt.evidence["after"]["player"]["entity_id"],
                 "dimension":receipt.evidence["after"]["player"]["dimension"],
                 "epoch":receipt.evidence["after"]["world"]["sample_clock"]["epoch"]}));
-            if receipt.outcome != Outcome::Observed || arrival.is_some_and(|(_, reached)| !reached)
+            // Cancellation is a control handoff, not a physical route verdict.
+            // Retain its exact intention without poisoning an otherwise feasible
+            // edge or immediately fighting the controller that cancelled it.
+            cancelled = receipt.outcome == Outcome::Cancelled;
+            if (!matches!(receipt.outcome, Outcome::Observed | Outcome::Cancelled))
+                || arrival.is_some_and(|(_, reached)| !reached)
             {
-                j.state.blocked.insert(blocked_key(
-                    &attempt
-                        .source_node
-                        .clone()
-                        .unwrap_or_else(|| key(attempt.origin)),
-                    &key(attempt.target),
-                    &attempt.scene,
-                ));
+                j.state.blocked.insert(attempt_edge_key(&attempt));
             }
             j.state.history.push(attempt);
             j.state.expansion = None;
@@ -582,6 +606,10 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
         if j.state.goal.gap(pose.position) <= 0.001 {
             j.save()?;
             return Ok(j.report("reached","Observed player pose satisfies the requested distance; gameplay effects need their own verification"));
+        }
+        if cancelled {
+            j.save()?;
+            return Ok(j.report("preempted","The previous intention was cancelled. Its exact ID and fresh pose are retained, without marking the route impossible or dispatching another mutation. Resume explicitly after control conditions change; the cancelled ID is not replayed."));
         }
         if j.state.history.len() >= options.max_steps || j.state.nodes.len() > options.max_nodes {
             j.save()?;
@@ -1677,68 +1705,120 @@ mod tests {
         );
         server.await.unwrap();
     }
-    #[tokio::test]
-    async fn a_defensively_cancelled_intention_is_resolved_before_reporting_the_fresh_pose() {
+    #[test]
+    fn reopening_removes_only_legacy_cancelled_only_edges_without_changing_intentions() {
         let temp = Temp::new();
         let path = temp.0.join("nav.json");
+        let attempt = |id: &str, x: f64, outcome| Attempt {
+            request: ActionRequest {
+                action_id: id.into(),
+                action: Action::StartMove {
+                    target: Position { x, y: 1., z: 0.5 },
+                    jump: false,
+                    max_ticks: 60,
+                },
+            },
+            origin: [0.5, 1., 0.5],
+            source_node: Some("canonical-source".into()),
+            scene: "scene".into(),
+            target: [x, 1., 0.5],
+            outcome,
+            arrival_verification: None,
+        };
+        let cancelled = attempt("cancel-only", 1.5, Some(Outcome::Cancelled));
+        let cancelled_after_failure = attempt("cancel-mixed", 2.5, Some(Outcome::Cancelled));
+        let failed = attempt("failed", 2.5, Some(Outcome::Rejected));
+        let pending = attempt("still-pending", 3.5, None);
         {
             let mut j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
-            j.state.pending = Some(Attempt {
-                request: ActionRequest {
-                    action_id: "cancelled".into(),
-                    action: Action::StartMove {
-                        target: Position {
-                            x: 1.5,
-                            y: 1.,
-                            z: 0.5,
-                        },
-                        jump: false,
-                        max_ticks: 60,
-                    },
-                },
-                origin: [0.5, 1., 0.5],
-                scene: "scene".into(),
-                target: [1.5, 1., 0.5],
-                outcome: None,
-                source_node: None,
-                arrival_verification: None,
-            });
+            j.state.blocked.insert(attempt_edge_key(&cancelled));
+            j.state.blocked.insert(attempt_edge_key(&failed));
+            j.state.blocked.insert("unattributed-old-edge".into());
+            j.state.history = vec![cancelled.clone(), cancelled_after_failure, failed.clone()];
+            j.state.pending = Some(pending.clone());
             j.save().unwrap();
         }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
-        let server = tokio::spawn(async move {
-            respond(&listener, "GET /v1/server ", info("instance"), 200).await;
-            respond(
-                &listener,
-                "GET /v1/bots/fixture/observations ",
-                observation([5.5, 1., 0.5]),
-                200,
-            )
-            .await;
-            respond(&listener,"GET /v1/bots/fixture/actions/cancelled ",serde_json::json!({"action_id":"cancelled","outcome":"cancelled","adapter_version":"fixture","evidence":{"input_released":true},"error":null}),200).await;
-            respond(
-                &listener,
-                "GET /v1/bots/fixture/observations ",
-                observation([5.5, 1., 0.5]),
-                200,
-            )
-            .await;
+        let j = Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+        assert!(!j.state.blocked.contains(&attempt_edge_key(&cancelled)));
+        assert!(j.state.blocked.contains(&attempt_edge_key(&failed)));
+        assert!(j.state.blocked.contains("unattributed-old-edge"));
+        assert_eq!(j.state.history.len(), 3);
+        assert_eq!(j.state.history[0].request.action_id, "cancel-only");
+        assert_eq!(
+            serde_json::to_value(&j.state.pending.as_ref().unwrap().request).unwrap(),
+            serde_json::to_value(pending.request).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn a_defensively_cancelled_intention_is_resolved_before_reporting_the_fresh_pose() {
+        for (fresh_pose, expected) in [([5.5, 1., 0.5], "reached"), ([1.0, 1., 0.5], "preempted")] {
+            let temp = Temp::new();
+            let path = temp.0.join("nav.json");
+            {
+                let mut j =
+                    Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+                j.state.pending = Some(Attempt {
+                    request: ActionRequest {
+                        action_id: "cancelled".into(),
+                        action: Action::StartMove {
+                            target: Position {
+                                x: 1.5,
+                                y: 1.,
+                                z: 0.5,
+                            },
+                            jump: false,
+                            max_ticks: 60,
+                        },
+                    },
+                    origin: [0.5, 1., 0.5],
+                    scene: "scene".into(),
+                    target: [1.5, 1., 0.5],
+                    outcome: None,
+                    source_node: None,
+                    arrival_verification: None,
+                });
+                j.save().unwrap();
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    observation(fresh_pose),
+                    200,
+                )
+                .await;
+                respond(&listener,"GET /v1/bots/fixture/actions/cancelled ",serde_json::json!({"action_id":"cancelled","outcome":"cancelled","adapter_version":"fixture","evidence":{"input_released":true},"error":null}),200).await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    observation(fresh_pose),
+                    200,
+                )
+                .await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let report = navigate(&c, goal(), &path, Options::default())
+                .await
+                .unwrap();
+            assert_eq!(report.status, expected);
+            assert_eq!(report.position, fresh_pose);
+            assert_eq!(report.actions, 1);
+            assert!(report.pending_action.is_none());
+            server.await.unwrap();
+            let j = Journal::open(&path, goal(), "instance", "actor", [5.5, 1., 0.5]).unwrap();
+            assert_eq!(j.state.history[0].outcome, Some(Outcome::Cancelled));
             assert!(
-                tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                    .await
-                    .is_err()
+                j.state.blocked.is_empty(),
+                "Cancellation must not retire a feasible route"
             );
-        });
-        let report = navigate(&c, goal(), &path, Options::default())
-            .await
-            .unwrap();
-        assert_eq!(report.status, "reached");
-        assert_eq!(report.actions, 1);
-        assert!(report.pending_action.is_none());
-        server.await.unwrap();
-        let j = Journal::open(&path, goal(), "instance", "actor", [5.5, 1., 0.5]).unwrap();
-        assert_eq!(j.state.history[0].outcome, Some(Outcome::Cancelled));
+        }
     }
     #[test]
     fn block_reach_uses_caller_parameters_and_nearest_face() {
