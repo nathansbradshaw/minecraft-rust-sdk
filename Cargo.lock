@@ -687,6 +687,7 @@ dependencies = [
 name = "minecraft-sdk-brain"
 version = "0.1.0-alpha.6"
 dependencies = [
+ "axum",
  "libc",
  "minecraft-sdk",
  "reqwest",
