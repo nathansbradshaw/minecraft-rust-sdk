@@ -155,6 +155,14 @@ fn proof(
             if after.player["using_item"] != false { return None; }
             if let Some(event)=new_event(action,before,after) { return Some(event.clone()); }
             if main_hand_changed(action,before,after) {return None;}
+            // Death drops inventory before respawn replaces the native player
+            // object. Same-life stack loss alone cannot establish item use.
+            // A genuine attributed Finish above remains historical evidence;
+            // it does not establish survival or nutrition recovery.
+            if !before.player["health"].as_f64().zip(after.player["health"].as_f64())
+                .is_some_and(|(b,a)|b.is_finite()&&b>0.&&a.is_finite()&&a>0.) {
+                return None;
+            }
             let b=held_stack(before,hand)?;let a=held_stack(after,hand)?;
             let decreased=b["count"].as_u64()?.checked_sub(a["count"].as_u64()?).is_some_and(|n|n>0);
             if b["count"].as_u64()? > 0 && (b["item"]!=a["item"] || decreased) {
@@ -607,6 +615,57 @@ mod tests {
         );
     }
     #[test]
+    fn same_life_death_inventory_loss_is_not_unattributed_item_use() {
+        let before = observation();
+        let mut after = before.clone();
+        after.world["sample_clock"]["nanos"] = json!("2");
+        after.player["inventory"][0] = json!({"slot":0,"item":"minecraft:air","count":0});
+        let action = Action::StartUseItem {
+            hand: Hand::Main,
+            max_ticks: 40,
+        };
+        assert!(proof(&action, &before, &after, None).is_some());
+        for health in [
+            json!(0.),
+            json!(-1.),
+            Value::Null,
+            json!(f64::NAN),
+            json!(f64::INFINITY),
+        ] {
+            let mut dead = after.clone();
+            dead.player["health"] = health.clone();
+            assert!(
+                proof(&action, &before, &dead, None).is_none(),
+                "accepted after health {health}"
+            );
+            let mut invalid_before = before.clone();
+            invalid_before.player["health"] = health.clone();
+            assert!(
+                proof(&action, &invalid_before, &after, None).is_none(),
+                "accepted before health {health}"
+            );
+        }
+        after.player.as_object_mut().unwrap().remove("health");
+        assert!(proof(&action, &before, &after, None).is_none());
+        let mut missing_before = before.clone();
+        missing_before
+            .player
+            .as_object_mut()
+            .unwrap()
+            .remove("health");
+        after.player["health"] = json!(20.);
+        assert!(proof(&action, &missing_before, &after, None).is_none());
+        // Native completion establishes the historical effect even if the
+        // next observation also records a subsequent death. It cannot count
+        // as staying alive or recovering hunger.
+        after.player["health"] = json!(0.);
+        after.player["native_action_effects"]["events"] = json!([{"sequence":2,"actor_uuid":"own","dimension":"minecraft:overworld","kind":"item_use_finished","item":"minecraft:apple","hand":"MAIN_HAND"}]);
+        assert_eq!(
+            proof(&action, &before, &after, None).unwrap()["kind"],
+            "item_use_finished"
+        );
+    }
+    #[test]
     fn selecting_another_slot_is_not_item_use_but_attributed_completion_still_counts() {
         let before = observation();
         let mut after = before.clone();
@@ -797,6 +856,28 @@ mod tests {
                 .connection()
                 .shutdown(std::net::Shutdown::Both);
         }
+    }
+    #[test]
+    fn death_drops_before_respawn_fail_the_pending_food_use() {
+        let lab = Lab::new();
+        let (job, worker, _) = lab.start(
+            Action::StartUseItem {
+                hand: Hand::Main,
+                max_ticks: 40,
+            },
+            40,
+        );
+        {
+            let mut after = lab.observed.lock().unwrap();
+            after.player["health"] = json!(0.);
+            after.player["inventory"][0] = json!({"slot":0,"item":"minecraft:air","count":0});
+        }
+        worker.join().unwrap();
+        let receipt = job.status("interaction-one").unwrap();
+        assert_eq!(receipt.outcome, Outcome::Failed);
+        assert_eq!(receipt.evidence["reason"], "character_died");
+        assert_eq!(receipt.evidence["native_effect_verified"], false);
+        assert_eq!(receipt.evidence["after"]["player"]["life_id"], "life-1");
     }
     #[test]
     fn a_delayed_menu_effect_stays_running_then_preserves_the_terminal_receipt_until_inspected() {
