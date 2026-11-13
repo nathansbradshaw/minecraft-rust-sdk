@@ -1,5 +1,166 @@
 use super::*;
 
+#[tokio::test]
+async fn recovered_breathing_releases_owned_input_once_and_yields_after_native_release() {
+    // Transport/lifecycle fixture, not evidence of real swimming. Keep the
+    // native control running after breath recovery, then acknowledge release.
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", http.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let shared = Arc::new(Shared {
+        mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
+        feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
+        emergency: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        latest: Mutex::new(None),
+        reason: Mutex::new(String::new()),
+        failed: tokio::sync::Notify::new(),
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let cancellations = Arc::new(AtomicU64::new(0));
+    let yielded = Arc::new(AtomicBool::new(false));
+    let held_until_release = Arc::new(AtomicBool::new(false));
+    let (server_shared, server_stop, server_cancel, server_yield, server_held) = (
+        shared.clone(),
+        stop.clone(),
+        cancellations.clone(),
+        yielded.clone(),
+        held_until_release.clone(),
+    );
+    let upstream = tokio::spawn(async move {
+        let mut blocks = Vec::new();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                for y in 0..=5 {
+                    blocks.push(json!({"position":[x,y,z],"block":if y==0{"minecraft:stone"}else if y<=2{"minecraft:water"}else{"minecraft:air"},
+                "collision":if y==0{json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+                }
+            }
+        }
+        let mut control = json!({});
+        let mut tick = 0;
+        let mut release_polls = 0;
+        loop {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let first = header.lines().next().unwrap();
+            let size = header
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(size < 8192);
+            let mut bytes = vec![0; size];
+            socket.read_exact(&mut bytes).await.unwrap();
+            let response = if first.starts_with("GET /v1/bots/own/observations ") {
+                tick += 5;
+                let recovering = control["action_id"].is_string();
+                if server_cancel.load(Ordering::Acquire) > 0 {
+                    release_polls += 1;
+                    if release_polls == 1 {
+                        server_held.store(server_shared.urgent(), Ordering::Release);
+                    } else {
+                        control["outcome"] = json!("cancelled");
+                        control["input_released"] = json!(true);
+                    }
+                    if release_polls > 2 && !server_shared.urgent() {
+                        server_yield.store(true, Ordering::Release);
+                        server_stop.store(true, Ordering::Release);
+                    }
+                    // A short observation budget distinguishes immediate
+                    // confirmed-release handoff from the old3second hold.
+                    if release_polls >= 8 {
+                        server_stop.store(true, Ordering::Release);
+                    }
+                }
+                json!({"revision":tick.to_string(),"player":{"uuid":"own","entity_id":1,
+                    "dimension":"minecraft:overworld","position":[0.5,if recovering{1.5}else{1.},0.5],
+                    "health":20.,"food":20,"sprinting":true,"on_ground":false,"in_water":true,
+                    "eyes_in_water":!recovering,"air":if recovering{300}else{200},"max_air":300,"control":control},
+                    "world":{"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,"entities":[]},"menu":{}})
+            } else if first.starts_with("GET /v1/bots/own/actions/pending ") {
+                json!([])
+            } else {
+                assert!(first.starts_with("POST /v1/bots/own/actions "), "{first}");
+                let request: ActionRequest = serde_json::from_slice(&bytes).unwrap();
+                match request.action {
+                    Action::StartMove { target, .. } => {
+                        assert!(
+                            control["action_id"].is_null(),
+                            "only one breathing intention"
+                        );
+                        control = json!({"action_id":request.action_id,"outcome":"running",
+                            "target":[target.x,target.y,target.z],"progress":{"elapsed_ms":100}});
+                    }
+                    Action::CancelControl { action_id } => {
+                        assert_eq!(
+                            control["action_id"], action_id,
+                            "only the owned input may be cancelled"
+                        );
+                        server_cancel.fetch_add(1, Ordering::AcqRel);
+                        control["cancel_requested"] = json!(true);
+                    }
+                    other => panic!("Unexpected control {other:?}"),
+                }
+                json!({"action_id":request.action_id,"outcome":"running","adapter_version":"fixture","evidence":{},"error":null})
+            };
+            let body = response.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller(
+            client,
+            Config {
+                enabled: true,
+                period_ms: 50,
+                decision_samples: 0,
+                experimental_ranged_boundary_turns: false,
+            },
+            shared,
+            stop,
+            &j,
+            3.5,
+            false,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    upstream.abort();
+    assert_eq!(cancellations.load(Ordering::Acquire), 1);
+    assert!(held_until_release.load(Ordering::Acquire));
+    assert!(
+        yielded.load(Ordering::Acquire),
+        "yield only after fresh native release, without3second relatch"
+    );
+}
+
 #[test]
 fn unproved_boundary_turns_require_explicit_deployment_opt_in() {
     assert!(!Config::default().experimental_ranged_boundary_turns);
