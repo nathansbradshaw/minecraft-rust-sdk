@@ -493,6 +493,37 @@ fn may_resume_after_danger(
         && (safe_for > Duration::from_secs(3)
             || (owned_water_control && geometry::breathing_recovered(observed) && released))
 }
+/// Invalidate an old escape that now approaches a visually observed fuse.
+/// A priming sound may have happened before this character could hear it.
+/// This only requests release; it neither invents hidden threats nor proves
+/// that a replacement route can outrun the blast.
+fn toward_visible_blast(observed: &Observation) -> bool {
+    let Some(start) = geometry::point(&observed.player["position"]) else {
+        return false;
+    };
+    let Some(target) = geometry::point(&observed.player["control"]["target"]) else {
+        return false;
+    };
+    observed.world["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entity| entity["visible"] == true)
+        .any(|entity| {
+            let Some((origin, radius)) =
+                geometry::point(&entity["position"]).zip(geometry::primed_blast(entity))
+            else {
+                return false;
+            };
+            let distance_squared = |point: [f64; 3]| {
+                (0..3)
+                    .map(|axis| (point[axis] - origin[axis]).powi(2))
+                    .sum::<f64>()
+            };
+            let end_distance = distance_squared(target);
+            end_distance <= radius * radius && end_distance < distance_squared(start)
+        })
+}
 async fn controller(
     client: Arc<Client>,
     cfg: Config,
@@ -824,11 +855,13 @@ async fn controller(
                         < (0..3).map(|i| (p[i] - origin[i]).powi(2)).sum::<f64>()
                 })
             });
+            let toward_visible_blast = toward_visible_blast(&observed);
             if active["outcome"] == "running"
                 && (active["action_id"].as_str() != Some(&owned_control)
                     || new_projectile
                     || toward_threat
                     || toward_heard_blast
+                    || toward_visible_blast
                     || (water_emergency && !owned_water_control)
                     || stuck)
             {
@@ -852,7 +885,7 @@ async fn controller(
                     .await?;
                     j.event(
                         "body_preempted_program",
-                        json!({"action_id":id,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"new_projectile":new_projectile,"incoming_projectile_ids":incoming_projectiles,"previous_dodge_projectile_ids":owned_projectiles,"toward_threat":toward_threat,"toward_heard_blast":toward_heard_blast,"stuck":stuck}),
+                        json!({"action_id":id,"reaction_ms":observed_at.elapsed().as_millis(),"cycle_ms":started.elapsed().as_millis(),"new_projectile":new_projectile,"incoming_projectile_ids":incoming_projectiles,"previous_dodge_projectile_ids":owned_projectiles,"toward_threat":toward_threat,"toward_heard_blast":toward_heard_blast,"toward_visible_blast":toward_visible_blast,"stuck":stuck}),
                     )?;
                 }
             } else {
