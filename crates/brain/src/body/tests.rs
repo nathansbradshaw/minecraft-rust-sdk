@@ -1,6 +1,253 @@
 use super::*;
 
 #[test]
+fn visible_blast_invalidates_only_approaching_exposed_targets_without_audio() {
+    let mut observation = Observation {
+        revision: "new-visible-fuse".into(),
+        player: json!({"position":[0.,1.,0.],"control":{"target":[3.,1.,0.]}}),
+        world: json!({"entities":[{"visible":true,"position":[8.,1.,0.],
+            "creeper":{"ignited":true,"powered":true}}]}),
+        menu: Value::Null,
+    };
+    assert!(toward_visible_blast(&observation));
+    assert!(hearing::blasts(&observation).is_empty());
+    for target in [[-3., 1., 0.], [0., 1., 3.], [0., 1., 0.]] {
+        observation.player["control"]["target"] = json!(target);
+        assert!(
+            !toward_visible_blast(&observation),
+            "outward/tangent/idle {target:?}"
+        );
+    }
+    observation.player["control"]["target"] = json!([3., 1., 0.]);
+    for (field, value) in [
+        ("visible", json!(false)),
+        ("position", Value::Null),
+        ("creeper", json!({"powered":true})),
+        ("creeper", json!({"powered":true,"swell_direction":-1})),
+    ] {
+        let mut hidden_or_calm = observation.clone();
+        hidden_or_calm.world["entities"][0][field] = value;
+        assert!(!toward_visible_blast(&hidden_or_calm), "{field}");
+    }
+    observation.world["entities"][0]["creeper"] = json!({"powered":false,"swell_direction":1});
+    assert!(
+        toward_visible_blast(&observation),
+        "normal fuse uses its six-block radius"
+    );
+    observation.world["entities"][0]["position"] = json!([10., 1., 0.]);
+    assert!(
+        !toward_visible_blast(&observation),
+        "approaching outside blast clearance is not exposed yet"
+    );
+    observation.player["control"]["target"] = Value::Null;
+    assert!(!toward_visible_blast(&observation));
+}
+
+#[tokio::test]
+async fn newly_visible_blast_cancels_owned_approach_once_before_a_fresh_escape() {
+    controller_visible_blast_scenario(true).await;
+}
+
+#[tokio::test]
+async fn newly_visible_blast_preserves_owned_outward_escape() {
+    controller_visible_blast_scenario(false).await;
+}
+
+async fn controller_visible_blast_scenario(approaching: bool) {
+    // Typed HTTP/controller fixture only, not a game or a survival claim.
+    // First establish genuine controller ownership, then show a fuse without
+    // delivering a sound. Keep the old native input held until release is read.
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", http.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let shared = Arc::new(Shared {
+        mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
+        feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
+        program_pending: Mutex::new(Default::default()),
+        scheduling_revision: AtomicU64::new(0),
+        emergency: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        latest: Mutex::new(None),
+        reason: Mutex::new(String::new()),
+        failed: tokio::sync::Notify::new(),
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let upstream = tokio::spawn(async move {
+        let mut blocks = Vec::new();
+        for x in -5..=5 {
+            for z in -5..=5 {
+                for y in 0..=4 {
+                    blocks.push(json!({"position":[x,y,z],"block":if y==0{"minecraft:stone"}else{"minecraft:air"},
+                "collision":if y==0{json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+                }
+            }
+        }
+        let start = [0.5, 1., 0.5];
+        let mut control = json!({});
+        let mut tick = 100;
+        let mut moves = Vec::new();
+        let mut cancels = Vec::new();
+        let mut terminal_release_seen = false;
+        let mut held_samples = 0;
+        let mut after_start_samples = 0;
+        loop {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(socket.read_u8().await.unwrap());
+                assert!(headers.len() < 8192);
+            }
+            let headers = std::str::from_utf8(&headers).unwrap();
+            let first = headers.lines().next().unwrap();
+            let size = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(size < 8192);
+            let mut body = vec![0; size];
+            socket.read_exact(&mut body).await.unwrap();
+            let mut finished = false;
+            let response = if first.starts_with("GET /v1/bots/own/observations ") {
+                tick += 1;
+                let entities = if moves.is_empty() {
+                    json!([{"entity_id":9,"visible":true,"hostile":true,"ranged_attack":true,"position":[10.5,1.,0.5]}])
+                } else {
+                    after_start_samples += 1;
+                    let target = geometry::point(&control["target"]).unwrap();
+                    let length = (0..3)
+                        .map(|i| (target[i] - start[i]).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    assert!(length > 0.2);
+                    let sign = if approaching { 1. } else { -1. };
+                    let origin = std::array::from_fn::<_, 3, _>(|i| {
+                        start[i] + sign * 8. * (target[i] - start[i]) / length
+                    });
+                    if !cancels.is_empty() {
+                        held_samples += 1;
+                        if held_samples >= 3 {
+                            control["outcome"] = json!("cancelled");
+                            control["input_released"] = json!(true);
+                            terminal_release_seen = true;
+                        }
+                    }
+                    if !approaching && after_start_samples >= 5 {
+                        finished = true;
+                    }
+                    json!([{"entity_id":10,"visible":true,"hostile":true,"position":origin,
+                        "creeper":{"ignited":true,"powered":true}}])
+                };
+                serde_json::to_value(Observation {
+                    revision:tick.to_string(), menu:Value::Null,
+                    player:json!({"uuid":"own","entity_id":1,"dimension":"minecraft:overworld","health":20.,
+                        "position":start,"food":20,"sprinting":true,"control":control}),
+                    world:json!({"game_time":tick,"sample_clock":{"epoch":"same-life"},"entities":entities,"blocks":blocks}),
+                }).unwrap()
+            } else {
+                assert!(first.starts_with("POST /v1/bots/own/actions "), "{first}");
+                let request: ActionRequest = serde_json::from_slice(&body).unwrap();
+                let outcome = match request.action {
+                    Action::StartMove {
+                        target, max_ticks, ..
+                    } => {
+                        assert!(max_ticks <= 60);
+                        if !moves.is_empty() {
+                            assert!(
+                                approaching && terminal_release_seen,
+                                "no replacement before observing terminal release"
+                            );
+                            assert_ne!(
+                                moves[0], request.action_id,
+                                "never replay the old intention"
+                            );
+                            finished = true;
+                        }
+                        moves.push(request.action_id.clone());
+                        control = json!({"action_id":request.action_id,"outcome":"running","input_released":false,
+                            "cancel_requested":false,"target":[target.x,target.y,target.z]});
+                        "running"
+                    }
+                    Action::CancelControl { action_id } => {
+                        assert!(approaching);
+                        assert_eq!(action_id, moves[0]);
+                        assert!(
+                            cancels.is_empty(),
+                            "only one cancellation while native release is pending"
+                        );
+                        assert!(tick < 114, "new fuse preempts before the old stuck timer");
+                        cancels.push(request.action_id.clone());
+                        control["cancel_requested"] = json!(true);
+                        "running"
+                    }
+                    other => panic!("unexpected action {other:?}"),
+                };
+                json!({"action_id":request.action_id,"outcome":outcome,"adapter_version":"fixture","evidence":{},"error":null})
+            };
+            let body = response.to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            if finished {
+                stopped.store(true, Ordering::Release);
+                break;
+            }
+        }
+        assert_eq!(cancels.len(), usize::from(approaching));
+        assert_eq!(moves.len(), if approaching { 2 } else { 1 });
+        assert!(!approaching || held_samples >= 3);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller(
+            client,
+            Config {
+                enabled: true,
+                period_ms: 50,
+                decision_samples: 0,
+                experimental_ranged_boundary_turns: false,
+            },
+            shared,
+            stop,
+            &journal,
+            3.5,
+            false,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    upstream.await.unwrap();
+}
+
+#[test]
 fn reconciled_owned_shore_hands_off_without_certifying_its_historical_effect() {
     let observation = Observation {
         revision: "settled-after-interruption".into(),
