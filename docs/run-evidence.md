@@ -91,3 +91,49 @@ operator-attested through source/build/trace binding. This is not a cryptographi
 attestation of observation delivery or a competence benchmark. Declare the
 measurement method before a trial, preserve earlier acknowledgement failures,
 and report both metrics alongside deaths, outcomes and interventions.
+
+## Observe an allocated compiler process tree
+
+`mc-sdk-workload-observer` is a Linux operator binary in the evidence crate.
+It reads only an allocated root process and its current descendants, without
+starting, signalling or keeping workloads alive. All options are required:
+
+```text
+mc-sdk-workload-observer --root-pid PID --root-start-jiffies START_JIFFIES \
+  --seconds SECONDS --interval-ms INTERVAL_MS --expected-rustc ABSOLUTE_EXECUTABLE \
+  --source-sha256 CALLER_DECLARED_SHA256
+```
+
+Bind the root to field 22 of its `/proc/PID/stat` in the same PID namespace;
+never select a shared container root containing unrelated work. The total budget
+is 1–600 seconds including preflight/output, with the final 100 ms reserved for
+completion records; sampling cadence is 25–50 ms. The expected executable must be an
+independently reviewed regular executable on a read-only filesystem mount.
+Canonical path and device/inode/metadata establish the internal comparison;
+file permissions alone do not satisfy the mount check. Records contain only
+`exe_matches_expected`, process identities, CPU ticks and UTC sample brackets,
+without executable paths, command names, arguments or environment. Redirect stdout
+to one private pipe/file ledger; terminals are refused. No per-process files or
+endpoints are created.
+
+Exit, root PID reuse and inaccessible root state stop sampling. Traversal and
+historical identities are bounded; inaccessible/absent observations, races,
+limits, partial trees, clock regressions and actual sample gaps remain explicit.
+Missed periods are skipped. Nonblocking writes/poll use the remaining monotonic
+budget and terminal cycle/gap measurements include output time. An **external
+hard timeout targeting only the observer PID is required**, because regular-file
+or kernel I/O can still block. For GNU `timeout`, use `--foreground --signal=KILL`
+with the same seconds budget; never signal the workload or its process group.
+Require exit 0, complete `observer_finished` and `observer_output_complete`
+records, and external wall time within budget. Missing/truncated completion,
+timeout or output failure means incomplete evidence. The trailing record measures
+post-summary elapsed time, final sample gap and overshoot; it is not a substitute
+for the external deadline. Apply declared sampling-gap limits separately.
+
+Matching samples establish executable presence at sampled instants; CPU deltas
+support activity. Short processes may be missed. Independently retain observer
+source/build identity and hash the actual program before and after: the supplied
+SHA is caller declared and does not certify compiler inputs. Join native effects
+and accepted model-request evidence using conservative timestamp bounds. Cargo
+success, global model-busy counts and blocked callers alone do not prove actual
+rustc work, an allocated model request, or precise GPU inference overlap.
