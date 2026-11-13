@@ -581,6 +581,7 @@ async fn controller(
     let mut last_motion_assessment = (Vec::new(), Vec::new());
     let mut retreat_progress = recovery::Progress::default();
     let mut native_escape = recovery::Discovery::default();
+    let mut native_required = recovery::Required::default();
     let mut last_meal = None;
     let mut owned_meal: Option<(String, tactics::Meal)> = None;
     loop {
@@ -735,18 +736,28 @@ async fn controller(
                 .into_iter()
                 .flatten()
                 .any(|e| e["visible"] == true && geometry::primed_blast(e).is_some());
-        let discover = stalled
-            && !urgent
+        let require_native = native_required.active(&observed)
+            && !water_emergency
+            && observed.player["on_ground"] == true;
+        let discover = (require_native || (stalled && !urgent))
             && threatened
             && observed.player["on_ground"] == true
             && active["outcome"] != "running";
         let admitted = native_escape
-            .tick(client.clone(), &observed, discover, finite_waypoint_axis, j)
+            .tick(
+                client.clone(),
+                &observed,
+                discover,
+                require_native,
+                finite_waypoint_axis,
+                j,
+            )
             .await?;
         // Finish the old finite input before discovery. During the short
         // read-only query keep observing and defending; any new urgent danger
         // immediately restores the fast route without waiting for the query.
-        let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
+        let awaiting_native =
+            (require_native || (discover && native_escape.waiting())) && admitted.is_empty();
         let escape = if active["outcome"] != "running" && !awaiting_native {
             let defensive = geometry::evade_policy(
                 &policy_observed,
@@ -988,6 +999,7 @@ async fn controller(
                                 || (observed.player["in_water"] == true && owned_water_shore);
                             owned_projectiles = incoming_projectiles.clone();
                         } else {
+                            native_required.movement_rejected(&observed, &r);
                             rejected_routes.push(key);
                             j.event("body_route_failure",json!({"target":key,"outcome":r.outcome,"error":r.error,"next_action":"try a different observed route; investigate if none works"}))?;
                         }

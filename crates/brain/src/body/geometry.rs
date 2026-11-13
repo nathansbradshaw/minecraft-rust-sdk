@@ -741,6 +741,7 @@ pub(super) fn evade_policy(
     if !burning
         && !projectile_danger
         && !blast_escape
+        && admitted.is_empty()
         && let Some(plan) = cover::plan(o, blocked, waypoint_axis)
     {
         return match plan {
@@ -950,6 +951,12 @@ pub(super) fn evade_policy(
             }
         }
     }
+    // Native recovery options describe paths actually predicted for this
+    // current pose/physics. Do not outrank them with the geometric guesses
+    // whose held-input feasibility already failed in this recovery scene.
+    if !admitted.is_empty() {
+        candidates.clear();
+    }
     for (p, native_jump) in candidates
         .into_iter()
         .map(|p| (p, None))
@@ -1099,6 +1106,37 @@ mod tests {
             }
         }
         (o, vec![[0.3524, 1., -0.6502]])
+    }
+    #[test]
+    fn smoke02_191_derived_recovery_uses_a_native_option_instead_of_an_unproven_guess() {
+        // Translated player/threat/options from native F smoke02 decision191.
+        // Floor is synthesized; foliage and version physics are omitted. This
+        // checks candidate authority, not an exact world replay or survival.
+        let mut o = world();
+        o.player = json!({"position":[0.5,1.,0.5],"on_ground":true});
+        o.world["entities"] = json!([{"visible":false,"hostile":true,"ranged_attack":true,
+            "position":[-1.435897210272,1.4,1.17490669445],
+            "client_memory":{"kind":"last_visible_ranged_threat"}}]);
+        let admitted: Vec<_> = [
+            [0.5, 1., 1.5],
+            [-0.5, 1., 0.5],
+            [0.5, 1., -0.5],
+            [-0.5, 1., -0.5],
+        ]
+        .into_iter()
+        .map(|target| Admitted {
+            target,
+            jump: false,
+        })
+        .collect();
+        let route = evade_with_native(&o, &[], &[], &[], 3.5, &admitted)
+            .expect("an admitted outward route");
+        assert!(
+            admitted
+                .iter()
+                .any(|r| r.target == [route.target.x, route.target.y, route.target.z])
+        );
+        assert!(route.reason.contains("native-predicted"));
     }
     #[test]
     fn a_known_corner_turn_preserves_circulation_in_rotated_worlds() {

@@ -798,10 +798,14 @@ async fn planning_refresh_waits_for_a_fresh_retry_without_admitting_stale_state(
 }
 #[tokio::test]
 async fn controller_defends_without_ending_escape_then_cancels_a_stuck_route() {
-    controller_projectile_scenario(false).await;
-    controller_projectile_scenario(true).await;
+    controller_projectile_scenario(false, false).await;
+    controller_projectile_scenario(true, false).await;
 }
-async fn controller_projectile_scenario(replace_projectile: bool) {
+#[tokio::test]
+async fn native_rejection_under_urgent_fire_uses_one_prefix_without_repeating_geometric_dispatch() {
+    controller_projectile_scenario(false, true).await;
+}
+async fn controller_projectile_scenario(replace_projectile: bool, require_native: bool) {
     // Transport fixture only: the game is deliberately held at one position
     // while its tick counter advances. This is not native gameplay evidence.
     let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -834,6 +838,8 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
         let mut control = json!({});
         let mut actions = Vec::new();
         let mut defended_while_moving = false;
+        let mut native_queried = false;
+        let mut move_attempts = 0;
         loop {
             let (mut socket, _) = http.accept().await.unwrap();
             let mut header = Vec::new();
@@ -859,18 +865,42 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
                 tick += 4;
                 serde_json::to_value(Observation {
                     revision:tick.to_string(),
-                    player:json!({"uuid":"own","entity_id":1,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"attack_strength":1.,"control":control}),
+                    player:json!({"uuid":"own","entity_id":1,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"on_ground":true,"attack_strength":1.,"control":control}),
                     world:json!({"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,"entities":[{"entity_id":9,"visible":true,"hostile":true,"position":[2.5,1.,0.5]},{"entity_id":if replace_projectile && tick>=116{11}else{10},"uuid":if replace_projectile && tick>=116{"new-projectile-fixture"}else{"projectile-fixture"},"visible":true,"projectile":true,"position":[2.5,1.9,0.5],"velocity":[-0.25,0.,0.]}]}),
                     menu:json!({}),
                 }).unwrap()
+            } else if first.starts_with("POST /v1/bots/own/observations/query ") {
+                assert!(require_native && !native_queried);
+                let query: ObservationQuery = serde_json::from_slice(&body).unwrap();
+                assert_eq!(query.capability, "minecraft:movement_options");
+                assert_eq!(query.input, json!({"offset":0,"limit":8}));
+                native_queried = true;
+                json!({"format":"minecraft-movement-options-v1","scene":"urgent-native-prefix",
+                    "origin":{"position":[0.5,1.,0.5],"dimension":"minecraft:overworld"},
+                    "options":[{"target":[0.5,1.,2.5],"jump":false,"duration_ticks":8,
+                        "max_ticks":60,"touched_blocks":["minecraft:stone","minecraft:air"]}],
+                    "complete":false,"next_offset":8})
             } else {
                 assert!(first.starts_with("POST /v1/bots/own/actions "), "{first}");
                 let request: ActionRequest = serde_json::from_slice(&body).unwrap();
                 let mut outcome = "observed";
                 match &request.action {
                     Action::StartMove { target, .. } => {
-                        control = json!({"action_id":request.action_id,"outcome":"running","target":[target.x,target.y,target.z]});
-                        outcome = "running";
+                        move_attempts += 1;
+                        if require_native && move_attempts == 1 {
+                            outcome = "rejected";
+                        } else {
+                            if require_native {
+                                assert!(
+                                    native_queried,
+                                    "do not dispatch another guess after native refusal"
+                                );
+                                assert_eq!([target.x, target.y, target.z], [0.5, 1., 2.5]);
+                                finished = true;
+                            }
+                            control = json!({"action_id":request.action_id,"outcome":"running","target":[target.x,target.y,target.z]});
+                            outcome = "running";
+                        }
                     }
                     Action::Attack { entity } => {
                         assert_eq!(*entity, 9);
@@ -895,7 +925,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
                     other => panic!("unexpected action {other:?}"),
                 }
                 actions.push(request.action);
-                json!({"action_id":request.action_id,"outcome":outcome,"adapter_version":"fixture","evidence":{"native_effect_verified":outcome=="observed"},"error":null})
+                json!({"action_id":request.action_id,"outcome":outcome,"adapter_version":"fixture","evidence":{"native_effect_verified":outcome=="observed"},"error":if outcome=="rejected"{json!({"code":"unsupported_capability","message":"No bounded held-input trajectory reaches waypoint"})}else{Value::Null}})
             };
             let body = response.to_string();
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
@@ -943,7 +973,17 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
     .unwrap();
     let actions = upstream.await.unwrap();
     assert!(matches!(actions.first(), Some(Action::StartMove { .. })));
-    assert!(matches!(actions.last(), Some(Action::CancelControl { .. })));
+    if require_native {
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::StartMove { .. }))
+                .count(),
+            2
+        );
+    } else {
+        assert!(matches!(actions.last(), Some(Action::CancelControl { .. })));
+    }
 }
 #[tokio::test]
 async fn delayed_interactions_return_final_feedback_without_leasing_the_survival_gate() {

@@ -10,6 +10,51 @@ use std::{
 };
 use tokio::task::JoinHandle;
 
+fn basis(o: &Observation) -> String {
+    crate::digest(
+        json!({"actor":o.player["uuid"],"life":o.player["life_id"],
+        "entity":o.player["entity_id"],"dimension":o.player["dimension"],
+        "clock":o.world["sample_clock"]["epoch"],
+        "position":geometry::point(&o.player["position"]).map(geometry::target_key),
+        "speed":o.player["movement_speed"],"physics":o.player["physics"],
+        "yaw":o.player["yaw"],"sprinting":o.player["sprinting"],
+        "on_ground":o.player["on_ground"],"velocity":o.player["velocity"],
+        "sneaking":o.player["sneaking"],"blocks":o.world["blocks"]})
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+/// A definite native refusal invalidates geometric guesses for this scene.
+/// Uncertainty never authorizes a retry or retires the original durable ID.
+#[derive(Default)]
+pub(super) struct Required {
+    rejected_basis: Option<String>,
+}
+impl Required {
+    pub fn active(&mut self, o: &Observation) -> bool {
+        if self
+            .rejected_basis
+            .as_ref()
+            .is_some_and(|old| old != &basis(o))
+        {
+            self.rejected_basis = None;
+        }
+        self.rejected_basis.is_some()
+    }
+    pub fn movement_rejected(&mut self, o: &Observation, receipt: &minecraft_sdk::Receipt) {
+        if receipt.outcome == minecraft_sdk::Outcome::Rejected
+            && minecraft_sdk::valid_id(&receipt.action_id)
+            && receipt
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == minecraft_sdk::ErrorCode::UnsupportedCapability)
+        {
+            self.rejected_basis = Some(basis(o));
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Progress {
     lane: Option<(String, String, String, i64)>,
@@ -131,6 +176,7 @@ impl Discovery {
         client: Arc<Client>,
         o: &Observation,
         enabled: bool,
+        first_prefix_only: bool,
         axis: f64,
         j: &Journal,
     ) -> Result<Vec<Admitted>> {
@@ -138,15 +184,7 @@ impl Discovery {
             self.reset(String::new());
             return Ok(Vec::new());
         }
-        let basis = crate::digest(
-            json!({"actor":o.player["uuid"],"entity":o.player["entity_id"],
-            "dimension":o.player["dimension"],"clock":o.world["sample_clock"]["epoch"],
-            "position":geometry::point(&o.player["position"]).map(geometry::target_key),
-            "speed":o.player["movement_speed"],"physics":o.player["physics"],
-            "sneaking":o.player["sneaking"],"blocks":o.world["blocks"]})
-            .to_string()
-            .as_bytes(),
-        );
+        let basis = basis(o);
         if basis != self.basis {
             self.reset(basis);
         }
@@ -168,6 +206,11 @@ impl Discovery {
                     "origin":o.player["position"],"revision":o.revision,
                     "scope":"Adapter predictions; native action admission and observed effect still required"}))?;
             }
+            if first_prefix_only {
+                // Rejection recovery consumes one bounded prefix, not a full
+                // route search or an unchanged-scene request loop.
+                self.done = true;
+            }
         }
         if self
             .received
@@ -180,7 +223,7 @@ impl Discovery {
             self.next_query = Instant::now() + Duration::from_millis(500);
             j.event("body_native_escape_query",json!({"offset":offset,"limit":8,
                 "revision":o.revision,"origin":o.player["position"],
-                "reason":"No two-block defensive displacement over80advancing native ticks",
+                "reason":if first_prefix_only{"Native held-input movement rejected; inspect one current prefix"}else{"No two-block defensive displacement over80advancing native ticks"},
                 "execution":"Read-only background query; body observations and urgent defense continue"}))?;
             self.task = Some(tokio::spawn(async move {
                 match tokio::time::timeout(
@@ -290,6 +333,62 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_definite_typed_rejection_requires_native_and_every_basis_change_retires_it() {
+        let o = observation();
+        let receipt = |outcome, code, id: &str| minecraft_sdk::Receipt {
+            action_id: id.into(),
+            outcome,
+            adapter_version: "fixture".into(),
+            evidence: Value::Null,
+            error: Some(minecraft_sdk::ApiError::new(code, "fixture")),
+        };
+        for (outcome, code, id) in [
+            (
+                minecraft_sdk::Outcome::Uncertain,
+                minecraft_sdk::ErrorCode::UnsupportedCapability,
+                "unknown",
+            ),
+            (
+                minecraft_sdk::Outcome::Rejected,
+                minecraft_sdk::ErrorCode::Conflict,
+                "conflict",
+            ),
+            (
+                minecraft_sdk::Outcome::Rejected,
+                minecraft_sdk::ErrorCode::UnsupportedCapability,
+                "invalid/id",
+            ),
+        ] {
+            let mut required = Required::default();
+            required.movement_rejected(&o, &receipt(outcome, code, id));
+            assert!(!required.active(&o));
+        }
+        let refusal = receipt(
+            minecraft_sdk::Outcome::Rejected,
+            minecraft_sdk::ErrorCode::UnsupportedCapability,
+            "rejected-move",
+        );
+        for (pointer, value) in [
+            ("/player/uuid", json!("other")),
+            ("/player/life_id", json!("new-life")),
+            ("/player/dimension", json!("minecraft:the_nether")),
+            ("/player/yaw", json!(90.)),
+            ("/player/physics", json!({"changed":true})),
+            ("/player/sprinting", json!(true)),
+            ("/player/position", json!([1.5, 1., 0.5])),
+            ("/world/blocks", json!([{"changed":true}])),
+        ] {
+            let mut required = Required::default();
+            required.movement_rejected(&o, &refusal);
+            assert!(required.active(&o));
+            let mut value_o = serde_json::to_value(&o).unwrap();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            value_o.pointer_mut(parent).unwrap()[key] = value;
+            let changed = serde_json::from_value(value_o).unwrap();
+            assert!(!required.active(&changed), "{pointer}");
+        }
+    }
     fn observation() -> Observation {
         serde_json::from_value(json!({"revision":"fixture","player":{
             "uuid":"own","entity_id":1,"dimension":"minecraft:overworld",
@@ -459,7 +558,9 @@ mod tests {
         let mut d = Discovery::default();
         let o = observation();
         let start = Instant::now();
-        d.tick(client.clone(), &o, true, 3.5, &j).await.unwrap();
+        d.tick(client.clone(), &o, true, false, 3.5, &j)
+            .await
+            .unwrap();
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(d.waiting());
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
@@ -473,7 +574,7 @@ mod tests {
             String::from_utf8_lossy(&request[..n])
                 .starts_with("POST /v1/bots/own/observations/query")
         );
-        d.tick(client, &o, false, 3.5, &j).await.unwrap();
+        d.tick(client, &o, false, false, 3.5, &j).await.unwrap();
         assert!(!d.waiting());
         assert!(d.routes.is_empty());
         assert_eq!(
