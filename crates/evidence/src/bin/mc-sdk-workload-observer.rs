@@ -633,7 +633,7 @@ mod linux {
             "max_sample_duration_ms":max_sample_ms,"max_sample_start_gap_ms":max_gap_ms,"utc_regressed":clock_regressed,
             "max_sample_cycle_including_output_ms":max_sample_cycle_ms,
             "expected_executable_identity_unchanged":expected.unchanged(),"processes":summaries,
-            "scope":"Only sampled identities and CPU counters; missed short processes and unobserved intervals remain possible; no processes signalled or spawned"}), deadline,
+            "scope":"Executable matches apply only at sampled instants. Aggregate first/last CPU counters cover the whole process identity, including nonmatching or inaccessible executable intervals; they are not rustc-only CPU. Short processes and unobserved exec changes may be missed; no processes signalled or spawned"}), deadline,
         )?;
         // This separate record measures the final summary write, including a
         // possible terminal stall that has no subsequent sample-start gap.

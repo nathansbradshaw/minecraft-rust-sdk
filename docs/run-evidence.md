@@ -130,8 +130,12 @@ timeout or output failure means incomplete evidence. The trailing record measure
 post-summary elapsed time, final sample gap and overshoot; it is not a substitute
 for the external deadline. Apply declared sampling-gap limits separately.
 
-Matching samples establish executable presence at sampled instants; CPU deltas
-support activity. Short processes may be missed. Independently retain observer
+Matching samples establish executable presence at sampled instants. Inspect CPU
+counters alongside each sample's executable match: aggregate first/last counters
+span the whole process identity, including nonmatching or inaccessible intervals,
+and cannot establish rustc-only CPU use. Executables may also change between
+samples; even matching endpoints do not certify exclusive execution in between.
+Short processes may be missed. Independently retain observer
 source/build identity and hash the actual program before and after: the supplied
 SHA is caller declared and does not certify compiler inputs. Join native effects
 and accepted model-request evidence using conservative timestamp bounds. Cargo
