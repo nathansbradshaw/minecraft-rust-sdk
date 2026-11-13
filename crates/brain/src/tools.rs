@@ -145,6 +145,9 @@ impl Drop for ProcessGroup {
     }
 }
 pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
+    terminal_with_view(brain, command, false).await
+}
+async fn terminal_with_view(brain: &mut Brain, command: &str, cargo_run: bool) -> Result<Value> {
     ensure(
         !command.is_empty() && command.len() <= 8192,
         "Bounded terminal command required",
@@ -275,9 +278,17 @@ pub async fn terminal(brain: &mut Brain, command: &str) -> Result<Value> {
             &row["container_inspection"],
         )?;
     }
-    Ok(
-        json!({"exit_code":status.code(),"success":status.success()&&!timed_out&&captured,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"inventory_delta":crate::feedback::inventory_delta(&initial_inventory,&brain.observed.player["inventory"]),"local_action_feedback":feedback,"compiler_diagnostics":crate::feedback::compiler_diagnostics(&stdout),"output_truncated":stdout.len()>2000||stderr.len()>2000,"output_files":output_files,"stdout":crate::output::preview(&stdout),"stderr":crate::output::preview(&stderr)}),
-    )
+    let (stdout_preview, cargo_view) = if cargo_run {
+        let (preview, metadata) = crate::output::cargo_run_preview(&stdout);
+        (preview, Some(metadata))
+    } else {
+        (crate::output::preview(&stdout), None)
+    };
+    let mut result = json!({"exit_code":status.code(),"success":status.success()&&!timed_out&&captured,"timed_out":timed_out,"elapsed_ms":started.elapsed().as_millis(),"inventory_changed":initial_inventory!=brain.observed.player["inventory"],"inventory_delta":crate::feedback::inventory_delta(&initial_inventory,&brain.observed.player["inventory"]),"local_action_feedback":feedback,"compiler_diagnostics":crate::feedback::compiler_diagnostics(&stdout),"output_truncated":stdout.len()>2000||stderr.len()>2000,"output_files":output_files,"stdout":stdout_preview,"stderr":crate::output::preview(&stderr)});
+    if let Some(view) = cargo_view {
+        result["cargo_output_view"] = view;
+    }
+    Ok(result)
 }
 pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
     match choice.tool.as_str() {
@@ -343,7 +354,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
         "terminal" => terminal(brain, &choice.input).await,
         "run" => {
             let command = run_command(&choice.input)?;
-            let mut result = terminal(brain, &command).await?;
+            let mut result = terminal_with_view(brain, &command, true).await?;
             result["command"] = json!(command);
             result["experiment"] = json!(true);
             Ok(result)

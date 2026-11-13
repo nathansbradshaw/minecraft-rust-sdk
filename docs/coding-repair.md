@@ -30,6 +30,13 @@ resolve within the bot workspace; source contents, file hash, workspace hash and
 goal revision are checked again before selecting the transition. Changed,
 partial, foreign or unavailable source leaves ordinary tools available.
 
+For the structured `run` tool, the stdout preview hides recognized Cargo prelude
+records and keeps output after `build-finished` before the ordinary bounded
+head/tail preview, with bounded warnings and preview truncation labelled
+in `cargo_output_view`. Compiler errors still come from the complete raw stream.
+The saved stdout/stderr bytes and hashes are unchanged, including the artifact
+records used for entry recovery. Generic `terminal` output is unchanged.
+
 The model receives the actual errors/outcomes and must author an exact source
 edit or report the specific missing fact/interface. Edits retain the normal
 compare-and-swap hash guard. Changing request IDs alone cannot fix invalid
