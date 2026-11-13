@@ -737,6 +737,7 @@ async fn controller(
                 .flatten()
                 .any(|e| e["visible"] == true && geometry::primed_blast(e).is_some());
         let require_native = native_required.active(&observed)
+            && threatened
             && !water_emergency
             && observed.player["on_ground"] == true;
         let discover = (require_native || (stalled && !urgent))
