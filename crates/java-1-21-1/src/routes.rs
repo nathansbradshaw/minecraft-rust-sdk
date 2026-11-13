@@ -243,7 +243,9 @@ fn page_with_pruning(
             let Ok(frames) = control::preview(before, *target, jump) else {
                 continue;
             };
-            if frames.len() + 4 > usize::from(max_ticks) {
+            // An already-satisfied endpoint is not an executable movement
+            // prediction. Publishing zero ticks invalidates the whole SDK page.
+            if frames.is_empty() || frames.len() + 4 > usize::from(max_ticks) {
                 continue;
             }
             let mut touched = BTreeSet::new();
@@ -303,6 +305,27 @@ mod tests {
             offset = result["next_offset"].as_u64().unwrap() as usize;
         }
         rows
+    }
+    #[test]
+    fn an_already_reached_target_does_not_publish_zero_tick_routes() {
+        let observation = room(false);
+        let target = position(&observation).unwrap();
+        assert!(
+            control::preview(&observation, target, false)
+                .unwrap()
+                .is_empty()
+        );
+        let result = page(&observation, &json!({"target":target,"limit":64}), 100).unwrap();
+        let options = result["options"].as_array().unwrap();
+        assert!(
+            !options.is_empty(),
+            "Other real movements must remain available"
+        );
+        assert!(options.iter().all(|route| {
+            route["duration_ticks"]
+                .as_u64()
+                .is_some_and(|ticks| ticks > 0 && ticks <= 100)
+        }));
     }
     #[test]
     fn endpoint_pruning_keeps_tolerated_contacts_and_removes_only_certain_overlap() {

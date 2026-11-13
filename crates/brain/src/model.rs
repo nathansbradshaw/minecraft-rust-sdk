@@ -176,6 +176,14 @@ fn session_schema(development: bool) -> Value {
     }
     schema
 }
+fn navigation_schema(context: &Value, schema: &mut Value) {
+    if context["navigation_resume"]["paused"] == true {
+        schema["properties"]["tool"]["enum"]
+            .as_array_mut()
+            .expect("fixed tool schema")
+            .retain(|tool| tool != "navigate");
+    }
+}
 pub struct Model {
     http: reqwest::Client,
     endpoint: String,
@@ -249,6 +257,9 @@ impl Model {
             repair.prepare(&mut context, &mut format);
             crate::fit_context(&mut context)?;
         }
+        // Suppress only the unavailable navigation command, not reasoning or
+        // code work. A body that remains urgent must not freeze the reasoner.
+        navigation_schema(&context, &mut format);
         let model = if use_sol { "gpt-6.1-sol" } else { "gpt-6-luna" };
         let (content, mut usage) = self
             .request(
@@ -410,6 +421,48 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn navigation_pause_excludes_only_navigation_from_the_reasoning_schema() {
+        let mut format = session_schema(false);
+        navigation_schema(&json!({"navigation_resume":{"paused":true}}), &mut format);
+        let tools = format["properties"]["tool"]["enum"].as_array().unwrap();
+        assert!(!tools.iter().any(|tool| tool == "navigate"));
+        for available in [
+            "write",
+            "edit",
+            "run",
+            "terminal",
+            "observe",
+            "query",
+            "sdk",
+            "status",
+            "reconcile",
+            "goal",
+            "report",
+        ] {
+            assert!(tools.iter().any(|tool| tool == available), "{available}");
+        }
+        let mut repaired = schema();
+        repaired["properties"]["tool"]["enum"] = json!(["edit", "report"]);
+        navigation_schema(&json!({"navigation_resume":{"paused":true}}), &mut repaired);
+        assert_eq!(
+            repaired["properties"]["tool"]["enum"],
+            json!(["edit", "report"]),
+            "do not widen repair constraints"
+        );
+        let mut ready = session_schema(false);
+        navigation_schema(
+            &json!({"navigation_resume":{"paused":false,"ready":true}}),
+            &mut ready,
+        );
+        assert!(
+            ready["properties"]["tool"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "navigate")
+        );
+    }
     #[tokio::test]
     async fn active_work_rejects_a_provider_returning_the_excluded_mode_command() {
         use tokio::io::AsyncWriteExt;

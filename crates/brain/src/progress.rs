@@ -107,6 +107,9 @@ fn fingerprint(root: &Path, state: Option<&Path>) -> Result<String> {
 }
 
 pub fn executed(tool: &str, result: &serde_json::Value, before: &str, after: &str) -> bool {
+    if tool == "navigate" && crate::navigation::scheduling_preempted(result) {
+        return false;
+    }
     let navigation_moved = tool == "navigate"
         && result["position_before"]
             .as_array()

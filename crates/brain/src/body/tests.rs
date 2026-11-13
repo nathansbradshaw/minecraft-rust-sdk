@@ -1,6 +1,337 @@
 use super::*;
 
 #[test]
+fn reconciled_owned_shore_hands_off_without_certifying_its_historical_effect() {
+    let observation = Observation {
+        revision: "settled-after-interruption".into(),
+        menu: Value::Null,
+        world: json!({"game_time":10}),
+        player: json!({"eyes_in_water":false,"air":300,"max_air":300,
+            "control":{"action_id":"owned-shore","outcome":"idle","input_released":true,
+                "historical_outcome":"uncertain","reconciliation":{"settled":true,
+                    "historical_effect_verified":false,"replayed":false}}}),
+    };
+    let before = observation.clone();
+    assert!(may_resume_after_danger(
+        &observation,
+        Duration::from_millis(50),
+        "owned-shore",
+        true,
+        true
+    ));
+    assert!(may_resume_after_danger(
+        &observation,
+        Duration::from_secs(30),
+        "owned-shore",
+        true,
+        true
+    ));
+    assert_eq!(
+        serde_json::to_value(&observation).unwrap(),
+        serde_json::to_value(before).unwrap(),
+        "readiness does not rewrite native observations or historical uncertainty"
+    );
+    assert!(
+        serde_json::from_value::<Outcome>(observation.player["control"]["outcome"].clone())
+            .is_err(),
+        "idle remains scheduling metadata, not a successful action outcome"
+    );
+    for (pointer, value) in [
+        ("/outcome", json!("uncertain")),
+        ("/input_released", json!(false)),
+        ("/input_released", Value::Null),
+        ("/historical_outcome", json!("observed")),
+        ("/historical_outcome", Value::Null),
+        ("/reconciliation", Value::Null),
+        ("/reconciliation/settled", json!(false)),
+        ("/reconciliation/settled", Value::Null),
+        ("/reconciliation/historical_effect_verified", json!(true)),
+        ("/reconciliation/historical_effect_verified", Value::Null),
+        ("/reconciliation/replayed", json!(true)),
+        ("/reconciliation/replayed", Value::Null),
+    ] {
+        let mut malformed = observation.clone();
+        *malformed.player["control"].pointer_mut(pointer).unwrap() = value;
+        assert!(
+            !may_resume_after_danger(
+                &malformed,
+                Duration::from_secs(30),
+                "owned-shore",
+                true,
+                true
+            ),
+            "unconfirmed idle field {pointer} must not release owned shore urgency"
+        );
+    }
+    let mut replacement = observation.clone();
+    replacement.player["control"]["action_id"] = json!("another-control");
+    assert!(
+        !may_resume_after_danger(
+            &replacement,
+            Duration::from_millis(50),
+            "owned-shore",
+            true,
+            true
+        ),
+        "another control's reconciliation cannot claim this immediate handoff"
+    );
+}
+
+#[test]
+fn shore_handoff_requires_terminal_native_release_despite_elapsed_wall_time() {
+    let mut observed = Observation {
+        revision: "same-native-sample".into(),
+        menu: Value::Null,
+        world: json!({"game_time":10}),
+        player: json!({"eyes_in_water":false,"air":300,"max_air":300,
+            "control":{"action_id":"owned-shore","outcome":"running","input_released":false}}),
+    };
+    for outcome in ["prepared", "dispatched", "running", "uncertain", "unknown"] {
+        for release in [Value::Null, json!(false), json!(true)] {
+            observed.player["control"]["outcome"] = json!(outcome);
+            observed.player["control"]["input_released"] = release;
+            assert!(
+                !may_resume_after_danger(
+                    &observed,
+                    Duration::from_secs(30),
+                    "owned-shore",
+                    true,
+                    true,
+                ),
+                "A wall timer or release flag alone cannot retire {outcome} native input"
+            );
+        }
+    }
+    for outcome in ["observed", "cancelled", "expired", "failed", "reconciled"] {
+        observed.player["control"]["outcome"] = json!(outcome);
+        for release in [Value::Null, json!(false)] {
+            observed.player["control"]["input_released"] = release;
+            assert!(!may_resume_after_danger(
+                &observed,
+                Duration::from_secs(30),
+                "owned-shore",
+                true,
+                true,
+            ));
+        }
+        observed.player["control"]["input_released"] = json!(true);
+        assert!(may_resume_after_danger(
+            &observed,
+            Duration::from_millis(50),
+            "owned-shore",
+            true,
+            true,
+        ));
+        assert!(
+            may_resume_after_danger(
+                &observed,
+                Duration::from_millis(50),
+                "owned-shore",
+                true,
+                false,
+            ),
+            "Proven breathing-only release still hands off immediately"
+        );
+    }
+    observed.player["control"] = json!({"action_id":"replacement","outcome":"running"});
+    assert!(
+        may_resume_after_danger(
+            &observed,
+            Duration::from_secs(30),
+            "owned-shore",
+            true,
+            true,
+        ),
+        "Replacement controls do not inherit old shore ownership"
+    );
+    assert!(
+        may_resume_after_danger(
+            &observed,
+            Duration::from_secs(30),
+            "replacement",
+            false,
+            false,
+        ),
+        "Ordinary non-water timer behavior is unchanged"
+    );
+    assert!(!may_resume_after_danger(
+        &observed,
+        Duration::from_secs(3),
+        "replacement",
+        false,
+        false,
+    ));
+}
+
+#[tokio::test]
+async fn recovered_breathing_releases_owned_input_once_and_yields_after_native_release() {
+    // Transport/lifecycle fixture, not evidence of real swimming. Keep the
+    // native control running after breath recovery, then acknowledge release.
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", http.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let shared = Arc::new(Shared {
+        mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
+        feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
+        emergency: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        latest: Mutex::new(None),
+        reason: Mutex::new(String::new()),
+        failed: tokio::sync::Notify::new(),
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let cancellations = Arc::new(AtomicU64::new(0));
+    let yielded = Arc::new(AtomicBool::new(false));
+    let held_until_release = Arc::new(AtomicBool::new(false));
+    let (server_shared, server_stop, server_cancel, server_yield, server_held) = (
+        shared.clone(),
+        stop.clone(),
+        cancellations.clone(),
+        yielded.clone(),
+        held_until_release.clone(),
+    );
+    let upstream = tokio::spawn(async move {
+        let mut blocks = Vec::new();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                for y in 0..=5 {
+                    blocks.push(json!({"position":[x,y,z],"block":if y==0{"minecraft:stone"}else if y<=2{"minecraft:water"}else{"minecraft:air"},
+                "collision":if y==0{json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+                }
+            }
+        }
+        let mut control = json!({});
+        let mut tick = 0;
+        let mut release_polls = 0;
+        loop {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let first = header.lines().next().unwrap();
+            let size = header
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(size < 8192);
+            let mut bytes = vec![0; size];
+            socket.read_exact(&mut bytes).await.unwrap();
+            let response = if first.starts_with("GET /v1/bots/own/observations ") {
+                tick += 5;
+                let recovering = control["action_id"].is_string();
+                if server_cancel.load(Ordering::Acquire) > 0 {
+                    release_polls += 1;
+                    if release_polls == 1 {
+                        server_held.store(server_shared.urgent(), Ordering::Release);
+                    } else {
+                        control["outcome"] = json!("cancelled");
+                        control["input_released"] = json!(true);
+                    }
+                    if release_polls > 2 && !server_shared.urgent() {
+                        server_yield.store(true, Ordering::Release);
+                        server_stop.store(true, Ordering::Release);
+                    }
+                    // A short observation budget distinguishes immediate
+                    // confirmed-release handoff from the old3second hold.
+                    if release_polls >= 8 {
+                        server_stop.store(true, Ordering::Release);
+                    }
+                }
+                json!({"revision":tick.to_string(),"player":{"uuid":"own","entity_id":1,
+                    "dimension":"minecraft:overworld","position":[0.5,if recovering{1.5}else{1.},0.5],
+                    "health":20.,"food":20,"sprinting":true,"on_ground":false,"in_water":true,
+                    "eyes_in_water":!recovering,"air":if recovering{300}else{200},"max_air":300,"control":control},
+                    "world":{"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,"entities":[]},"menu":{}})
+            } else if first.starts_with("GET /v1/bots/own/actions/pending ") {
+                json!([])
+            } else {
+                assert!(first.starts_with("POST /v1/bots/own/actions "), "{first}");
+                let request: ActionRequest = serde_json::from_slice(&bytes).unwrap();
+                match request.action {
+                    Action::StartMove { target, .. } => {
+                        assert!(
+                            control["action_id"].is_null(),
+                            "only one breathing intention"
+                        );
+                        control = json!({"action_id":request.action_id,"outcome":"running",
+                            "target":[target.x,target.y,target.z],"progress":{"elapsed_ms":100}});
+                    }
+                    Action::CancelControl { action_id } => {
+                        assert_eq!(
+                            control["action_id"], action_id,
+                            "only the owned input may be cancelled"
+                        );
+                        server_cancel.fetch_add(1, Ordering::AcqRel);
+                        control["cancel_requested"] = json!(true);
+                    }
+                    other => panic!("Unexpected control {other:?}"),
+                }
+                json!({"action_id":request.action_id,"outcome":"running","adapter_version":"fixture","evidence":{},"error":null})
+            };
+            let body = response.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    let handoff_state = shared.clone();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller(
+            client,
+            Config {
+                enabled: true,
+                period_ms: 50,
+                decision_samples: 0,
+                experimental_ranged_boundary_turns: false,
+            },
+            shared,
+            stop,
+            &j,
+            3.5,
+            false,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    upstream.abort();
+    assert_eq!(cancellations.load(Ordering::Acquire), 1);
+    assert!(held_until_release.load(Ordering::Acquire));
+    assert!(
+        yielded.load(Ordering::Acquire),
+        "yield only after fresh native release, without3second relatch"
+    );
+    assert_eq!(
+        handoff_state.view()["scheduling_revision"],
+        2,
+        "Only emergency entry and confirmed release advance scheduling; observations and final stop do not"
+    );
+}
+
+#[test]
 fn unproved_boundary_turns_require_explicit_deployment_opt_in() {
     assert!(!Config::default().experimental_ranged_boundary_turns);
     let previous: Config = serde_json::from_value(json!({"enabled":true,"period_ms":150})).unwrap();
@@ -118,6 +449,7 @@ async fn stalled_native_query_does_not_stop_observation_or_close_threat_defense(
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -158,6 +490,7 @@ async fn planning_refresh_waits_for_a_fresh_retry_without_admitting_stale_state(
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(Some((
@@ -328,6 +661,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -382,6 +716,7 @@ async fn delayed_interactions_return_final_feedback_without_leasing_the_survival
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -508,6 +843,7 @@ async fn real_local_proxy_returns_the_receipt_and_retains_only_compact_diagnosti
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -569,6 +905,7 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
     let shared = Arc::new(Shared {
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         model_lanes: crate::model::Lanes::default(),
         emergency: AtomicBool::new(true),

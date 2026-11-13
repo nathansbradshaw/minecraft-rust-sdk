@@ -54,10 +54,33 @@ pub struct Job {
     cancel_id: Option<String>,
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<Receipt>>,
+    reconciled: AtomicBool,
 }
 impl Job {
     pub fn observation(&self) -> Value {
-        self.state.lock().map(|r|json!({"action_id":self.id,"outcome":r.outcome,"target":r.evidence["target"],"progress":r.evidence["progress"],"cancel_requested":self.cancel.load(Ordering::Acquire),"input_released":r.evidence["input_released"]})).unwrap_or_else(|_|json!({"action_id":self.id,"outcome":"uncertain","error":"Control state unavailable"}))
+        self.state.lock().map(|r| {
+            let mut observation=json!({"action_id":self.id,"outcome":r.outcome,"target":r.evidence["target"],"progress":r.evidence["progress"],"cancel_requested":self.cancel.load(Ordering::Acquire),"input_released":r.evidence["input_released"]});
+            if self.reconciled.load(Ordering::Acquire)
+                && r.outcome==Outcome::Uncertain && r.evidence["input_released"]==true {
+                // This is present scheduling readiness, not a rewrite of the
+                // original action's uncertain historical game effect.
+                observation["outcome"]=json!("idle");
+                observation["historical_outcome"]=json!(r.outcome);
+                observation["reconciliation"]=json!({"settled":true,"historical_effect_verified":false,"replayed":false});
+            }
+            observation
+        }).unwrap_or_else(|_|json!({"action_id":self.id,"outcome":"uncertain","error":"Control state unavailable"}))
+    }
+    pub fn acknowledge_reconciliation(&self, id: &str) {
+        if (id == self.id || self.cancel_id.as_deref() == Some(id))
+            && self.state.lock().is_ok_and(|r| {
+                r.outcome == Outcome::Uncertain && r.evidence["input_released"] == true
+            })
+        {
+            // Called only after settled native reconciliation. Retain status
+            // and its evidence exactly; expose that this stopped lane is free.
+            self.reconciled.store(true, Ordering::Release);
+        }
     }
     pub fn running(&self) -> bool {
         self.state
@@ -159,12 +182,102 @@ impl Job {
             cancel_id: None,
             cancel,
             state,
+            reconciled: AtomicBool::new(false),
         })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn interrupted_job(outcome: Outcome, input_released: bool) -> Job {
+        Job {
+            id: "move-original".into(),
+            cancel_id: Some("cancel-original".into()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            reconciled: AtomicBool::new(false),
+            state: Arc::new(Mutex::new(Receipt {
+                action_id: "move-original".into(),
+                outcome,
+                adapter_version: VERSION.into(),
+                evidence: json!({"input_released":input_released,"native_effect_verified":false,
+                    "target":[2.5,64.,1.5],"progress":{"frames_sent":3}}),
+                error: Some(ApiError::new(
+                    ErrorCode::UncertainOutcome,
+                    "Inspect without replay",
+                )),
+            })),
+        }
+    }
+    #[test]
+    fn explicit_reconciliation_frees_a_stopped_lane_without_rewriting_historical_effects() {
+        for id in ["move-original", "cancel-original"] {
+            let job = interrupted_job(Outcome::Uncertain, true);
+            let status_before = serde_json::to_value(job.status("move-original").unwrap()).unwrap();
+            let cancel_before =
+                serde_json::to_value(job.status("cancel-original").unwrap()).unwrap();
+            assert_eq!(job.observation()["outcome"], "uncertain");
+            job.acknowledge_reconciliation("foreign");
+            assert_eq!(job.observation()["outcome"], "uncertain");
+            assert!(
+                !job.cancel.load(Ordering::Acquire),
+                "reconciliation cannot submit cancellation input"
+            );
+            job.acknowledge_reconciliation(id);
+            job.acknowledge_reconciliation(id);
+            let observed = job.observation();
+            assert_eq!(observed["action_id"], "move-original");
+            assert_eq!(
+                observed["outcome"], "idle",
+                "existing navigation readiness accepts a settled idle lane"
+            );
+            assert_eq!(observed["historical_outcome"], "uncertain");
+            assert_eq!(observed["input_released"], true);
+            assert_eq!(
+                observed["reconciliation"]["historical_effect_verified"],
+                false
+            );
+            assert_eq!(observed["reconciliation"]["replayed"], false);
+            assert_eq!(
+                serde_json::to_value(job.status("move-original").unwrap()).unwrap(),
+                status_before
+            );
+            assert_eq!(
+                serde_json::to_value(job.status("cancel-original").unwrap()).unwrap(),
+                cancel_before
+            );
+            assert!(!job.running());
+            assert!(!job.cancel.load(Ordering::Acquire));
+        }
+    }
+    #[test]
+    fn reconciliation_cannot_free_running_unreleased_or_unrelated_controls() {
+        for outcome in [
+            Outcome::Prepared,
+            Outcome::Running,
+            Outcome::Observed,
+            Outcome::Cancelled,
+            Outcome::Expired,
+            Outcome::Failed,
+        ] {
+            let job = interrupted_job(outcome, true);
+            let before = job.observation();
+            job.acknowledge_reconciliation("move-original");
+            assert_eq!(job.observation(), before);
+            assert!(!job.reconciled.load(Ordering::Acquire));
+        }
+        let job = interrupted_job(Outcome::Uncertain, false);
+        job.acknowledge_reconciliation("move-original");
+        assert_eq!(job.observation()["outcome"], "uncertain");
+        assert!(!job.reconciled.load(Ordering::Acquire));
+        let job = interrupted_job(Outcome::Running, true);
+        job.acknowledge_reconciliation("move-original");
+        job.state.lock().unwrap().outcome = Outcome::Uncertain;
+        assert_eq!(
+            job.observation()["outcome"],
+            "uncertain",
+            "a premature acknowledgment is never queued for later"
+        );
+    }
     fn sample() -> (FirstEffectContext, Observation) {
         (
             FirstEffectContext {
@@ -225,6 +338,7 @@ mod tests {
             id: "own".into(),
             cancel_id: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            reconciled: AtomicBool::new(false),
             state: Arc::new(Mutex::new(Receipt {
                 action_id: "own".into(),
                 outcome: Outcome::Running,

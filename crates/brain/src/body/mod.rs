@@ -60,6 +60,7 @@ pub struct Shared {
     // Bumped under mutation ownership before submitting an SDK program's
     // action. A food choice cannot act on a hand snapshot older than that.
     program_generation: AtomicU64,
+    scheduling_revision: AtomicU64,
     emergency: AtomicBool,
     running: AtomicBool,
     latest: Mutex<Option<(Instant, Arc<Observation>)>>,
@@ -75,11 +76,18 @@ impl std::fmt::Display for StaleObservation {
 }
 impl std::error::Error for StaleObservation {}
 impl Shared {
+    fn set_urgent(&self, urgent: bool) -> bool {
+        let previous = self.emergency.swap(urgent, Ordering::AcqRel);
+        if previous != urgent {
+            self.scheduling_revision.fetch_add(1, Ordering::Release);
+        }
+        previous
+    }
     pub fn urgent(&self) -> bool {
         self.emergency.load(Ordering::Acquire)
     }
     pub fn view(&self) -> Value {
-        json!({"emergency":self.urgent(),"running":self.running.load(Ordering::Acquire),"reason":self.reason.lock().ok().map(|s|s.clone()),"observation_age_ms":self.latest.lock().ok().and_then(|v|v.as_ref().map(|(at,_)|at.elapsed().as_millis()))})
+        json!({"emergency":self.urgent(),"scheduling_revision":self.scheduling_revision.load(Ordering::Acquire),"running":self.running.load(Ordering::Acquire),"reason":self.reason.lock().ok().map(|s|s.clone()),"observation_age_ms":self.latest.lock().ok().and_then(|v|v.as_ref().map(|(at,_)|at.elapsed().as_millis()))})
     }
     pub fn observe(&self) -> Result<Observation> {
         ensure(
@@ -223,6 +231,7 @@ impl Handle {
         let shared = Arc::new(Shared {
             feedback: Mutex::new(crate::feedback::Trace::default()),
             program_generation: AtomicU64::new(0),
+            scheduling_revision: AtomicU64::new(0),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
             model_lanes: crate::model::Lanes::default(),
             emergency: AtomicBool::new(false),
@@ -445,6 +454,37 @@ async fn send(client: &Client, j: &Journal, action: Action) -> Result<Receipt> {
     }
     Ok(r)
 }
+fn may_resume_after_danger(
+    observed: &Observation,
+    safe_for: Duration,
+    owned_control: &str,
+    owned_water_control: bool,
+    owned_water_shore: bool,
+) -> bool {
+    let active = &observed.player["control"];
+    // Explicit reconciliation publishes present idle readiness separately from
+    // the action's unchanged uncertain historical receipt. It is not a native
+    // terminal outcome or evidence that the original movement succeeded.
+    let reconciled_idle = active["action_id"].as_str() == Some(owned_control)
+        && active["outcome"] == "idle"
+        && active["historical_outcome"] == "uncertain"
+        && active["reconciliation"]["settled"] == true
+        && active["reconciliation"]["historical_effect_verified"] == false
+        && active["reconciliation"]["replayed"] == false;
+    let released = active["input_released"] == true
+        && (reconciled_idle
+            || serde_json::from_value::<Outcome>(active["outcome"].clone())
+                .is_ok_and(|outcome| outcome.terminal()));
+    // Wall time cannot retire native input: a lagging server may still be
+    // finishing the bank leg after three seconds. Only its own terminal,
+    // released observation completes that handoff. A replacement control or
+    // new life must not inherit an old control's ownership latch.
+    let awaiting_shore_release =
+        owned_water_shore && active["action_id"].as_str() == Some(owned_control) && !released;
+    !awaiting_shore_release
+        && (safe_for > Duration::from_secs(3)
+            || (owned_water_control && geometry::breathing_recovered(observed) && released))
+}
 async fn controller(
     client: Arc<Client>,
     cfg: Config,
@@ -468,6 +508,9 @@ async fn controller(
     let mut safe_since = Instant::now();
     let mut owned_control = String::new();
     let mut owned_water_control = false;
+    let mut owned_water_shore = false;
+    let mut allowed_surface_control = String::new();
+    let mut breathing_release_requested = String::new();
     let mut owned_projectiles = Vec::new();
     let mut cycles = 0u64;
     let mut rejected_routes = Vec::new();
@@ -633,7 +676,14 @@ async fn controller(
         let heard_danger = !heard_blasts.is_empty();
         let trail = retreat_trail.update(&observed, threatened || incoming);
         let dead = observed.player["health"].as_f64().is_some_and(|h| h <= 0.);
-        let water_emergency = geometry::water_danger(&observed);
+        let surface_swim = geometry::bounded_surface_swim(&observed, &owned_control);
+        let water_emergency = geometry::water_danger(&observed) && !surface_swim;
+        if surface_swim && active["action_id"].as_str() != Some(&allowed_surface_control) {
+            allowed_surface_control = active["action_id"].as_str().unwrap_or_default().into();
+            j.event("body_surface_swim_continues",json!({"action_id":allowed_surface_control,
+                "air":observed.player["air"],"target":active["target"],
+                "scope":"Bounded admitted foreground input toward known breathing space; no new input or safety guarantee"}))?;
+        }
         let stalled = retreat_progress.stalled(&observed, threatened);
         let urgent = dead
             || heard_danger
@@ -659,7 +709,7 @@ async fn controller(
         // immediately restores the fast route without waiting for the query.
         let awaiting_native = discover && native_escape.waiting() && admitted.is_empty();
         let escape = if active["outcome"] != "running" && !awaiting_native {
-            geometry::evade_policy(
+            let defensive = geometry::evade_policy(
                 &policy_observed,
                 &rejected_routes,
                 &stationary_projectiles,
@@ -667,7 +717,12 @@ async fn controller(
                 finite_waypoint_axis,
                 &admitted,
                 cfg.experimental_ranged_boundary_turns,
-            )
+            );
+            defensive.or_else(|| {
+                owned_water_control
+                    .then(|| geometry::shore_after_breath(&policy_observed, &rejected_routes))
+                    .flatten()
+            })
         } else {
             None
         };
@@ -689,7 +744,7 @@ async fn controller(
         let policy_ms = observed_at.elapsed().as_millis();
         if danger {
             safe_since = Instant::now();
-            if !shared.emergency.swap(true, Ordering::AcqRel) {
+            if !shared.set_urgent(true) {
                 j.event("body_emergency",json!({"revision":observed.revision,"health":observed.player["health"],"position":p,"nearest_hostile_distance":nearby.map(|(_,d)|d)}))?;
             }
         }
@@ -885,7 +940,10 @@ async fn controller(
                         }
                         if r.outcome == Outcome::Running {
                             owned_control = dispatched_id.clone();
-                            owned_water_control = water_emergency;
+                            owned_water_shore =
+                                route.reason == "leave water for observed dry support";
+                            owned_water_control = water_emergency
+                                || (observed.player["in_water"] == true && owned_water_shore);
                             owned_projectiles = incoming_projectiles.clone();
                         } else {
                             rejected_routes.push(key);
@@ -920,13 +978,49 @@ async fn controller(
                 last_attack = Instant::now();
                 j.event("body_defensive_attack",json!({"entity":entity,"action_id":receipt.action_id,"outcome":receipt.outcome,"native_effect_verified":receipt.evidence["native_effect_verified"],"observed_control":active,"reason":"cooldown-ready defense without pausing escape; server validates sight/reach and damage"}))?;
             }
-        } else if shared.urgent() && safe_since.elapsed() > Duration::from_secs(3) {
+        } else if shared.urgent()
+            && owned_water_control
+            && !owned_water_shore
+            && geometry::breathing_recovered(&observed)
+            && active["action_id"].as_str() == Some(&owned_control)
+            && active["outcome"] == "running"
+        {
+            // Release breathing-only input once, then wait for native release.
+            // A three-second hold here lets the character sink before handoff.
+            if active["cancel_requested"] != true && breathing_release_requested != owned_control {
+                let _guard = shared.mutation.lock().await;
+                breathing_release_requested = owned_control.clone();
+                let r = send(
+                    &client,
+                    j,
+                    Action::CancelControl {
+                        action_id: owned_control.clone(),
+                    },
+                )
+                .await?;
+                j.event(
+                    "body_breathing_input_released",
+                    json!({"action_id":owned_control,
+                    "cancel_action_id":r.action_id,"outcome":r.outcome,"replayed":false}),
+                )?;
+            }
+        } else if shared.urgent()
+            && may_resume_after_danger(
+                &observed,
+                safe_since.elapsed(),
+                &owned_control,
+                owned_water_control,
+                owned_water_shore,
+            )
+        {
             if body_sprint {
                 let _guard = shared.mutation.lock().await;
                 send(&client, j, Action::Sprint { enabled: false }).await?;
                 body_sprint = false;
             }
-            shared.emergency.store(false, Ordering::Release);
+            shared.set_urgent(false);
+            owned_water_control = false;
+            owned_water_shore = false;
             *shared.reason.lock().map_err(|_| "Body state unavailable")? =
                 "safe; ordinary program may resume".into();
             j.event(
@@ -988,7 +1082,7 @@ async fn controller(
             tokio::time::sleep(Duration::from_millis(cfg.period_ms) - elapsed).await;
         }
     }
-    shared.emergency.store(false, Ordering::Release);
+    shared.set_urgent(false);
     j.event("body_stopped", json!({"cycles":cycles}))?;
     Ok(())
 }
