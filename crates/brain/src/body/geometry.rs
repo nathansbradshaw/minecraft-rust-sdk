@@ -725,6 +725,7 @@ pub(super) fn evade_policy(
     }
     let start = point(&o.player["position"])?;
     let mut threats = Vec::new();
+    let mut visible_contacts = Vec::new();
     let mut projectile_danger = false;
     let mut incoming_directions = Vec::new();
     let mut blasts = Vec::new();
@@ -746,6 +747,9 @@ pub(super) fn evade_policy(
             .sqrt();
         if e["hostile"] == true && d < threat_radius(e) {
             threats.push((p, e["ranged_attack"] == true, super::aerial::diver(e)));
+            if e["visible"] == true && visible_contacts.len() < 16 {
+                visible_contacts.push(p);
+            }
             if let Some(radius) = primed_blast(e)
                 && d <= radius + 2.
                 && blasts.len() < 4
@@ -783,6 +787,9 @@ pub(super) fn evade_policy(
         return None;
     }
     threats.truncate(16);
+    let contact_exposed = visible_contacts
+        .iter()
+        .any(|enemy| (0..3).map(|i| (start[i] - enemy[i]).powi(2)).sum::<f64>() < 25.);
     let cells: Cells<'_> = o.world["blocks"]
         .as_array()?
         .iter()
@@ -861,11 +868,22 @@ pub(super) fn evade_policy(
         if boundary_turn.is_some() {
             distance = distance.min(5.5);
         }
-        let cover = threats
+        // A ballistic shadow does not protect against a nearby pursuer
+        // walking around it. Do not let its large score veto leaving the
+        // same five-block contact envelope used by cover-path admission.
+        // These are current visible poses, never hidden current positions.
+        let contact = visible_contacts
             .iter()
-            .filter(|(e, _, _)| covered(p, *e, &obstacles))
-            .map(|(_, ranged, _)| if *ranged { 24. } else { 4. })
-            .sum::<f64>();
+            .any(|enemy| (0..3).map(|i| (p[i] - enemy[i]).powi(2)).sum::<f64>() < 25.);
+        let cover = if contact {
+            0.
+        } else {
+            threats
+                .iter()
+                .filter(|(e, _, _)| covered(p, *e, &obstacles))
+                .map(|(_, ranged, _)| if *ranged { 24. } else { 4. })
+                .sum::<f64>()
+        };
         let sidestep = incoming_directions
             .iter()
             .map(|v| {
@@ -1109,6 +1127,8 @@ pub(super) fn evade_policy(
                         "approach observed low-roof refuge from flying attacker"
                     } else if boundary_turn.is_some() {
                         "turn along observed boundary without reversing the firing lane"
+                    } else if contact_exposed {
+                        "leave close threat without relying on ballistic cover"
                     } else {
                         "increase threat distance and seek cover"
                     }
@@ -1136,6 +1156,110 @@ pub(super) fn evade_policy(
 mod tests {
     use super::*;
     use serde_json::json;
+    fn guarded_floor() -> Observation {
+        let mut o = world();
+        o.player = json!({"position":[0.5,1.,0.5],"on_ground":true});
+        // A synthetic collision screen: source policy evidence, not a claim
+        // that these cells or an admitted path existed in the native world.
+        for block in o.world["blocks"].as_array_mut().unwrap() {
+            let p = point(&block["position"]).unwrap();
+            if p[0] == 2. && p[2] == 0. && (1. ..=3.).contains(&p[1]) {
+                block["block"] = json!("minecraft:stone");
+                block["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        o.world["entities"] = json!([{"hostile":true,"visible":false,"ranged_attack":true,
+            "position":[7.179277791468074,1.,0.5],"client_memory":{
+                "kind":"last_visible_ranged_threat","age_ticks":2,"expires_after_ticks":160}}]);
+        o
+    }
+    #[test]
+    fn f06_far_visible_spider_does_not_disable_a_relevant_ranged_cover_plan() {
+        // F06 first spider sighting was visible, nonaggressive and23.366m
+        // away. Its relative pose is translated; the floor/screen is synthetic.
+        let mut o = guarded_floor();
+        let before = match cover::plan(&o, &[], 3.5).expect("known guarded route") {
+            cover::Plan::Move(route) => [route.target.x, route.target.y, route.target.z],
+            cover::Plan::Hold => panic!("fixture starts away from the screen"),
+        };
+        o.world["entities"].as_array_mut().unwrap().push(json!({
+            "visible":true,"hostile":true,"aggressive":false,"ranged_attack":false,
+            "type":"minecraft:spider","position":[-7.35068563867185,2.,-21.485384390613]}));
+        let after = match cover::plan(&o, &[], 3.5).expect("distant species is not a local threat")
+        {
+            cover::Plan::Move(route) => [route.target.x, route.target.y, route.target.z],
+            cover::Plan::Hold => panic!("the unrelated observation cannot change the route"),
+        };
+        assert_eq!(before, after);
+        o.world["entities"][1]["position"] = json!([-1.5, 1., 1.5]);
+        assert!(
+            cover::plan(&o, &[], 3.5).is_none(),
+            "a nearby melee threat still forbids ranged-only cover"
+        );
+    }
+    #[test]
+    fn f06_close_pursuer_prevents_ballistic_shadow_from_vetoing_an_outward_route() {
+        // F06 brought a visible spider into close contact while retreating
+        // from an archer. This isolates that scoring contradiction on a
+        // synthetic screen. The supplied prediction is fixture data, not a
+        // native trajectory replay or a Survival guarantee.
+        let mut o = guarded_floor();
+        o.world["entities"].as_array_mut().unwrap().push(json!({
+            "visible":true,"hostile":true,"aggressive":true,"ranged_attack":false,
+            "type":"minecraft:spider","position":[-1.5,1.,1.5]}));
+        let outward = [0.5, 1., -2.5];
+        let obstacles = boxes(&o);
+        assert!(covered(
+            [0.5, 1., 0.5],
+            [7.179277791468074, 1., 0.5],
+            &obstacles
+        ));
+        assert!(!covered(outward, [7.179277791468074, 1., 0.5], &obstacles));
+        let route = evade_with_native(
+            &o,
+            &[],
+            &[],
+            &[],
+            3.5,
+            &[Admitted {
+                target: outward,
+                jump: false,
+            }],
+        )
+        .expect("leaving contact cannot lose to the current static shadow");
+        assert_eq!([route.target.x, route.target.y, route.target.z], outward);
+        assert_eq!(
+            route.reason,
+            "native-predicted retreat after stalled local avoidance"
+        );
+        let guessed = evade(&o).expect("ordinary observed geometry also permits departure");
+        assert_eq!(
+            guessed.reason,
+            "leave close threat without relying on ballistic cover"
+        );
+    }
+    #[test]
+    fn hidden_melee_coordinates_do_not_remove_the_guarding_screen_reward() {
+        let mut o = guarded_floor();
+        o.world["entities"].as_array_mut().unwrap().push(json!({
+            "visible":false,"hostile":true,"ranged_attack":false,"position":[-1.5,1.,1.5]}));
+        let outward = [0.5, 1., -2.5];
+        assert!(
+            evade_with_native(
+                &o,
+                &[],
+                &[],
+                &[],
+                3.5,
+                &[Admitted {
+                    target: outward,
+                    jump: false
+                }]
+            )
+            .is_none(),
+            "raw hidden positions cannot create a contact emergency"
+        );
+    }
     #[test]
     fn smoke05_44_ordinary_retreat_refuses_a_closing_prefix_to_leased_shooter_memory() {
         // F05 control44 translated onto synthetic floor: a policy regression,

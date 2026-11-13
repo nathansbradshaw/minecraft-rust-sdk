@@ -278,6 +278,17 @@ equivalent source/output inspections. Explain the exact missing trusted interfac
 if client code cannot solve it. Exhausted unchanged diagnosis does not poll;
 changed code, meaningful game facts or a new task can reopen it. Body and chat
 remain active throughout.
+menu_inspection retains answered menu pages for this goal, actor, life and exact
+menu/inventory contents. It is cached evidence, never fresh native authority.
+Use its slot numbers and explicit player_inventory roles instead of rereading
+covered pages. During investigation or alternatives, ask a genuinely unresolved
+question or run a changed bounded experiment; changing page size, notes or clocks
+does not change the question. An already_answered result adds no facts and cannot
+extend the alternative window. Changed inventory/menu and other perception views
+remain available. Retrieve the indicated Generic menu builders section when useful:
+the optional menu::craft_once helper lets a Rust program compose finite verified
+menu steps without one inference per click. Check its actual preconditions and
+receipts; neither cached slots nor the helper grant native effect credit.
 exhausted_boundary marks a consumed diagnosis, not a ban on useful alternatives.
 One persistent, bounded routine window lets you choose different work, repair
 code or select a useful goal. An exact observed empty-hand placement failure with

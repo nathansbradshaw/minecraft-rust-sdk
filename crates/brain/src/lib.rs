@@ -15,6 +15,7 @@ pub mod feedback;
 mod gameplay_failure;
 mod handoff;
 pub mod memory;
+mod menu_evidence;
 pub mod model;
 pub mod navigation;
 mod navigation_checkpoint;
@@ -1138,6 +1139,7 @@ impl Brain {
             let mut investigation_left = 0;
             let mut investigation_subject = String::new();
             let mut investigation_revision = String::new();
+            let mut menu_alternative_window = false;
             if (inspected_goal == self.goal
                 && inspected >= self.cfg.max_inspections_without_execution)
                 || self.journal.get("needs_investigation")?.as_deref() == Some("true")
@@ -1183,6 +1185,7 @@ impl Brain {
                                 inspected,
                                 self.cfg.max_inspections_without_execution,
                             )? {
+                                menu_alternative_window = true;
                                 if fresh {
                                     inspected = 0;
                                 }
@@ -1288,6 +1291,16 @@ impl Brain {
             };
             context["goal_revision"] =
                 json!(self.journal.get("goal_revision")?.unwrap_or_default());
+            context["menu_inspection"] = match menu_evidence::context(
+                &self.journal,
+                &self.observed,
+                &self.journal.get("goal_revision")?.unwrap_or_default(),
+                investigation_left > 0 || menu_alternative_window,
+            ) {
+                Ok(value) => value,
+                Err(error) => json!({"available":false,"reason":error.to_string(),
+                    "scope":"Optional retained menu evidence unavailable; no freshness or emptiness inferred"}),
+            };
             context["coding_checkpoint"] = self.journal.navigation_coding_checkpoint(
                 &progress::workspace_fingerprint_excluding_state(
                     &self.cfg.workspace,
@@ -1476,7 +1489,7 @@ impl Brain {
             } else {
                 None
             };
-            let result = tools::execute(self, &choice).await;
+            let mut result = tools::execute(self, &choice).await;
             if let (Some(version), Ok(value)) = (&program_version, &result)
                 && let Err(error) = self.journal.remember_program(
                     &self.cfg.state,
@@ -1500,6 +1513,25 @@ impl Brain {
                 &self.cfg.workspace,
                 &self.cfg.state,
             )?;
+            // Journal caching is bookkeeping, never an editable-source change
+            // or execution credit. Bind only a view actually returned by this
+            // observation; other tools/perceptions keep their existing path.
+            if choice.tool == "observe"
+                && let Ok(value) = &mut result
+            {
+                match menu_evidence::record(
+                    &self.journal,
+                    &self.observed,
+                    &choice.input,
+                    value.clone(),
+                ) {
+                    Ok(recorded) => *value = recorded,
+                    Err(error) => {
+                        value["menu_question"] = json!({"available":false,"reason":error.to_string(),
+                        "scope":"Optional retained evidence unavailable; observation unchanged"})
+                    }
+                }
+            }
             let goal_changed = self.goal != requested_goal
                 || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision;
             let paused = result.as_ref().is_ok_and(navigation::scheduling_preempted);
@@ -1571,6 +1603,21 @@ impl Brain {
                 }
             } else {
                 progress::next_inspection_count(inspected, inspected_goal == self.goal, executed)
+            };
+            let inspected = if !goal_changed && !executed {
+                match &result {
+                    Ok(value) => menu_evidence::inspection_count(
+                        &self.journal,
+                        value,
+                        investigation_left > 0,
+                        menu_alternative_window,
+                        inspected,
+                        self.cfg.max_inspections_without_execution,
+                    )?,
+                    Err(_) => inspected,
+                }
+            } else {
+                inspected
             };
             self.journal
                 .set("inspection_streak", &inspected.to_string())?;

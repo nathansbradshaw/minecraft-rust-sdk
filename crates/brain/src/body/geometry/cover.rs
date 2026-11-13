@@ -59,10 +59,16 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
         .iter()
         .filter(|e| perceived(e) && e["hostile"] == true)
     {
+        let p = point(&enemy["position"])?;
+        // Match the enclosing avoidance policy's threat scope. A distant
+        // visible melee species must not disable useful ranged cover merely
+        // because its row is present in the observation.
+        if (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>() >= threat_radius(enemy).powi(2) {
+            continue;
+        }
         if enemy["ranged_attack"] != true {
             return None;
         }
-        let p = point(&enemy["position"])?;
         if (p[0] - start[0]).hypot(p[2] - start[2]) < 5. {
             return None;
         }
