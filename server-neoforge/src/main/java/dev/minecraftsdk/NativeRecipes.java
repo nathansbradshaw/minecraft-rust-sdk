@@ -48,10 +48,10 @@ final class NativeRecipes {
         var ingredients=new ArrayList<Map<String,Object>>();var source=recipe.getIngredients();
         for(var ingredient:source.stream().limit(64).toList()){
             var options=ingredient.getItems();var samples=Arrays.stream(options).limit(16).map(NativeRecipes::stack).toList();
-            ingredients.add(Map.of("matching_stacks",samples,"omitted_alternatives",Math.max(0,options.length-samples.size())));
+            ingredients.add(Map.of("empty",ingredient.isEmpty(),"matching_stacks",samples,"omitted_alternatives",Math.max(0,options.length-samples.size())));
         }
         row.put("ingredients",ingredients);row.put("omitted_ingredient_slots",Math.max(0,source.size()-ingredients.size()));
-        row.put("ingredient_semantics","Runtime representative matching stacks; custom quantities, components and dynamic results may require a namespaced mod adapter. Empty matching stacks do not establish an impossible recipe.");
+        row.put("ingredient_semantics","empty is the native explicit empty-slot flag, not an inference from matching_stacks. Runtime representative matching stacks do not certify custom quantities, components or dynamic results; these may require a namespaced mod adapter. An empty matching_stacks list alone establishes neither an empty slot nor an impossible recipe.");
         if(SdkService.JSON.toJson(row).length()>8192){row.remove("ingredients");row.put("ingredients_omitted_for_budget",true);}
         return row;
     }
