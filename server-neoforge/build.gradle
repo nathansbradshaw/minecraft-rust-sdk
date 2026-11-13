@@ -3,7 +3,7 @@ plugins {
     id 'net.neoforged.moddev' version '2.0.148'
 }
 group = 'dev.minecraftsdk'
-version = '0.1.0-alpha.14'
+version = '0.1.0-alpha.15'
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 repositories { mavenCentral() }
 neoForge {
@@ -17,3 +17,15 @@ tasks.named('processResources') {
     filesMatching('META-INF/neoforge.mods.toml') { expand(mod_version:project.version) }
 }
 tasks.named('jar') { from('../LICENSE') }
+sourceSets {
+    nativeLifeTest {
+        compileClasspath+=sourceSets.main.output
+        runtimeClasspath+=sourceSets.main.output
+    }
+}
+tasks.register('nativeLifeTest',JavaExec) {
+    dependsOn nativeLifeTestClasses
+    classpath=sourceSets.nativeLifeTest.runtimeClasspath
+    mainClass='dev.minecraftsdk.LifeEpochsTest'
+}
+tasks.named('check') { dependsOn 'nativeLifeTest' }

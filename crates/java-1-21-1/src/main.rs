@@ -3,6 +3,7 @@ mod chat;
 mod control;
 mod effects;
 mod fluids;
+mod fresh_observation;
 mod mining;
 mod motion;
 mod recipes;
@@ -1040,6 +1041,26 @@ fn trajectory(
     }
     Err("No collision-safe trajectory reaches the requested supported waypoint".into())
 }
+fn require_native_integration(discovery: &Value) -> AnyResult<()> {
+    if discovery["minecraft_version"] != "1.21.1"
+        || discovery["platform"] != "neoforge"
+        || discovery["online_mode"] != true
+        || !discovery["native_observation_features"]
+            .as_array()
+            .is_some_and(|v| {
+                [
+                    "minecraft:physics_facts",
+                    "minecraft:native_action_effects",
+                    "minecraft:life_identity",
+                ]
+                .iter()
+                .all(|required| v.iter().any(|c| c == required))
+            })
+    {
+        return Err("Unsupported native integration: alpha.15 physics, native action effects and minecraft:life_identity are required".into());
+    }
+    Ok(())
+}
 fn main() -> AnyResult<()> {
     let path = std::env::args_os()
         .nth(1)
@@ -1056,19 +1077,7 @@ fn main() -> AnyResult<()> {
     }
     let native = Native::new(&config)?;
     let discovery = native.call("discover", json!({}))?;
-    if discovery["minecraft_version"] != "1.21.1"
-        || discovery["platform"] != "neoforge"
-        || discovery["online_mode"] != true
-        || !discovery["native_observation_features"]
-            .as_array()
-            .is_some_and(|v| {
-                ["minecraft:physics_facts", "minecraft:native_action_effects"]
-                    .iter()
-                    .all(|required| v.iter().any(|c| c == required))
-            })
-    {
-        return Err("Unsupported native integration: alpha.10 physics and native action effects are required".into());
-    }
+    require_native_integration(&discovery)?;
     let mut players: HashMap<String, Player> = HashMap::new();
     let mut identities: HashMap<String, (String, String, String)> = HashMap::new();
     let mut channel: Option<(String, u64)> = None;
@@ -1190,6 +1199,7 @@ fn dispatch(
                     "minecraft:commands",
                     "minecraft:respawn",
                     routes::CAPABILITY,
+                    fresh_observation::CAPABILITY,
                 ]
                 .into_iter()
                 .filter(|c| {
@@ -1217,6 +1227,7 @@ fn dispatch(
                 limits: json!({"process_protocol":ADAPTER_VERSION,"max_players":discovery["max_players"],"move_waypoint_blocks":3.5,"finite_move_waypoint_blocks":motion::FINITE_WAYPOINT_AXIS,"move_up_blocks":4,"move_down_blocks":4,"observation_radius":4,"entity_observation_radius":discovery["entity_observation_radius"],"finite_control_max_ticks":config.control_max_ticks,"blocking_locomotion":config.allow_blocking_locomotion,"observation_queries":({
                     let mut schemas=discovery["observation_query_schemas"].as_object().cloned().unwrap_or_default();
                     schemas.insert(routes::CAPABILITY.into(),routes::schema());
+                    schemas.insert(fresh_observation::CAPABILITY.into(),fresh_observation::schema());
                     Value::Object(schemas)
                 })}),
             })),
@@ -1288,6 +1299,56 @@ fn dispatch(
                         ErrorCode::SessionRequired,
                         "Player is not connected",
                     ));
+                }
+                if query.capability == fresh_observation::CAPABILITY {
+                    let player = players.get(&request.bot_id).ok_or_else(|| {
+                        ApiError::new(ErrorCode::SessionRequired, "Player disconnected")
+                    })?;
+                    if !player.alive.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            ErrorCode::SessionRequired,
+                            "Character connection ended; reconnect without replay",
+                        ));
+                    }
+                    let cached = player.physics.observe().map_err(|_| {
+                        ApiError::new(
+                            ErrorCode::NotReady,
+                            "Character controller observation unavailable",
+                        )
+                    })?;
+                    if cached.player["uuid"] != request.player_uuid {
+                        return Err(ApiError::new(
+                            ErrorCode::Conflict,
+                            "Fresh observation does not belong to this controller",
+                        ));
+                    }
+                    let mut observation =
+                        fresh_observation::read(native, &request.player_uuid, &query.input)?;
+                    if !player.alive.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            ErrorCode::SessionRequired,
+                            "Character connection ended during fresh observation",
+                        ));
+                    }
+                    // Preserve current controller metadata without replacing this
+                    // explicit native snapshot with a cached/effect sample.
+                    if cached.player["life_id"] == observation.player["life_id"]
+                        && cached.world["sample_clock"]["epoch"]
+                            == observation.world["sample_clock"]["epoch"]
+                    {
+                        if let Some(metadata) = cached.player.get("physical_controller") {
+                            observation.player["physical_controller"] = metadata.clone();
+                        }
+                        if let Some(job) = &player.control {
+                            observation.player["control"] = job.observation();
+                        }
+                        if let Some(job) = &player.interaction {
+                            observation.player["interaction"] = job.observation();
+                        }
+                    }
+                    return Ok(AdapterResponse::ObservationData(json!({
+                        "format":fresh_observation::FORMAT,"observation":observation
+                    })));
                 }
                 if query.capability == routes::CAPABILITY {
                     routes::validate(&query.input).map_err(|e| {
@@ -1667,6 +1728,7 @@ fn dispatch(
                 }
                 if first.player["uuid"] != request.player_uuid
                     || second.player["uuid"] != request.player_uuid
+                    || !same_life(&first, &second)
                     || !first.player["dimension"].is_string()
                     || first.player["dimension"] != second.player["dimension"]
                     || first.player["using_item"] != second.player["using_item"]
@@ -1704,7 +1766,18 @@ fn dispatch(
         Err(error) => AdapterResponse::Error(error),
     }
 }
+fn same_life(before: &Observation, after: &Observation) -> bool {
+    before.player["uuid"].is_string()
+        && before.player["uuid"] == after.player["uuid"]
+        && before.player["life_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+        && before.player["life_id"] == after.player["life_id"]
+}
 fn verified_effect(action: &Action, before: &Observation, after: &Observation) -> bool {
+    if !matches!(action, Action::Respawn) && !same_life(before, after) {
+        return false;
+    }
     match action {
         Action::Move { target, .. } | Action::MotionFrame { target } => {
             position(after).is_ok_and(|p| {
@@ -1727,6 +1800,15 @@ fn verified_effect(action: &Action, before: &Observation, after: &Observation) -
         Action::Respawn => {
             before.player["health"].as_f64().is_some_and(|h| h <= 0.)
                 && after.player["health"].as_f64().is_some_and(|h| h > 0.)
+                && before.player["uuid"].is_string()
+                && before.player["uuid"] == after.player["uuid"]
+                && before.player["life_id"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                && after.player["life_id"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                && before.player["life_id"] != after.player["life_id"]
         }
         Action::Dig { block, stage, .. } => {
             let p = json!([block.x, block.y, block.z]);
@@ -1875,6 +1957,59 @@ fn compact(action: &Action, o: &Observation) -> Value {
 #[cfg(test)]
 mod movement_tests {
     use super::*;
+    #[test]
+    fn native_compatibility_rejects_the_pre_life_identity_module() {
+        let mut discovery = json!({
+            "minecraft_version":"1.21.1","platform":"neoforge","online_mode":true,
+            "native_observation_features":["minecraft:physics_facts","minecraft:native_action_effects"]
+        });
+        assert!(
+            require_native_integration(&discovery)
+                .unwrap_err()
+                .to_string()
+                .contains("minecraft:life_identity")
+        );
+        discovery["native_observation_features"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("minecraft:life_identity"));
+        assert!(require_native_integration(&discovery).is_ok());
+        discovery["online_mode"] = json!(false);
+        assert!(require_native_integration(&discovery).is_err());
+    }
+    #[test]
+    fn respawn_requires_same_character_and_new_native_life_not_a_new_entity_id() {
+        let before = Observation {
+            revision: "dead".into(),
+            player: json!({"uuid":"character","entity_id":17,"life_id":"old-life","health":0.}),
+            world: Value::Null,
+            menu: Value::Null,
+        };
+        let mut after = before.clone();
+        after.player["health"] = json!(20.);
+        assert!(
+            !verified_effect(&Action::Respawn, &before, &after),
+            "healing alone is not respawn evidence"
+        );
+        after.player["life_id"] = json!("new-life");
+        assert!(
+            verified_effect(&Action::Respawn, &before, &after),
+            "ordinary respawn reuses numeric entity ID"
+        );
+        after.player["selected"] = json!(0);
+        assert!(
+            !verified_effect(&Action::SelectSlot { slot: 0 }, &before, &after),
+            "a new life's default selected slot cannot certify the old life's action"
+        );
+        after.player["uuid"] = json!("other");
+        assert!(!verified_effect(&Action::Respawn, &before, &after));
+        after.player["uuid"] = json!("character");
+        after.player["life_id"] = Value::Null;
+        assert!(
+            !verified_effect(&Action::Respawn, &before, &after),
+            "old providers cannot silently certify a life change"
+        );
+    }
     #[test]
     fn correction_reports_authorized_absolute_position_and_observed_support() {
         let mut packet = Vec::new();

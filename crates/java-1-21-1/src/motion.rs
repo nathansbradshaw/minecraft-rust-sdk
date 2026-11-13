@@ -420,6 +420,7 @@ impl Drive {
 struct Engine {
     body: Body,
     epoch: u64,
+    native_epoch: Value,
     drive: Option<Drive>,
     frames: u64,
     reason: String,
@@ -456,6 +457,7 @@ impl Actor {
             Ordering::Release,
         );
         let body = observed_body(&initial)?;
+        let native_epoch = initial.world["sample_clock"]["epoch"].clone();
         let cache = Arc::new(Cache {
             latest: Mutex::new(Some(Arc::new(Snapshot {
                 at: Instant::now(),
@@ -469,6 +471,7 @@ impl Actor {
         let engine = Arc::new(Mutex::new(Engine {
             body,
             epoch,
+            native_epoch,
             drive: None,
             frames: 0,
             reason: "native physics running".into(),
@@ -540,16 +543,31 @@ impl Actor {
                         Ordering::Release,
                     );
                     let mut e = engine.lock().map_err(|_| "Physical state unavailable")?;
-                    if e.epoch != snapshot.epoch {
+                    let life_changed = e.native_epoch != snapshot.o.world["sample_clock"]["epoch"];
+                    if e.epoch != snapshot.epoch || life_changed {
                         if let Some(d) = e.drive.take() {
-                            finish_interrupted(d, "Server relocation interrupted this control");
+                            finish_interrupted(
+                                d,
+                                "Server relocation or native life change interrupted this control",
+                            );
                         }
-                        e.body = Body {
-                            position: position(&snapshot.o)?,
-                            velocity: [0.; 3],
-                            on_ground: false,
+                        e.body = if life_changed {
+                            observed_body(&snapshot.o)?
+                        } else {
+                            Body {
+                                position: position(&snapshot.o)?,
+                                velocity: [0.; 3],
+                                on_ground: false,
+                            }
                         };
+                        if life_changed {
+                            w.impulses
+                                .lock()
+                                .map_err(|_| "Impulse state unavailable")?
+                                .clear();
+                        }
                         e.epoch = snapshot.epoch;
+                        e.native_epoch = snapshot.o.world["sample_clock"]["epoch"].clone();
                     }
                     if snapshot.o.player["health"]
                         .as_f64()
@@ -856,10 +874,10 @@ impl Actor {
                 "Existing control must be inspected/cancelled",
             ));
         }
-        if e.epoch != epoch {
+        if e.epoch != epoch || e.native_epoch != before.world["sample_clock"]["epoch"] {
             return Err(ApiError::new(
                 ErrorCode::Conflict,
-                "Server relocated this character; observe fresh state",
+                "Server relocated or respawned this character; observe fresh state",
             ));
         }
         let target = [target.x, target.y, target.z];
@@ -1153,6 +1171,7 @@ mod tests {
     }
     use std::net::TcpListener;
 
+    #[track_caller]
     fn wait_until(test: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(4);
         while !test() {
@@ -1431,10 +1450,12 @@ mod tests {
             evidence: json!({}),
             error: None,
         }));
+        let mut unreachable_before = diagonal_gap_fixture();
+        unreachable_before.world["sample_clock"] = json!({"epoch":"fixture","nanos":"1"});
         assert_eq!(
             actor
                 .start_control(
-                    diagonal_gap_fixture(),
+                    unreachable_before,
                     &unreachable,
                     0,
                     rejected_state.clone(),
@@ -1645,6 +1666,87 @@ mod tests {
             actor.engine.lock().unwrap().drive.is_none(),
             "interrupted input must not replay"
         );
+        // A normal respawn keeps this socket, UUID and numeric entity ID. Even
+        // if death and the teleport correction were missed, the native life
+        // clock must fence the old drive and allow fresh work on the same actor.
+        let old_life = actor.observe().unwrap();
+        let respawn_request = ActionRequest {
+            action_id: "fixture-respawn-interruption".into(),
+            action: Action::StartMove {
+                target: Position {
+                    x: 2.5,
+                    y: 1.,
+                    z: 0.5,
+                },
+                jump: false,
+                max_ticks: 60,
+            },
+        };
+        let respawn_state = Arc::new(Mutex::new(Receipt {
+            action_id: respawn_request.action_id.clone(),
+            outcome: Outcome::Running,
+            adapter_version: VERSION.into(),
+            evidence: json!({}),
+            error: None,
+        }));
+        actor
+            .start_control(
+                old_life.clone(),
+                &respawn_request,
+                1,
+                respawn_state.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        {
+            let mut o = observed.lock().unwrap();
+            o.world["sample_clock"]["epoch"] = json!("fixture-next-life");
+            o.player["life_id"] = json!("second-life");
+            o.player["velocity"] = json!([0., 0., 0.]);
+        }
+        wait_until(|| respawn_state.lock().unwrap().outcome == Outcome::Uncertain);
+        assert_eq!(respawn_state.lock().unwrap().outcome, Outcome::Uncertain);
+        assert_eq!(
+            corrections.load(Ordering::Acquire),
+            1,
+            "no synthetic correction or reconnect"
+        );
+        assert!(actor.alive.load(Ordering::Acquire));
+        assert_eq!(
+            actor
+                .start_control(
+                    old_life,
+                    &respawn_request,
+                    1,
+                    respawn_state.clone(),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict,
+            "stale pre-death observations cannot start new controls"
+        );
+        let mut fresh_request = respawn_request.clone();
+        fresh_request.action_id = "fixture-after-respawn".into();
+        let fresh_state = Arc::new(Mutex::new(Receipt {
+            action_id: fresh_request.action_id.clone(),
+            outcome: Outcome::Running,
+            adapter_version: VERSION.into(),
+            evidence: json!({}),
+            error: None,
+        }));
+        actor
+            .start_control(
+                actor.observe().unwrap(),
+                &fresh_request,
+                1,
+                fresh_state.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        wait_until(|| fresh_state.lock().unwrap().outcome.terminal());
+        assert_eq!(fresh_state.lock().unwrap().outcome, Outcome::Observed);
+        assert_eq!(actor.observe().unwrap().player["entity_id"], 7);
         observed.lock().unwrap().world["blocks"] = json!([]);
         wait_until(|| !alive.load(Ordering::Acquire));
         assert!(

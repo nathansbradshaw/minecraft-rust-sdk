@@ -14,9 +14,17 @@ import java.util.*;
 final class NativeEffects {
     private static final Map<Connection,Inbox> inboxes=new WeakHashMap<>();
     private static final class Inbox {
+        final String life;
         final String epoch=UUID.randomUUID().toString();
         long sequence;
         final ArrayDeque<Map<String,Object>> rows=new ArrayDeque<>();
+        Inbox(String life){this.life=life;}
+    }
+    private static Inbox inbox(ServerPlayer player){
+        var connection=player.connection.getConnection();
+        var life=LifeEpochs.of(connection,player);var inbox=inboxes.get(connection);
+        if(inbox==null||!inbox.life.equals(life)){inbox=new Inbox(life);inboxes.put(connection,inbox);}
+        return inbox;
     }
     static void install(){
         NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST,false,(LivingDamageEvent.Post event)->{
@@ -40,7 +48,7 @@ final class NativeEffects {
         var service=SdkService.active;
         if(service==null||!service.owns(player)||!player.server.isSameThread())return;
         synchronized(inboxes){
-            var inbox=inboxes.computeIfAbsent(player.connection.getConnection(),key->new Inbox());
+            var inbox=inbox(player);
             var row=new LinkedHashMap<>(effect);
             row.put("sequence",++inbox.sequence);row.put("actor_uuid",player.getUUID().toString());
             row.put("dimension",player.serverLevel().dimension().location().toString());
@@ -50,7 +58,7 @@ final class NativeEffects {
     }
     static Object snapshot(ServerPlayer player){
         synchronized(inboxes){
-            var inbox=inboxes.computeIfAbsent(player.connection.getConnection(),key->new Inbox());
+            var inbox=inbox(player);
             return Map.of("format","native-action-effects-v1","epoch",inbox.epoch,
                 "last_sequence",inbox.sequence,"events",List.copyOf(inbox.rows));
         }

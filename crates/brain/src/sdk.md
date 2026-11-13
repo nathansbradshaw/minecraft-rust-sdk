@@ -109,6 +109,28 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   native roles and fresh menu/state IDs before clicking. Prepare, take output,
   and verify retained inventory before preparing a dependent recipe. A prepared
   ingredient in the output/grid has not yet been acquired to unlock later recipes.
+  Optional `menu::craft_once(&client, recipe_id, unique_prefix, &journal_path,
+  Duration::from_secs(15)).await?` composes one preparation, one output PICKUP,
+  and storage in an empty permitted own slot, then checks retained item/count gain.
+  Supply ingredients and an appropriate open menu with empty grid/cursor. It uses
+  native preparation metadata, not guessed output slots. It never uses make_all
+  or QUICK_MOVE. Each intended batch needs its own durable prefix/journal; repeat
+  the same journal after interruption to inspect the same requests without replay.
+  Native player.life_id is required and persisted; a life change stops the journal
+  even if menu IDs match. Old providers or version 1 journals require inspection,
+  never replacement action IDs. Use the matching life-identity module/adapter.
+  The adapter must also advertise minecraft:fresh_observation. The helper uses
+  menu::observe_fresh(&client) for its existing reads: one explicit bounded native
+  query, without cached fallback or polling. Full terrain/entities are included,
+  so this is heavier than the cached default body observation. Fresh revisions
+  can still change before a click; rejection stops rather than rebasing or retrying.
+  LocalPreempted means no submission and permits a later retry. Pending/NotReady
+  can still be running; Uncertain/Reconciled/NeedsInspection require original-ID
+  inspection/reconciliation and fresh facts. Do not discard state to retry. A
+  completed journal returns AlreadyCompleted without new crafting; check current
+  inventory separately. This is not atomic or native benchmark certification;
+  concurrent inventory/menu changes cause conservative stops. See the SDK
+  `craft_once` example. Custom component semantics remain unverified.
 - If advertised, minecraft:recipes discovers exact installed recipe IDs using
   recipe, output item or type selectors and bounded offset/limit pagination.
   The Rust recipes::Query helper builds that same read-only query. Recipe IDs
