@@ -81,26 +81,34 @@ fn gap(goal: &Goal, mut p: [f64; 3]) -> Option<f64> {
             .max(0.),
     )
 }
-fn clean_scheduling(result: &Value, observation: &Observation) -> bool {
+fn clean_scheduling(result: &Value, observation: &Observation) -> Option<bool> {
     let before = &result["navigation_scheduling"]["before"];
     let after = &result["navigation_scheduling"]["after"];
-    [before, after].into_iter().all(|b| {
+    let valid = [before, after].into_iter().all(|b| {
         b["body_running"] == true
             && b["emergency"] == false
             && b["scheduling_revision"].as_u64().is_some()
-    }) && before["scheduling_revision"] == after["scheduling_revision"]
-        && ["actor", "entity", "dimension", "epoch"]
-            .iter()
-            .all(|k| before[*k] == after[*k])
+    }) && ["actor", "entity", "dimension", "epoch"]
+        .iter()
+        .all(|k| before[*k] == after[*k])
         && after["actor"] == observation.player["uuid"]
         && after["entity"] == observation.player["entity_id"]
         && after["dimension"] == observation.player["dimension"]
-        && after["epoch"] == observation.world["sample_clock"]["epoch"]
+        && after["epoch"] == observation.world["sample_clock"]["epoch"];
+    if !valid {
+        return None;
+    }
+    let previous = before["scheduling_revision"].as_u64()?;
+    let current = after["scheduling_revision"].as_u64()?;
+    // Urgency that started and finished within a complete slice is diagnostic
+    // evidence, not a reason to discard that slice's lack of retained progress.
+    (current >= previous).then_some(current > previous)
 }
 fn clean_result(result: &Value) -> bool {
     result["exit_code"] == 0
         && result["timed_out"] == false
         && result["navigation"]["error"].is_null()
+        && result["navigation_slice"]["paused_for_control"] != true
         && result["error"].is_null()
         && result["output_files"]["error"].is_null()
         && result["local_action_feedback"]["error"].is_null()
@@ -147,7 +155,10 @@ impl Journal {
         let Some(basis) = basis(source, revision, observation) else {
             return Ok(());
         };
-        if !clean_scheduling(result, observation) || !clean_result(result) {
+        let Some(body_cycled) = clean_scheduling(result, observation) else {
+            return Ok(());
+        };
+        if !clean_result(result) {
             return Ok(());
         }
         let report = &result["navigation"]["report"];
@@ -180,6 +191,18 @@ impl Journal {
         if (actual - end).abs() > 0.000001 {
             return Ok(());
         }
+        let reported_end = end;
+        let retained_position = if body_cycled && status == "budget_exhausted" {
+            let Some(position) = point(&result["position_after"]) else {
+                return Ok(());
+            };
+            position
+        } else {
+            point(&report["position"]).expect("Validated report position")
+        };
+        let Some(end) = gap(&goal, retained_position) else {
+            return Ok(());
+        };
         let mut state = self.navigation_nonprogress_state(&basis)?;
         let goal_key = digest(serde_json::to_string(&goal)?.as_bytes());
         let best = *state.best_gaps.entry(goal_key.clone()).or_insert(start);
@@ -195,7 +218,11 @@ impl Journal {
             state.count = state.count.saturating_add(1);
             state.slices.push(json!({"goal":goal,"start_gap":start,"end_gap":end,
                 "previous_best_gap":best,"report_position":report["position"],
-                "scope":"A bounded helper missed measured goal improvement; native movement remains valid"}));
+                "sdk_report_gap":reported_end,"retained_position":retained_position,
+                "kind":if body_cycled{"body_navigation_backtrack"}else{"goal_gap_nonprogress"},
+                "body_scheduling_revisions":[result["navigation_scheduling"]["before"]["scheduling_revision"],
+                    result["navigation_scheduling"]["after"]["scheduling_revision"]],
+                "scope":"A completed helper missed retained goal improvement; overlapping body activity is a cooperation diagnostic, not a failed or revoked native movement effect"}));
             if state.slices.len() > 2 {
                 state.slices.remove(0);
             }
@@ -248,7 +275,8 @@ impl Journal {
         self.event(
             "navigation_goal_gap_sample",
             json!({"basis":basis,"status":status,
-            "start_gap":start,"end_gap":end,"improved":improved,"nonprogress_slices":state.count,
+            "start_gap":start,"end_gap":end,"sdk_report_gap":reported_end,"body_cycled":body_cycled,
+            "retained_position":retained_position,"improved":improved,"nonprogress_slices":state.count,
             "diagnosis_requested":state.requested,"native_effects_reclassified":false}),
         )?;
         Ok(())
@@ -296,7 +324,8 @@ mod tests {
         json!({"success":false,"exit_code":0,"timed_out":false,"position_before":start,"position_after":end,
             "navigation":{"report":{"status":"budget_exhausted","pending_action":null,
                 "position":end,"remaining_distance":gap(&goal,end).unwrap()}},
-            "navigation_slice":{"format":"navigation-slice-v1","completed":false,"can_resume":true,"goal":goal},
+            "navigation_slice":{"format":"navigation-slice-v1","completed":false,"can_resume":true,
+                "paused_for_control":false,"goal":goal},
             "navigation_scheduling":{"before":scheduling,"after":scheduling},
             "local_action_feedback":{"omitted_records":0,"requests":[{"request":{"action_id":"move-1",
                 "action":{"kind":"start_move","target":{"x":end[0],"y":end[1],"z":end[2]}}},
@@ -311,6 +340,122 @@ mod tests {
     fn record(j: &Journal, v: &Value) {
         j.record_navigation_nonprogress(v, "source", "parent", &observed(), false)
             .unwrap();
+    }
+    fn body_backtrack() -> Value {
+        let start = [284.5, 63., -731.5];
+        let wet = [281.5, 62., -731.5];
+        let goal = Goal::BlockReach {
+            dimension: "fixture:world".into(),
+            block: [275, 63, -731],
+            distance: 4.,
+            eye_height: 1.62,
+        };
+        let mut result = slice(start, wet);
+        result["navigation_slice"]["goal"] = serde_json::to_value(&goal).unwrap();
+        result["navigation"]["report"]["remaining_distance"] = json!(gap(&goal, wet).unwrap());
+        result["position_after"] = json!(start);
+        result["navigation_scheduling"]["after"]["scheduling_revision"] = json!(10);
+        result
+    }
+    #[test]
+    fn completed_block_reach_and_body_rescue_cycles_request_one_cooperation_diagnosis() {
+        let (_dir, j) = journal();
+        let v = body_backtrack();
+        let native_receipts = v["local_action_feedback"].clone();
+        record(&j, &v);
+        let context = j
+            .navigation_nonprogress_context("source", "parent", &observed())
+            .unwrap();
+        assert_eq!(context["count"], 1);
+        let evidence = &context["recent_slices"][0];
+        assert_eq!(evidence["kind"], "body_navigation_backtrack");
+        assert!(
+            evidence["sdk_report_gap"].as_f64().unwrap() < evidence["end_gap"].as_f64().unwrap(),
+            "transient native arrival and retained post-rescue gap must stay separate"
+        );
+        assert_eq!(evidence["start_gap"], evidence["end_gap"]);
+        assert_eq!(evidence["body_scheduling_revisions"], json!([8, 10]));
+        record(&j, &v);
+        assert_eq!(
+            j.get("development_turns_remaining").unwrap().as_deref(),
+            Some("4")
+        );
+        for _ in 0..4 {
+            assert!(j.take_development_turn().unwrap());
+        }
+        let mut repeated = v.clone();
+        repeated["navigation_scheduling"]["after"]["scheduling_revision"] = json!(12);
+        record(&j, &repeated);
+        assert_eq!(
+            j.get("development_turns_remaining").unwrap().as_deref(),
+            Some("0")
+        );
+        assert!(j.get("needs_investigation").unwrap().is_none());
+        assert_eq!(
+            v["local_action_feedback"], native_receipts,
+            "native Observed receipts are never reclassified"
+        );
+    }
+    #[test]
+    fn completed_body_cycles_with_retained_closer_or_reached_goals_are_not_penalized() {
+        let (_dir, j) = journal();
+        let v = body_backtrack();
+        record(&j, &v);
+        let mut closer = v.clone();
+        closer["position_after"] = closer["navigation"]["report"]["position"].clone();
+        record(&j, &closer);
+        assert!(
+            j.navigation_nonprogress_context("source", "parent", &observed())
+                .unwrap()
+                .is_null()
+        );
+        assert!(j.get("develop_next").unwrap().is_none());
+        record(&j, &v);
+        let mut reached = slice([1.5, 63., -731.5], [4.5, 63., -731.5]);
+        reached["navigation_scheduling"]["after"]["scheduling_revision"] = json!(10);
+        reached["navigation"]["report"]["status"] = json!("reached");
+        record(&j, &reached);
+        assert!(
+            j.navigation_nonprogress_context("source", "parent", &observed())
+                .unwrap()
+                .is_null()
+        );
+        assert!(j.get("develop_next").unwrap().is_none());
+    }
+    #[test]
+    fn actual_preemption_urgency_pending_and_uncertainty_still_exclude_body_cycles() {
+        let (_dir, j) = journal();
+        let v = body_backtrack();
+        for (path, value) in [
+            ("/navigation/report/status", json!("preempted")),
+            ("/navigation_slice/paused_for_control", json!(true)),
+            (
+                "/navigation/report/pending_action",
+                json!("pending-original-id"),
+            ),
+            ("/navigation_scheduling/before/emergency", json!(true)),
+            ("/navigation_scheduling/after/emergency", json!(true)),
+            (
+                "/local_action_feedback/requests/0/response/outcome",
+                json!("uncertain"),
+            ),
+            (
+                "/local_action_feedback/requests/0/response/outcome",
+                json!("cancelled"),
+            ),
+            (
+                "/local_action_feedback/requests/0/response/outcome",
+                json!("reconciled"),
+            ),
+        ] {
+            let mut excluded = v.clone();
+            *excluded.pointer_mut(path).unwrap() = value;
+            record(&j, &excluded);
+            assert!(
+                j.get(KEY).unwrap().is_none(),
+                "excluded body-cycle boundary {path}"
+            );
+        }
     }
     #[test]
     fn motion_and_new_vectors_remain_valid_but_do_not_renew_goal_progress_or_work_sessions() {
@@ -417,7 +562,7 @@ mod tests {
         );
     }
     #[test]
-    fn pending_preempted_uncertain_and_body_handoff_slices_never_count_or_erase_history() {
+    fn pending_preempted_uncertain_and_urgent_slices_never_count_or_erase_history() {
         let (_dir, j) = journal();
         let v = slice([1.5, 63., -731.5], [0.5, 63., -731.5]);
         record(&j, &v);
@@ -427,6 +572,7 @@ mod tests {
                 json!("preserved-original-id"),
             ),
             ("/navigation/report/status", json!("preempted")),
+            ("/navigation_slice/paused_for_control", json!(true)),
             ("/timed_out", json!(true)),
             ("/local_action_feedback/omitted_records", json!(1)),
             (
@@ -445,8 +591,9 @@ mod tests {
                 "/local_action_feedback/requests/0/response/native_effect_verified",
                 json!(false),
             ),
-            ("/navigation_scheduling/after/scheduling_revision", json!(9)),
+            ("/navigation_scheduling/after/scheduling_revision", json!(7)),
             ("/navigation_scheduling/before/emergency", json!(true)),
+            ("/navigation_scheduling/after/emergency", json!(true)),
             ("/navigation_scheduling/after/body_running", json!(false)),
             ("/navigation_scheduling/after/epoch", json!("new-life")),
             ("/navigation/report/remaining_distance", json!(0.01)),
