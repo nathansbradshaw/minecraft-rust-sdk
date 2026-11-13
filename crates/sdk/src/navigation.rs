@@ -102,6 +102,9 @@ pub struct Options {
     pub max_nodes: usize,
     pub timeout_ms: u64,
     pub blocked_blocks: Vec<String>,
+    /// Experimental client policy: act on a fresh, strictly improving preview
+    /// prefix rather than waiting for full local enumeration. Off by default.
+    pub eager_progress: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -110,6 +113,7 @@ impl Default for Options {
             max_nodes: 1024,
             timeout_ms: 120000,
             blocked_blocks: Vec::new(),
+            eager_progress: false,
         }
     }
 }
@@ -123,9 +127,22 @@ pub struct Report {
     /// Valid transient previews encountered by this durable navigation journal.
     #[serde(default)]
     pub preview_waits: u64,
+    #[serde(default)]
+    pub preview: PreviewStats,
     pub pending_action: Option<String>,
     pub journal: PathBuf,
     pub note: String,
+}
+/// Cumulative diagnostic counters for this durable navigation journal.
+/// Read predictions and local intentions never certify retained game progress.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreviewStats {
+    pub ready_pages: u64,
+    pub pending_busy: u64,
+    pub pending_other: u64,
+    pub scene_restarts: u64,
+    pub eager_intentions: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Origin {
@@ -149,6 +166,8 @@ struct Page {
     complete: bool,
     next_offset: Option<usize>,
     retry_after_ms: u64,
+    #[serde(default)]
+    busy: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Edge {
@@ -183,6 +202,13 @@ struct Expansion {
     #[serde(default)]
     ready_after_unix_ms: u64,
 }
+#[derive(Serialize, Deserialize)]
+struct Prefix {
+    origin: Origin,
+    scene: String,
+    next_offset: usize,
+    routes_read: usize,
+}
 fn unix_ms() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -200,6 +226,12 @@ struct State {
     sequence: u64,
     #[serde(default)]
     preview_waits: u64,
+    #[serde(default)]
+    preview: PreviewStats,
+    // Keep the read provenance associated with an exact durable intention even
+    // after moving invalidates the single resumable expansion at the old pose.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    prefixes: BTreeMap<String, Prefix>,
     nodes: BTreeMap<String, Node>,
     blocked: BTreeSet<String>,
     pending: Option<Attempt>,
@@ -283,6 +315,8 @@ impl Journal {
                 ),
                 sequence: 0,
                 preview_waits: 0,
+                preview: PreviewStats::default(),
+                prefixes: BTreeMap::new(),
                 nodes: BTreeMap::new(),
                 blocked: BTreeSet::new(),
                 pending: None,
@@ -347,6 +381,7 @@ impl Journal {
             remaining_distance: self.state.goal.gap(self.state.position),
             actions: self.state.history.len(),
             preview_waits: self.state.preview_waits,
+            preview: self.state.preview.clone(),
             pending_action: self
                 .state
                 .pending
@@ -422,6 +457,47 @@ fn released_swim_arrival(last: &Attempt, observed: &Observation, position: [f64;
         && (last.target[0] - last.origin[0]).hypot(last.target[2] - last.origin[2]) <= 0.15
         && (position[0] - last.target[0]).hypot(position[2] - last.target[2]) <= 0.15
         && (position[1] - last.target[1]).abs() <= 0.6
+}
+fn arrived(state: &State, target: &str) -> bool {
+    state.history.iter().any(|a| {
+        a.outcome == Some(Outcome::Observed)
+            && a.arrival_verification
+                .as_ref()
+                .is_some_and(|v| v["target_reached"] == true)
+            && key(a.target) == target
+    })
+}
+fn eager_route(
+    state: &State,
+    current: &str,
+    origin: [f64; 3],
+    scene: &str,
+    routes: &[Route],
+    options: &Options,
+) -> Option<Route> {
+    let gap = state.goal.gap(origin);
+    routes
+        .iter()
+        .filter(|route| {
+            let to = key(route.target);
+            to != current
+                && state.goal.gap(route.target) < gap - 1e-6
+                && !route
+                    .touched_blocks
+                    .iter()
+                    .any(|b| options.blocked_blocks.contains(b))
+                && !arrived(state, &to)
+                && !state.blocked.contains(&blocked_key(current, &to, scene))
+                && state.nodes.get(&to).is_none_or(|n| !n.expanded)
+        })
+        .min_by(|a, b| {
+            state
+                .goal
+                .gap(a.target)
+                .total_cmp(&state.goal.gap(b.target))
+                .then_with(|| a.duration_ticks.cmp(&b.duration_ticks))
+        })
+        .cloned()
 }
 fn choose(state: &State, start: &str) -> Option<Route> {
     let mut costs: BTreeMap<String, f64> = BTreeMap::from([(start.to_owned(), 0.)]);
@@ -595,7 +671,12 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 j.state.blocked.insert(attempt_edge_key(&attempt));
             }
             j.state.history.push(attempt);
-            j.state.expansion = None;
+            // A prefix may still have unread predictions at its old origin.
+            // Keep that cursor until fresh pose/physical/scene validation can
+            // retire it, and retain action-bound provenance independently.
+            if !j.state.prefixes.contains_key(&id) {
+                j.state.expansion = None;
+            }
             if let Some((actual, false)) = arrival {
                 j.state.position = actual;
                 j.save()?;
@@ -635,6 +716,8 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
         let mut origin: Option<Origin> = None;
         let mut scene = String::new();
         let mut routes = Vec::new();
+        let mut eager = None;
+        let mut expansion_complete = false;
         if let Some(saved) = &j.state.expansion {
             let wait = saved.ready_after_unix_ms.saturating_sub(unix_ms()?);
             // Honor the last page's interval across process boundaries. A
@@ -657,6 +740,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 && (1..=1024).contains(&saved.next_offset)
         });
         if resume.is_none() && j.state.expansion.is_some() {
+            j.state.preview.scene_restarts = j.state.preview.scene_restarts.saturating_add(1);
             j.state.expansion = None;
             j.save()?;
         }
@@ -706,6 +790,11 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                     ));
                 }
                 j.state.preview_waits = j.state.preview_waits.saturating_add(1);
+                if page.busy {
+                    j.state.preview.pending_busy = j.state.preview.pending_busy.saturating_add(1);
+                } else {
+                    j.state.preview.pending_other = j.state.preview.pending_other.saturating_add(1);
+                }
                 j.save()?;
                 tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000)))
                     .await;
@@ -728,31 +817,74 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                     "Invalid route prediction",
                 ));
             }
+            // A validation probe is still a page. Reject contradictory or
+            // nonadvancing pagination before reusing any cached useful edge.
+            let next = if page.complete {
+                if page.next_offset.is_some() {
+                    return Err(error(
+                        ErrorCode::UnsupportedVersion,
+                        "Complete movement preview has a continuation cursor",
+                    ));
+                }
+                None
+            } else {
+                Some(
+                    page.next_offset
+                        .filter(|n| *n > offset && *n <= 1024)
+                        .ok_or_else(|| {
+                            error(
+                                ErrorCode::NotReady,
+                                "Movement option pagination did not advance",
+                            )
+                        })?,
+                )
+            };
             let now = page.origin.expect("Validated ready movement preview");
+            j.state.preview.ready_pages = j.state.preview.ready_pages.saturating_add(1);
             if now.dimension != pose.dimension || distance(now.position, pose.position) > 0.15 {
+                j.state.preview.scene_restarts = j.state.preview.scene_restarts.saturating_add(1);
                 origin = None;
                 j.state.expansion = None;
                 j.save()?;
                 break;
             }
-            if let Some(mut saved) = resume.take()
-                && saved.scene == page.scene
-                && saved.origin.position == now.position
-            {
-                offset = saved.next_offset;
-                scene = saved.scene.clone();
-                origin = Some(saved.origin.clone());
-                routes = saved.routes.clone();
-                saved.ready_after_unix_ms =
-                    unix_ms()?.saturating_add(page.retry_after_ms.clamp(25, 5000));
-                j.state.expansion = Some(saved);
-                j.save()?;
-                tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000)))
-                    .await;
-                continue;
+            if let Some(mut saved) = resume.take() {
+                if !page.complete
+                    && saved.scene == page.scene
+                    && saved.origin.position == now.position
+                {
+                    offset = saved.next_offset;
+                    scene = saved.scene.clone();
+                    origin = Some(saved.origin.clone());
+                    routes = saved.routes.clone();
+                    if options.eager_progress {
+                        let current = current_node(&j.state, &observation, saved.origin.position);
+                        eager = eager_route(
+                            &j.state,
+                            &current,
+                            saved.origin.position,
+                            &saved.scene,
+                            &saved.routes,
+                            options,
+                        );
+                    }
+                    saved.ready_after_unix_ms =
+                        unix_ms()?.saturating_add(page.retry_after_ms.clamp(25, 5000));
+                    j.state.expansion = Some(saved);
+                    j.save()?;
+                    if eager.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000)))
+                        .await;
+                    continue;
+                }
+                j.state.preview.scene_restarts = j.state.preview.scene_restarts.saturating_add(1);
             }
             if let Some(old) = &origin {
                 if distance(old.position, now.position) > 0.01 || scene != page.scene {
+                    j.state.preview.scene_restarts =
+                        j.state.preview.scene_restarts.saturating_add(1);
                     origin = None;
                     j.state.expansion = None;
                     j.save()?;
@@ -761,6 +893,11 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
             } else {
                 scene = page.scene.clone();
                 origin = Some(now);
+            }
+            if options.eager_progress && !page.complete {
+                let p = origin.as_ref().expect("Validated preview origin").position;
+                let current = current_node(&j.state, &observation, p);
+                eager = eager_route(&j.state, &current, p, &scene, &page.options, options);
             }
             for r in page.options {
                 routes.push(r);
@@ -772,17 +909,12 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 ));
             }
             if page.complete {
+                expansion_complete = true;
                 j.state.expansion = None;
                 j.save()?;
                 break;
             }
-            let Some(next) = page.next_offset.filter(|n| *n > offset && *n <= 1024) else {
-                return Err(error(
-                    ErrorCode::NotReady,
-                    "Movement option pagination did not advance",
-                ));
-            };
-            offset = next;
+            offset = next.expect("Validated incomplete page cursor");
             j.state.expansion = Some(Expansion {
                 origin: origin
                     .as_ref()
@@ -795,6 +927,11 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 ready_after_unix_ms: unix_ms()?.saturating_add(page.retry_after_ms.clamp(25, 5000)),
             });
             j.save()?;
+            if eager.is_some() {
+                // Query cooldown still governs further reads. Dispatch has its
+                // own ordinary fresh native admission and durable pending ID.
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(page.retry_after_ms.clamp(25, 5000))).await;
         }
         let Some(origin) = origin else {
@@ -842,11 +979,12 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
             current.clone(),
             Node {
                 position: origin.position,
-                expanded: true,
+                expanded: expansion_complete,
                 edges,
             },
         );
-        let Some(route) = choose(&j.state, &current) else {
+        let was_eager = eager.is_some();
+        let Some(route) = eager.or_else(|| choose(&j.state, &current)) else {
             j.save()?;
             return Ok(j.report("no_known_route","No reachable unexplored frontier remains. Inspect local support, foot space, headroom and goal constraints before selecting another distant target. This is not proof that the world has no route, or permission to change terrain."));
         };
@@ -867,6 +1005,23 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 max_ticks: route.max_ticks,
             },
         };
+        if was_eager {
+            let read = j
+                .state
+                .expansion
+                .as_ref()
+                .ok_or_else(|| local("Eager read provenance missing"))?;
+            j.state.prefixes.insert(
+                request.action_id.clone(),
+                Prefix {
+                    origin: read.origin.clone(),
+                    scene: read.scene.clone(),
+                    next_offset: read.next_offset,
+                    routes_read: read.routes.len(),
+                },
+            );
+            j.state.preview.eager_intentions = j.state.preview.eager_intentions.saturating_add(1);
+        }
         j.state.pending = Some(Attempt {
             request: request.clone(),
             origin: origin.position,
@@ -951,6 +1106,644 @@ mod tests {
             duration_ticks: 10,
             touched_blocks: Vec::new(),
         }
+    }
+    fn eager_options() -> Options {
+        Options {
+            eager_progress: true,
+            max_steps: 1,
+            timeout_ms: 3000,
+            ..Options::default()
+        }
+    }
+    fn eager_page(
+        routes: Vec<Route>,
+        complete: bool,
+        next: Option<usize>,
+        retry: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({"format":"minecraft-movement-options-v1",
+            "origin":{"position":[0.5,1.,0.5],"dimension":"fixture:world"},
+            "scene":"prefix-scene","options":routes,"complete":complete,
+            "next_offset":next,"retry_after_ms":retry})
+    }
+    async fn eager_open(listener: &tokio::net::TcpListener) {
+        respond(listener, "GET /v1/server ", info("instance"), 200).await;
+        for _ in 0..2 {
+            respond(
+                listener,
+                "GET /v1/bots/fixture/observations ",
+                observation([0.5, 1., 0.5]),
+                200,
+            )
+            .await;
+        }
+    }
+    async fn eager_finish(listener: &tokio::net::TcpListener, id: &str, position: [f64; 3]) {
+        respond(
+            listener,
+            &format!("GET /v1/bots/fixture/actions/{id} "),
+            serde_json::json!({"action_id":id,"outcome":"observed","adapter_version":"fixture",
+                "error":null,"evidence":{"native_effect_verified":true,"after":{"player":{
+                    "uuid":"actor","dimension":"fixture:world","position":position}}}}),
+            200,
+        )
+        .await;
+        respond(
+            listener,
+            "GET /v1/bots/fixture/observations ",
+            observation(position),
+            200,
+        )
+        .await;
+    }
+    #[test]
+    fn eager_prefix_requires_new_strict_progress_and_obeys_current_policy() {
+        assert!(!Options::default().eager_progress);
+        assert!(
+            !serde_json::from_str::<Options>("{}")
+                .unwrap()
+                .eager_progress
+        );
+        let root = Temp::new();
+        let p = [0.5, 1., 0.5];
+        let current = key(p);
+        let mut j =
+            Journal::open(&root.0.join("nav.json"), goal(), "instance", "actor", p).unwrap();
+        let mut options = eager_options();
+        options.blocked_blocks = vec!["fixture:denied".into()];
+        let mut denied = route([4.5, 1., 0.5]);
+        denied.touched_blocks = options.blocked_blocks.clone();
+        j.state
+            .blocked
+            .insert(blocked_key(&current, &key([3.5, 1., 0.5]), "prefix-scene"));
+        let routes = vec![
+            route(p),
+            route([-0.5, 1., 0.5]),
+            route([0.5, 1., 1.5]),
+            denied,
+            route([3.5, 1., 0.5]),
+            route([2.5, 1., 0.5]),
+        ];
+        assert_eq!(
+            eager_route(&j.state, &current, p, "prefix-scene", &routes, &options)
+                .unwrap()
+                .target,
+            [2.5, 1., 0.5]
+        );
+        j.state.history.push(serde_json::from_value(serde_json::json!({
+            "request":{"action_id":"already-arrived","action":{"kind":"start_move","target":{"x":2.5,"y":1.,"z":0.5},"jump":false,"max_ticks":60}},
+            "origin":p,"scene":"previous-scene","target":[2.5,1.,0.5],"outcome":"observed",
+            "arrival_verification":{"target_reached":true}})).unwrap());
+        assert!(
+            eager_route(&j.state, &current, p, "prefix-scene", &routes, &options).is_none(),
+            "Returned-to-origin control must not repeatedly select an already arrived frontier"
+        );
+        j.state.nodes.insert(
+            current.clone(),
+            Node {
+                position: p,
+                expanded: false,
+                edges: vec![Edge {
+                    route: route([2.5, 1., 0.5]),
+                    to: key([2.5, 1., 0.5]),
+                }],
+            },
+        );
+        j.state.nodes.insert(
+            key([2.5, 1., 0.5]),
+            Node {
+                position: [2.5, 1., 0.5],
+                expanded: false,
+                edges: vec![],
+            },
+        );
+        assert!(
+            choose(&j.state, &current).is_some(),
+            "Full search must revisit arrived nodes whose preview is unfinished"
+        );
+    }
+    #[tokio::test]
+    async fn eager_dispatch_preserves_partial_provenance_and_never_replays_a_lost_reply() {
+        for lost in [false, true] {
+            let root = Temp::new();
+            let path = root.0.join("nav.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let saved_path = path.clone();
+            let server = tokio::spawn(async move {
+                eager_open(&listener).await;
+                respond(
+                    &listener,
+                    "POST /v1/bots/fixture/observations/query ",
+                    eager_page(vec![route([1.5, 1., 0.5])], false, Some(8), 5000),
+                    200,
+                )
+                .await;
+                // A second page would wait five seconds. The fresh useful edge
+                // must dispatch before that read interval, without polling it.
+                let (stream, value) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    request(&listener, "POST /v1/bots/fixture/actions "),
+                )
+                .await
+                .unwrap();
+                let action: ActionRequest = serde_json::from_value(value).unwrap();
+                let state: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
+                assert_eq!(state["pending"]["request"]["action_id"], action.action_id);
+                assert_eq!(state["expansion"]["next_offset"], 8);
+                assert_eq!(state["prefixes"][&action.action_id]["next_offset"], 8);
+                assert_eq!(state["nodes"][key([0.5, 1., 0.5])]["expanded"], false);
+                if lost {
+                    drop(stream);
+                } else {
+                    reply(stream,serde_json::json!({"action_id":action.action_id,"outcome":"running","adapter_version":"fixture","error":null,"evidence":{}}),200).await;
+                    eager_finish(&listener, &action.action_id, [1.5, 1., 0.5]).await;
+                }
+                (listener, action.action_id)
+            });
+            let result = navigate(&c, goal(), &path, eager_options()).await;
+            let (listener, id) = server.await.unwrap();
+            if lost {
+                assert_eq!(result.unwrap_err().code, ErrorCode::UncertainOutcome);
+                let saved: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["pending"]["request"]["action_id"], id);
+                let server = tokio::spawn(async move {
+                    respond(&listener, "GET /v1/server ", info("instance"), 200).await;
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/observations ",
+                        observation([0.5, 1., 0.5]),
+                        200,
+                    )
+                    .await;
+                    eager_finish(&listener, &id, [1.5, 1., 0.5]).await;
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                            .await
+                            .is_err(),
+                        "Resume reads the original ID, never another POST"
+                    );
+                });
+                let report = navigate(&c, goal(), &path, eager_options()).await.unwrap();
+                server.await.unwrap();
+                assert_eq!(report.actions, 1);
+            } else {
+                assert_eq!(result.unwrap().actions, 1);
+            }
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(saved["pending"].is_null());
+            assert_eq!(saved["preview"]["eager_intentions"], 1);
+            assert_eq!(saved["prefixes"].as_object().unwrap().len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn eager_paused_pages_resume_only_after_validation_and_keep_unread_cursor() {
+        let root = Temp::new();
+        let path = root.0.join("nav.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            eager_open(&listener).await;
+            respond(
+                &listener,
+                "POST /v1/bots/fixture/observations/query ",
+                eager_page(vec![route([0.5, 1., 1.5])], false, Some(8), 500),
+                200,
+            )
+            .await;
+            listener
+        });
+        let first = navigate(
+            &c,
+            goal(),
+            &path,
+            Options {
+                timeout_ms: 100,
+                ..eager_options()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = server.await.unwrap();
+        assert_eq!(first.actions, 0);
+        let server = tokio::spawn(async move {
+            eager_open(&listener).await;
+            let (stream, q) = request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+            assert_eq!(q["input"]["offset"], 0);
+            assert_eq!(q["input"]["limit"], 1);
+            reply(stream, eager_page(vec![], false, Some(1), 25), 200).await;
+            let (stream, q) = request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+            assert_eq!(q["input"]["offset"], 8);
+            reply(
+                stream,
+                eager_page(vec![route([1.5, 1., 0.5])], false, Some(9), 5000),
+                200,
+            )
+            .await;
+            let (stream, value) = tokio::time::timeout(
+                Duration::from_secs(2),
+                request(&listener, "POST /v1/bots/fixture/actions "),
+            )
+            .await
+            .unwrap();
+            let action: ActionRequest = serde_json::from_value(value).unwrap();
+            reply(stream,serde_json::json!({"action_id":action.action_id,"outcome":"running","adapter_version":"fixture","error":null,"evidence":{}}),200).await;
+            eager_finish(&listener, &action.action_id, [1.5, 1., 0.5]).await;
+        });
+        let report = navigate(&c, goal(), &path, eager_options()).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(report.actions, 1);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["expansion"]["next_offset"], 9);
+        assert_eq!(saved["expansion"]["routes"].as_array().unwrap().len(), 2);
+        assert_eq!(saved["nodes"][key([0.5, 1., 0.5])]["expanded"], false);
+    }
+    #[tokio::test]
+    async fn eager_saved_prefix_is_usable_only_after_matching_fresh_validation() {
+        let root = Temp::new();
+        let path = root.0.join("nav.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            eager_open(&listener).await;
+            respond(
+                &listener,
+                "POST /v1/bots/fixture/observations/query ",
+                eager_page(vec![route([1.5, 1., 0.5])], false, Some(8), 500),
+                200,
+            )
+            .await;
+            listener
+        });
+        let first = navigate(
+            &c,
+            goal(),
+            &path,
+            Options {
+                timeout_ms: 100,
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = server.await.unwrap();
+        assert_eq!(first.actions, 0);
+        let server = tokio::spawn(async move {
+            eager_open(&listener).await;
+            let (stream, q) = request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+            assert_eq!(q["input"]["offset"], 0);
+            assert_eq!(q["input"]["limit"], 1);
+            reply(stream, eager_page(vec![], false, Some(1), 5000), 200).await;
+            let (stream, value) = tokio::time::timeout(
+                Duration::from_secs(2),
+                request(&listener, "POST /v1/bots/fixture/actions "),
+            )
+            .await
+            .unwrap();
+            let action: ActionRequest = serde_json::from_value(value).unwrap();
+            reply(stream,serde_json::json!({"action_id":action.action_id,"outcome":"running","adapter_version":"fixture","error":null,"evidence":{}}),200).await;
+            eager_finish(&listener, &action.action_id, [1.5, 1., 0.5]).await;
+        });
+        let report = navigate(&c, goal(), &path, eager_options()).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(report.actions, 1);
+        assert_eq!(report.preview.eager_intentions, 1);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["expansion"]["next_offset"], 8);
+    }
+    #[tokio::test]
+    async fn eager_dead_end_backtracks_to_an_arrived_partial_frontier_then_reads_its_detour() {
+        let root = Temp::new();
+        let path = root.0.join("nav.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let a = [0.5, 1., 0.5];
+        let b = [1.5, 1., 0.5];
+        let end = [2.5, 1., 0.5];
+        let detour = [1.5, 1., 1.5];
+        let server = tokio::spawn(async move {
+            eager_open(&listener).await;
+            let page_at = |p: [f64; 3], routes: Vec<Route>, complete, next| {
+                let mut page = eager_page(routes, complete, next, 25);
+                page["origin"]["position"] = serde_json::json!(p);
+                page["scene"] = serde_json::json!(format!("scene-{p:?}"));
+                page
+            };
+            for (step, origin, target) in [(0, a, b), (1, b, end), (2, end, b), (3, b, detour)] {
+                let (stream, q) =
+                    request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                assert_eq!(q["input"]["offset"], 0);
+                if step == 3 {
+                    // C was genuinely reached, but B's old prefix was never a
+                    // completed graph expansion. Skip C only as an eager edge.
+                    reply(stream, page_at(b, vec![route(end)], false, Some(1)), 200).await;
+                    let (stream, q) =
+                        request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                    assert_eq!(q["input"]["offset"], 1);
+                    reply(stream, page_at(b, vec![route(detour)], true, None), 200).await;
+                } else {
+                    reply(
+                        stream,
+                        page_at(
+                            origin,
+                            vec![route(target)],
+                            step == 2,
+                            if step == 2 { None } else { Some(1) },
+                        ),
+                        200,
+                    )
+                    .await;
+                }
+                let (stream, value) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    request(&listener, "POST /v1/bots/fixture/actions "),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    value["action"]["target"],
+                    serde_json::json!({"x":target[0],"y":target[1],"z":target[2]}),
+                    "A→B→C must return to partial B before taking its later detour"
+                );
+                let action: ActionRequest = serde_json::from_value(value).unwrap();
+                reply(stream,serde_json::json!({"action_id":action.action_id,"outcome":"running","adapter_version":"fixture","error":null,"evidence":{}}),200).await;
+                eager_finish(&listener, &action.action_id, target).await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    max_steps: 4,
+                    ..eager_options()
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(report.actions, 4);
+        assert_eq!(report.preview.eager_intentions, 2);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["nodes"][key(b)]["expanded"], true);
+        assert_eq!(saved["history"][2]["target"], serde_json::json!(b));
+        assert_eq!(saved["history"][3]["target"], serde_json::json!(detour));
+    }
+    #[tokio::test]
+    async fn eager_malformed_validation_page_cannot_dispatch_cached_routes_or_drop_ids() {
+        for (complete, next) in [
+            (false, None),
+            (false, Some(0)),
+            (false, Some(1025)),
+            (true, Some(1)),
+        ] {
+            let root = Temp::new();
+            let path = root.0.join("nav.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                eager_open(&listener).await;
+                respond(
+                    &listener,
+                    "POST /v1/bots/fixture/observations/query ",
+                    eager_page(vec![route([1.5, 1., 0.5])], false, Some(8), 200),
+                    200,
+                )
+                .await;
+                listener
+            });
+            let first = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    timeout_ms: 50,
+                    ..Options::default()
+                },
+            )
+            .await
+            .unwrap();
+            let listener = server.await.unwrap();
+            assert_eq!(first.actions, 0);
+            {
+                let mut j =
+                    Journal::open(&path, goal(), "instance", "actor", [0.5, 1., 0.5]).unwrap();
+                j.state.history.push(serde_json::from_value(serde_json::json!({
+                    "request":{"action_id":"retained-prior-id","action":{"kind":"start_move","target":{"x":0.5,"y":1.,"z":1.5},"jump":false,"max_ticks":60}},
+                    "origin":[0.5,1.,0.5],"scene":"prior","target":[0.5,1.,1.5],"outcome":"cancelled"})).unwrap());
+                j.save().unwrap();
+            }
+            let server = tokio::spawn(async move {
+                eager_open(&listener).await;
+                let (stream, q) =
+                    request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                assert_eq!(q["input"]["limit"], 1);
+                reply(stream, eager_page(vec![], complete, next, 25), 200).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "Malformed fresh validation must stop before any mutation or continuation read"
+                );
+            });
+            let error = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    max_steps: 2,
+                    ..eager_options()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                if complete {
+                    ErrorCode::UnsupportedVersion
+                } else {
+                    ErrorCode::NotReady
+                }
+            );
+            server.await.unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["history"][0]["request"]["action_id"],
+                "retained-prior-id"
+            );
+            assert_eq!(saved["expansion"]["next_offset"], 8);
+            assert!(saved["pending"].is_null());
+            assert_eq!(saved["sequence"], 0);
+        }
+    }
+    #[tokio::test]
+    async fn eager_mode_keeps_full_detour_search_block_policy_and_node_budget() {
+        for case in ["detour", "blocked", "node_budget"] {
+            let root = Temp::new();
+            let path = root.0.join("nav.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                eager_open(&listener).await;
+                let target = if case == "detour" {
+                    [-0.5, 1., 0.5]
+                } else {
+                    [1.5, 1., 0.5]
+                };
+                let mut r = route(target);
+                if case == "blocked" {
+                    r.touched_blocks = vec!["fixture:forbidden".into()];
+                }
+                respond(
+                    &listener,
+                    "POST /v1/bots/fixture/observations/query ",
+                    eager_page(vec![r], false, Some(8), 25),
+                    200,
+                )
+                .await;
+                if case != "node_budget" {
+                    let (stream, q) =
+                        request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                    assert_eq!(
+                        q["input"]["offset"], 8,
+                        "No improving prefix: complete the bounded graph"
+                    );
+                    reply(stream, eager_page(vec![], true, None, 25), 200).await;
+                }
+                if case == "detour" {
+                    let (stream, value) =
+                        request(&listener, "POST /v1/bots/fixture/actions ").await;
+                    let action: ActionRequest = serde_json::from_value(value).unwrap();
+                    assert!(
+                        matches!(action.action,Action::StartMove{target,..} if target.x == -0.5)
+                    );
+                    reply(stream,serde_json::json!({"action_id":action.action_id,"outcome":"running","adapter_version":"fixture","error":null,"evidence":{}}),200).await;
+                    eager_finish(&listener, &action.action_id, target).await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "Budget/policy denial must not dispatch; a detour must stop at the same action budget"
+                );
+            });
+            let report = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    max_nodes: if case == "node_budget" { 1 } else { 1024 },
+                    blocked_blocks: if case == "blocked" {
+                        vec!["fixture:forbidden".into()]
+                    } else {
+                        vec![]
+                    },
+                    ..eager_options()
+                },
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(report.actions, usize::from(case == "detour"));
+            assert_eq!(
+                report.status,
+                if case == "blocked" {
+                    "no_known_route"
+                } else {
+                    "budget_exhausted"
+                }
+            );
+            assert_eq!(report.preview.eager_intentions, 0);
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eager_local_preemption_keeps_prefix_without_claiming_or_replaying_dispatch() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        struct Socket(PathBuf);
+        impl Drop for Socket {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let root = Temp::new();
+        let path = root.0.join("nav.json");
+        // Unix socket paths must fit Darwin's short sun_path independently of
+        // the test runner's potentially long temporary-directory prefix.
+        let socket = Socket(Path::new("/tmp").join(format!(
+            "mc-eager-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        let local = tokio::net::UnixListener::bind(&socket.0).unwrap();
+        fs::set_permissions(&socket.0, fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        c.local_arbiter = Some(socket.0.clone());
+        let server = tokio::spawn(async move {
+            eager_open(&listener).await;
+            respond(
+                &listener,
+                "POST /v1/bots/fixture/observations/query ",
+                eager_page(vec![route([1.5, 1., 0.5])], false, Some(8), 5000),
+                200,
+            )
+            .await;
+            listener
+        });
+        let arbiter = tokio::spawn(async move {
+            let (socket, _) = local.accept().await.unwrap();
+            let mut socket = tokio::io::BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            let request: LocalActionRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.version, LOCAL_CONTROL_VERSION);
+            let response =
+                LocalActionResponse::Error(error(ErrorCode::LocalPreempted, "No gateway dispatch"));
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            socket.get_mut().write_all(&bytes).await.unwrap();
+        });
+        let report = tokio::time::timeout(
+            Duration::from_secs(2),
+            navigate(&c, goal(), &path, eager_options()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        arbiter.await.unwrap();
+        let listener = server.await.unwrap();
+        assert_eq!(report.status, "preempted");
+        assert!(report.pending_action.is_none());
+        assert_eq!(report.preview.eager_intentions, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "Local refusal must produce zero HTTP gameplay POSTs"
+        );
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(state["history"][0]["outcome"], "rejected");
+        assert_eq!(
+            state["history"][0]["arrival_verification"]["gateway_dispatch_attempted"],
+            false
+        );
+        assert_eq!(state["prefixes"].as_object().unwrap().len(), 1);
+        assert_eq!(state["expansion"]["next_offset"], 8);
     }
     #[test]
     fn verified_arrival_drift_expands_the_reached_node_only_in_the_same_life_and_clock() {
@@ -1486,7 +2279,10 @@ mod tests {
     }
     #[tokio::test]
     async fn resumed_previews_reject_changed_scenes_lives_clocks_and_block_policy() {
-        for case in ["scene", "life", "clock", "velocity", "policy"] {
+        for (case, eager_progress) in ["scene", "life", "clock", "velocity", "policy"]
+            .into_iter()
+            .flat_map(|case| [false, true].into_iter().map(move |eager| (case, eager)))
+        {
             let root = Temp::new();
             let path = root.0.join("navigation.json");
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1584,6 +2380,7 @@ mod tests {
                 &path,
                 Options {
                     timeout_ms: 2000,
+                    eager_progress,
                     blocked_blocks: if case == "policy" {
                         vec!["minecraft:stone".into()]
                     } else {

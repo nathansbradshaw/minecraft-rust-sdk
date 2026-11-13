@@ -16,6 +16,7 @@ pub mod memory;
 pub mod model;
 pub mod navigation;
 mod navigation_checkpoint;
+mod navigation_progress;
 pub mod output;
 mod ownership;
 pub mod progress;
@@ -139,7 +140,7 @@ fn conversation_default() -> bool {
     true
 }
 fn model_context_contract(instructions: &str) -> String {
-    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v3/compiler-error-view-v1/bounded-investigation-routing-v2/native-navigation-feedback-v1","navigation_scheduling_contract":"nonblocking-changed-ready-control-pause-v2","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v3/compiler-error-view-v1/bounded-investigation-routing-v2/native-navigation-feedback-v1","navigation_scheduling_contract":"nonblocking-changed-ready-control-pause-v2","navigation_progress_contract":"bounded-gap-soft-diagnosis-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
@@ -1084,6 +1085,21 @@ impl Brain {
                     .map(|h| h.shared.view())
                     .unwrap_or(Value::Null),
             )?;
+            context["navigation_nonprogress"] = match self.journal.navigation_nonprogress_context(
+                &progress::workspace_fingerprint_excluding_state(
+                    &self.cfg.workspace,
+                    &self.cfg.state,
+                )?,
+                &self.journal.get("goal_revision")?.unwrap_or_default(),
+                &self.observed,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.journal.event("navigation_nonprogress_error",json!({"error":error.to_string(),
+                        "execution":"Optional diagnostic context unavailable; reasoning and gameplay remain available"}))?;
+                    Value::Null
+                }
+            };
             context["goal_revision"] =
                 json!(self.journal.get("goal_revision")?.unwrap_or_default());
             context["coding_checkpoint"] = self.journal.navigation_coding_checkpoint(
@@ -1285,6 +1301,16 @@ impl Brain {
                         &requested_revision,
                         &self.observed,
                     )?;
+                    if let Err(error) = self.journal.record_navigation_nonprogress(
+                        value,
+                        &source_after,
+                        &requested_revision,
+                        &self.observed,
+                        active_work,
+                    ) {
+                        self.journal.event("navigation_nonprogress_error",json!({"error":error.to_string(),
+                            "execution":"Gameplay result retained; no new request or halt inferred"}))?;
+                    }
                 }
                 if let Err(error) = self.journal.remember_search(
                     &choice,

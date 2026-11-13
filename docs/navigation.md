@@ -65,6 +65,23 @@ action/node budgets and forbidden runtime block IDs. No block policy is imposed
 by the core helper. Unknown terrain cannot be assumed to be air. No known route
 is a report about the explored graph, not proof that the world has no route.
 
+`Options::eager_progress` is an experimental opt-in, disabled by default. The
+reference brain enables it to reduce idle time between finite controls. A fresh
+partial preview may supply a strictly goal-improving, policy-permitted edge;
+the client may dispatch it before reading every local candidate. Eager shortcuts
+skip already arrived frontiers, including after another controller returns the
+player to an earlier pose. Full bounded graph search can revisit partial nodes
+to finish their unread candidates and find detours. This changes client route
+selection, never ordinary native admission,
+body preemption, goal tolerances or pending-ID reconciliation.
+
+Partial nodes remain unexpanded. The resumable read cursor is retained, and a
+`prefixes` entry binds the origin, scene and unfinished cursor to the exact action
+ID even after moving invalidates that cached expansion. Reports include cumulative
+`preview` counters for ready pages, busy/other pending envelopes, scene restarts
+and eager intentions. An intention can be refused locally before gateway dispatch;
+none of these counters is native movement or retained-goal evidence.
+
 The alpha12 NeoForge integration adds `minecraft:fluid_facts`: versioned native
 fluid tags, occupied height, and known flow for each observed cell, plus the
 character's `eyes_in_water`. The matching Rust predictor changes medium at each
