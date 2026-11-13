@@ -454,6 +454,27 @@ async fn send(client: &Client, j: &Journal, action: Action) -> Result<Receipt> {
     }
     Ok(r)
 }
+fn may_resume_after_danger(
+    observed: &Observation,
+    safe_for: Duration,
+    owned_control: &str,
+    owned_water_control: bool,
+    owned_water_shore: bool,
+) -> bool {
+    let active = &observed.player["control"];
+    let released = active["input_released"] == true
+        && serde_json::from_value::<Outcome>(active["outcome"].clone())
+            .is_ok_and(|outcome| outcome.terminal());
+    // Wall time cannot retire native input: a lagging server may still be
+    // finishing the bank leg after three seconds. Only its own terminal,
+    // released observation completes that handoff. A replacement control or
+    // new life must not inherit an old control's ownership latch.
+    let awaiting_shore_release =
+        owned_water_shore && active["action_id"].as_str() == Some(owned_control) && !released;
+    !awaiting_shore_release
+        && (safe_for > Duration::from_secs(3)
+            || (owned_water_control && geometry::breathing_recovered(observed) && released))
+}
 async fn controller(
     client: Arc<Client>,
     cfg: Config,
@@ -974,11 +995,13 @@ async fn controller(
                 )?;
             }
         } else if shared.urgent()
-            && (safe_since.elapsed() > Duration::from_secs(3)
-                || (owned_water_control
-                    && geometry::breathing_recovered(&observed)
-                    && active["outcome"] != "running"
-                    && active["input_released"] == true))
+            && may_resume_after_danger(
+                &observed,
+                safe_since.elapsed(),
+                &owned_control,
+                owned_water_control,
+                owned_water_shore,
+            )
         {
             if body_sprint {
                 let _guard = shared.mutation.lock().await;

@@ -401,11 +401,27 @@ fn current_node(state: &State, observed: &Observation, position: [f64; 3]) -> St
         && arrival["dimension"] == observed.player["dimension"]
         && arrival["epoch"].as_str().is_some_and(|s| !s.is_empty())
         && arrival["epoch"] == observed.world["sample_clock"]["epoch"]
-        && distance(position, last.target) <= 0.35
+        && (distance(position, last.target) <= 0.35
+            || released_swim_arrival(last, observed, position))
     {
         return key(last.target);
     }
     key(position)
+}
+fn released_swim_arrival(last: &Attempt, observed: &Observation, position: [f64; 3]) -> bool {
+    // A released vertical swim can settle below its verified waypoint before
+    // the next preview. Re-expand from that waypoint using the fresh pose;
+    // otherwise the same short rise is selected forever. This changes graph
+    // identity only, never goal distance or native movement admission.
+    observed.player["in_water"] == true
+        && observed.player["control"]["action_id"] == last.request.action_id
+        && observed.player["control"]["outcome"] == "observed"
+        && observed.player["control"]["input_released"] == true
+        && matches!(last.request.action, Action::StartMove { jump: false, .. })
+        && last.target[1] > last.origin[1]
+        && (last.target[0] - last.origin[0]).hypot(last.target[2] - last.origin[2]) <= 0.15
+        && (position[0] - last.target[0]).hypot(position[2] - last.target[2]) <= 0.15
+        && (position[1] - last.target[1]).abs() <= 0.6
 }
 fn choose(state: &State, start: &str) -> Option<Route> {
     let mut costs: BTreeMap<String, f64> = BTreeMap::from([(start.to_owned(), 0.)]);
@@ -1030,6 +1046,121 @@ mod tests {
                 key(p),
                 "{case} cannot reuse arrival identity"
             );
+        }
+    }
+    #[test]
+    fn a_released_swim_rise_is_not_selected_again_after_vertical_settling() {
+        let root = Temp::new();
+        let position = [0.5, 62., 0.5];
+        let target = [0.5, 62.4888889, 0.5];
+        let mut j = Journal::open(
+            &root.0.join("nav.json"),
+            goal(),
+            "instance",
+            "actor",
+            position,
+        )
+        .unwrap();
+        j.state.history.push(Attempt {
+            request: ActionRequest {
+                action_id: "swim-rise".into(),
+                action: Action::StartMove {
+                    target: Position {
+                        x: target[0],
+                        y: target[1],
+                        z: target[2],
+                    },
+                    jump: false,
+                    max_ticks: 100,
+                },
+            },
+            origin: position,
+            source_node: Some(key(position)),
+            scene: "wet-bank".into(),
+            target,
+            outcome: Some(Outcome::Observed),
+            arrival_verification: Some(serde_json::json!({"target_reached":true,
+                "native_after_position":[0.5,62.52,0.5],"entity_id":1,
+                "dimension":"fixture:world","epoch":"clock-a"})),
+        });
+        let mut o: Observation = serde_json::from_value(observation(position)).unwrap();
+        o.player["entity_id"] = serde_json::json!(1);
+        o.player["in_water"] = serde_json::json!(true);
+        o.player["control"] = serde_json::json!({"action_id":"swim-rise",
+            "outcome":"observed","input_released":true});
+        o.world["sample_clock"] = serde_json::json!({"epoch":"clock-a"});
+        assert_eq!(current_node(&j.state, &o, position), key(target));
+        let next = [1.5, 63., 0.5];
+        j.state.nodes.insert(
+            key(target),
+            Node {
+                position,
+                expanded: true,
+                edges: vec![Edge {
+                    route: route(next),
+                    to: key(next),
+                }],
+            },
+        );
+        j.state.nodes.insert(
+            key(next),
+            Node {
+                position: next,
+                expanded: false,
+                edges: vec![],
+            },
+        );
+        assert_eq!(
+            choose(&j.state, &current_node(&j.state, &o, position))
+                .unwrap()
+                .target,
+            next
+        );
+        for case in [
+            "dry",
+            "missing_water",
+            "different_control",
+            "running",
+            "unreleased",
+            "different_life",
+            "clock",
+            "unverified",
+            "cancelled",
+            "far_vertical",
+            "far_horizontal",
+        ] {
+            let mut changed = o.clone();
+            let mut p = position;
+            let mut state: State =
+                serde_json::from_value(serde_json::to_value(&j.state).unwrap()).unwrap();
+            match case {
+                "dry" => changed.player["in_water"] = serde_json::json!(false),
+                "missing_water" => changed
+                    .player
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("in_water")
+                    .map(|_| ())
+                    .unwrap(),
+                "different_control" => {
+                    changed.player["control"]["action_id"] = serde_json::json!("other")
+                }
+                "running" => changed.player["control"]["outcome"] = serde_json::json!("running"),
+                "unreleased" => {
+                    changed.player["control"]["input_released"] = serde_json::json!(false)
+                }
+                "different_life" => changed.player["entity_id"] = serde_json::json!(2),
+                "clock" => changed.world["sample_clock"]["epoch"] = serde_json::json!("clock-b"),
+                "unverified" => {
+                    state.history[0].arrival_verification.as_mut().unwrap()["target_reached"] =
+                        serde_json::json!(false)
+                }
+                "cancelled" => state.history[0].outcome = Some(Outcome::Cancelled),
+                "far_vertical" => p[1] = 61.8,
+                "far_horizontal" => p[0] = 0.7,
+                _ => unreachable!(),
+            }
+            assert_eq!(current_node(&state, &changed, p), key(p), "{case}");
         }
     }
     async fn respond(

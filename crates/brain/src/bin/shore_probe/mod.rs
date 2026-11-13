@@ -3,7 +3,7 @@ use minecraft_sdk::{Observation, navigation::Goal};
 use minecraft_sdk_brain::{Brain, Result, ensure, private_read, tools};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +172,100 @@ impl Monitor {
     }
 }
 
+fn bounded_text(value: &Value, limit: usize) -> Value {
+    value
+        .as_str()
+        .map(|s| Value::String(s.chars().take(limit).collect()))
+        .unwrap_or(Value::Null)
+}
+fn navigation_error(result: &Value) -> Value {
+    let error = [
+        &result["navigation"]["error"],
+        &result["navigation_result_error"],
+        &result["error"],
+        &result["output_files"]["error"],
+        &result["local_action_feedback"]["error"],
+    ]
+    .into_iter()
+    .find(|v| !v.is_null())
+    .or_else(|| {
+        result["local_action_feedback"]["requests"]
+            .as_array()?
+            .iter()
+            .flat_map(|r| [&r["response"]["error"], &r["status_refresh_error"]])
+            .find(|v| !v.is_null())
+    });
+    match error {
+        Some(error) => json!({"code":bounded_text(&error["code"],96),
+            "message":bounded_text(if error.is_string(){error}else{&error["message"]},512)}),
+        None => Value::Null,
+    }
+}
+fn expected_handoff(result: &Value) -> bool {
+    result["navigation_slice"]["format"] == "navigation-slice-v1"
+        && result["navigation_slice"]["paused_for_control"] == true
+        && result["navigation"]["report"]["status"] == "preempted"
+        && result["navigation"]["report"]
+            .get("pending_action")
+            .is_some_and(Value::is_null)
+        && result["exit_code"] == 0
+        && result["timed_out"] == false
+        && result["navigation"]["error"].is_null()
+        && result["navigation_result_error"].is_null()
+        && result["error"].is_null()
+        && result["output_files"]["error"].is_null()
+        && result["local_action_feedback"]["error"].is_null()
+        && result["local_action_feedback"]["requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|row| {
+                let error = &row["response"]["error"];
+                (error.is_null() || error["code"] == "local_preempted")
+                    && row["status_refresh_error"].is_null()
+                    && !matches!(
+                        row["response"]["outcome"].as_str(),
+                        Some("rejected" | "uncertain" | "failed" | "expired")
+                    )
+            })
+}
+fn navigation_ready(observation: &Observation, body: &Value, after: Option<(&str, u64)>) -> bool {
+    let control = &observation.player["control"];
+    let changed = after.is_none_or(|(revision, scheduling)| {
+        observation.revision != revision
+            && body["scheduling_revision"]
+                .as_u64()
+                .is_some_and(|now| now != scheduling)
+    });
+    changed
+        && body["running"] == true
+        && body["emergency"] == false
+        && (control.is_null()
+            || matches!(
+                control["outcome"].as_str(),
+                Some("observed" | "cancelled" | "failed" | "rejected" | "expired" | "idle")
+            ))
+        && control["input_released"] != false
+}
+async fn wait_navigation_ready(
+    shared: &minecraft_sdk_brain::body::Shared,
+    after: Option<(&str, u64)>,
+) -> Result<(Observation, u64)> {
+    // This future owns no worker or mutation. The outer probe deadline/cancel
+    // drops it immediately; an unchanged handoff cannot busy-loop or dispatch.
+    loop {
+        let observation = shared.wait_fresh().await?;
+        let body = shared.view();
+        if navigation_ready(&observation, &body, after) {
+            let revision = body["scheduling_revision"]
+                .as_u64()
+                .ok_or("Native body scheduling revision missing")?;
+            return Ok((observation, revision));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn workload(brain: &mut Brain, spec: &Spec) -> Result<Value> {
     match spec.workload {
         Workload::Blocked => std::future::pending().await,
@@ -184,18 +278,48 @@ async fn workload(brain: &mut Brain, spec: &Spec) -> Result<Value> {
         }
         Workload::Navigate => {
             let goal = serde_json::to_string(spec.goal.as_ref().ok_or("Navigation goal missing")?)?;
+            let shared: Arc<_> = brain.body.as_ref().ok_or("Body missing")?.shared.clone();
+            let mut paused: Option<(String, u64)> = None;
             loop {
+                let (observation, scheduling) = wait_navigation_ready(
+                    &shared,
+                    paused
+                        .as_ref()
+                        .map(|(revision, scheduling)| (revision.as_str(), *scheduling)),
+                )
+                .await?;
+                let revision = observation.revision.clone();
+                brain.observed = observation;
                 let result = minecraft_sdk_brain::navigation::execute(brain, &goal).await?;
                 let status = result["navigation"]["report"]["status"]
                     .as_str()
                     .unwrap_or("error");
+                let error = navigation_error(&result);
+                let message = bounded_text(&result["navigation"]["report"]["note"], 512);
                 println!(
                     "{}",
-                    json!({"event":"shore_probe_navigation","status":status,"report":result["navigation"]["report"],"position_before":result["position_before"],"position_after":result["position_after"],"models_called":0})
+                    json!({"event":"shore_probe_navigation","status":status,"report":result["navigation"]["report"],"error":error,"message":message,"position_before":result["position_before"],"position_after":result["position_after"],"models_called":0})
                 );
-                if status != "budget_exhausted" {
-                    return Ok(json!({"kind":"navigate","status":status}));
+                if expected_handoff(&result) {
+                    paused = Some((revision, scheduling));
+                    println!(
+                        "{}",
+                        json!({"event":"shore_probe_handoff","scheduling_revision":scheduling,"resume_condition":"Changed body scheduling revision, fresh native observation and released ready control","models_called":0})
+                    );
+                    continue;
                 }
+                paused = None;
+                if status != "budget_exhausted"
+                    || result["navigation_slice"]["can_resume"] != true
+                    || !error.is_null()
+                {
+                    return Ok(
+                        json!({"kind":"navigate","status":status,"error":error,"message":message,
+                        "success":result["success"],
+                        "exit_code":result["exit_code"],"timed_out":result["timed_out"]}),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
     }
@@ -236,16 +360,16 @@ pub async fn run(brain: &mut Brain, spec: &Spec, seconds: u64) -> Result<()> {
                     let work_ready=match spec.workload {
                         Workload::Blocked=>true,
                         Workload::Compile=>work_result.as_ref().is_some_and(|r:&Value|r["success"]==true),
-                        Workload::Navigate=>work_result.as_ref().is_some_and(|r:&Value|r["status"]=="reached"),
+                        Workload::Navigate=>work_result.as_ref().is_some_and(|r:&Value|r["status"]=="reached"&&r["success"]==true),
                     };
                     if monitor.dry_count>=spec.dry_samples && work_ready {break "dry_ground_observed";}
                 }
             }
             result=&mut work,if work_result.is_none()=> {
-                let result=result.unwrap_or_else(|error|json!({"kind":"tool_error","error":error.to_string()}));
+                let result=result.unwrap_or_else(|error|json!({"kind":"tool_error","error":{"code":"probe_tool_error","message":error.to_string().chars().take(512).collect::<String>()}}));
                 println!("{}",json!({"event":"shore_probe_workload","result":result}));
                 let failed=matches!(spec.workload,Workload::Compile) && result["success"]!=true
-                    || matches!(spec.workload,Workload::Navigate) && result["status"]!="reached";
+                    || matches!(spec.workload,Workload::Navigate) && (result["status"]!="reached"||result["success"]!=true);
                 work_result=Some(result);
                 if failed {break "workload_failed";}
             }
@@ -278,6 +402,104 @@ mod tests {
             world: json!({"game_time":tick,"sample_clock":{"epoch":"epoch"}}),
             menu: json!({}),
         }
+    }
+    #[test]
+    fn handoff_wait_requires_changed_scheduling_fresh_native_state_and_released_control() {
+        let mut o = observation(10, [0., 1., 0.], true, false);
+        let mut body = json!({"running":true,"emergency":false,"scheduling_revision":2});
+        assert!(navigation_ready(&o, &body, None));
+        assert!(
+            !navigation_ready(&o, &body, Some(("10", 0))),
+            "Same native sample"
+        );
+        assert!(
+            !navigation_ready(&o, &body, Some(("9", 2))),
+            "Same scheduling revision"
+        );
+        assert!(
+            navigation_ready(&o, &body, Some(("9", 0))),
+            "An entire emergency cycle during navigation still counts"
+        );
+        body["emergency"] = json!(true);
+        assert!(!navigation_ready(&o, &body, None));
+        assert!(!navigation_ready(&o, &body, Some(("9", 0))));
+        body["emergency"] = json!(false);
+        o.player["control"] = json!({"outcome":"running","input_released":false});
+        assert!(!navigation_ready(&o, &body, Some(("9", 0))));
+        o.player["control"] = json!({"outcome":"cancelled","input_released":false});
+        assert!(!navigation_ready(&o, &body, Some(("9", 0))));
+        o.player["control"]["input_released"] = json!(true);
+        assert!(navigation_ready(&o, &body, Some(("9", 0))));
+        body["running"] = json!(false);
+        assert!(!navigation_ready(&o, &body, Some(("9", 0))));
+    }
+    fn handoff() -> Value {
+        json!({"navigation_slice":{"format":"navigation-slice-v1","paused_for_control":true},
+            "navigation":{"report":{"status":"preempted","pending_action":null}},
+            "exit_code":0,"timed_out":false,
+            "local_action_feedback":{"requests":[{"response":{"error":{"code":"local_preempted"}}}]}})
+    }
+    #[test]
+    fn only_a_clean_known_preemption_is_resumable() {
+        let clean = handoff();
+        assert!(expected_handoff(&clean));
+        for pointer in [
+            "/navigation/report/pending_action",
+            "/navigation/error",
+            "/error",
+            "/output_files/error",
+            "/local_action_feedback/error",
+            "/local_action_feedback/requests/0/status_refresh_error",
+        ] {
+            let mut result = clean.clone();
+            // Existing JSON fields are addressed explicitly, so missing fields
+            // must first be inserted through their owning objects.
+            match pointer {
+                "/navigation/report/pending_action" => {
+                    result["navigation"]["report"]["pending_action"] = json!("existing-id")
+                }
+                "/navigation/error" => result["navigation"]["error"] = json!({"code":"conflict"}),
+                "/error" => result["error"] = json!("worker failed"),
+                "/output_files/error" => result["output_files"] = json!({"error":"missing"}),
+                "/local_action_feedback/error" => {
+                    result["local_action_feedback"]["error"] = json!("missing")
+                }
+                _ => {
+                    result["local_action_feedback"]["requests"][0]["status_refresh_error"] =
+                        json!("unavailable")
+                }
+            }
+            assert!(!expected_handoff(&result), "{pointer}");
+        }
+        let mut result = clean.clone();
+        result["timed_out"] = json!(true);
+        assert!(!expected_handoff(&result));
+        result = clean.clone();
+        result["exit_code"] = json!(1);
+        assert!(!expected_handoff(&result));
+        for outcome in ["uncertain", "rejected", "failed", "expired"] {
+            result = clean.clone();
+            result["local_action_feedback"]["requests"][0]["response"]["outcome"] = json!(outcome);
+            assert!(!expected_handoff(&result));
+        }
+    }
+    #[test]
+    fn error_summary_keeps_bounded_utf8_native_code_and_message() {
+        let result = json!({"navigation":{"error":{"code":"not_ready","message":"é".repeat(700)}}});
+        let error = navigation_error(&result);
+        assert_eq!(error["code"], "not_ready");
+        assert_eq!(error["message"].as_str().unwrap().chars().count(), 512);
+        assert_eq!(
+            navigation_error(&json!({"navigation_result_error":"File missing"}))["message"],
+            "File missing"
+        );
+        assert_eq!(
+            navigation_error(
+                &json!({"local_action_feedback":{"requests":[{"response":{"error":{"code":"conflict","message":"denied"}}}]}})
+            )["code"],
+            "conflict"
+        );
+        assert!(navigation_error(&json!({})).is_null());
     }
     #[test]
     fn repeated_native_frame_and_vertical_bobbing_do_not_hide_stationary_failure() {

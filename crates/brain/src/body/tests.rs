@@ -1,5 +1,91 @@
 use super::*;
 
+#[test]
+fn shore_handoff_requires_terminal_native_release_despite_elapsed_wall_time() {
+    let mut observed = Observation {
+        revision: "same-native-sample".into(),
+        menu: Value::Null,
+        world: json!({"game_time":10}),
+        player: json!({"eyes_in_water":false,"air":300,"max_air":300,
+            "control":{"action_id":"owned-shore","outcome":"running","input_released":false}}),
+    };
+    for outcome in ["prepared", "dispatched", "running", "uncertain", "unknown"] {
+        for release in [Value::Null, json!(false), json!(true)] {
+            observed.player["control"]["outcome"] = json!(outcome);
+            observed.player["control"]["input_released"] = release;
+            assert!(
+                !may_resume_after_danger(
+                    &observed,
+                    Duration::from_secs(30),
+                    "owned-shore",
+                    true,
+                    true,
+                ),
+                "A wall timer or release flag alone cannot retire {outcome} native input"
+            );
+        }
+    }
+    for outcome in ["observed", "cancelled", "expired", "failed", "reconciled"] {
+        observed.player["control"]["outcome"] = json!(outcome);
+        for release in [Value::Null, json!(false)] {
+            observed.player["control"]["input_released"] = release;
+            assert!(!may_resume_after_danger(
+                &observed,
+                Duration::from_secs(30),
+                "owned-shore",
+                true,
+                true,
+            ));
+        }
+        observed.player["control"]["input_released"] = json!(true);
+        assert!(may_resume_after_danger(
+            &observed,
+            Duration::from_millis(50),
+            "owned-shore",
+            true,
+            true,
+        ));
+        assert!(
+            may_resume_after_danger(
+                &observed,
+                Duration::from_millis(50),
+                "owned-shore",
+                true,
+                false,
+            ),
+            "Proven breathing-only release still hands off immediately"
+        );
+    }
+    observed.player["control"] = json!({"action_id":"replacement","outcome":"running"});
+    assert!(
+        may_resume_after_danger(
+            &observed,
+            Duration::from_secs(30),
+            "owned-shore",
+            true,
+            true,
+        ),
+        "Replacement controls do not inherit old shore ownership"
+    );
+    assert!(
+        may_resume_after_danger(
+            &observed,
+            Duration::from_secs(30),
+            "replacement",
+            false,
+            false,
+        ),
+        "Ordinary non-water timer behavior is unchanged"
+    );
+    assert!(!may_resume_after_danger(
+        &observed,
+        Duration::from_secs(3),
+        "replacement",
+        false,
+        false,
+    ));
+}
+
 #[tokio::test]
 async fn recovered_breathing_releases_owned_input_once_and_yields_after_native_release() {
     // Transport/lifecycle fixture, not evidence of real swimming. Keep the
