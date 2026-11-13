@@ -32,6 +32,9 @@ pub(super) struct Required {
     rejected_basis: Option<String>,
 }
 impl Required {
+    pub fn for_threat(&mut self, o: &Observation, threatened: bool, water_emergency: bool) -> bool {
+        self.active(o) && threatened && !water_emergency && o.player["on_ground"] == true
+    }
     pub fn active(&mut self, o: &Observation) -> bool {
         if self
             .rejected_basis
@@ -369,6 +372,20 @@ mod tests {
             minecraft_sdk::ErrorCode::UnsupportedCapability,
             "rejected-move",
         );
+        let mut unrelated = Required::default();
+        unrelated.movement_rejected(&o, &refusal);
+        let mut burning = o.clone();
+        burning.world["entities"] = json!([]);
+        burning.player["fire_ticks"] = json!(20);
+        assert!(
+            !unrelated.for_threat(&burning, false, false),
+            "old rejection must not suppress unrelated fire recovery without a threat"
+        );
+        assert!(
+            !unrelated.for_threat(&o, true, true),
+            "breathing recovery retains immediate authority"
+        );
+        assert!(unrelated.for_threat(&o, true, false));
         for (pointer, value) in [
             ("/player/uuid", json!("other")),
             ("/player/life_id", json!("new-life")),

@@ -736,10 +736,7 @@ async fn controller(
                 .into_iter()
                 .flatten()
                 .any(|e| e["visible"] == true && geometry::primed_blast(e).is_some());
-        let require_native = native_required.active(&observed)
-            && threatened
-            && !water_emergency
-            && observed.player["on_ground"] == true;
+        let require_native = native_required.for_threat(&observed, threatened, water_emergency);
         let discover = (require_native || (stalled && !urgent))
             && threatened
             && observed.player["on_ground"] == true
@@ -853,14 +850,8 @@ async fn controller(
                 cancelled_item_use = id.into();
                 j.event("body_preempted_item_use",json!({"action_id":id,"cancel_action_id":receipt.action_id,"outcome":receipt.outcome,"reason":"release held input before urgent survival work","replayed":false}))?;
             }
-            let toward_threat = nearby.is_some_and(|(enemy, d)| {
-                d < 5.
-                    && geometry::point(&active["target"])
-                        .zip(geometry::point(&enemy["position"]))
-                        .is_some_and(|(t, e)| {
-                            (0..3).map(|i| (t[i] - e[i]).powi(2)).sum::<f64>() < d * d
-                        })
-            });
+            let toward_threat = geometry::point(&active["target"])
+                .is_some_and(|target| geometry::toward_close_threat(&observed, target));
             let toward_heard_blast = geometry::point(&active["target"]).is_some_and(|target| {
                 heard_blasts.iter().any(|(origin, _)| {
                     (0..3).map(|i| (target[i] - origin[i]).powi(2)).sum::<f64>()
