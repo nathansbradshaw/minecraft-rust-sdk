@@ -1683,6 +1683,12 @@ fn dispatch(
                 {
                     job.acknowledge_reconciliation(action_id);
                 }
+                if let Some(job) = players
+                    .get(&request.bot_id)
+                    .and_then(|p| p.control.as_ref())
+                {
+                    job.acknowledge_reconciliation(action_id);
+                }
                 Ok(AdapterResponse::Receipt(Receipt {
                     action_id: action_id.clone(),
                     outcome: Outcome::Reconciled,
