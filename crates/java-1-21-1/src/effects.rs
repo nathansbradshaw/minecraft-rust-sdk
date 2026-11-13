@@ -118,8 +118,10 @@ fn same_lane(before: &Observation, after: &Observation) -> bool {
     later
         && before.player["uuid"].is_string()
         && before.player["uuid"] == after.player["uuid"]
-        // Character UUID survives respawn; its player entity does not. Losing
-        // inventory on death is not evidence that an old item use succeeded.
+        // Minecraft 1.21.1 reuses the connection AND numeric entity ID on
+        // respawn. Only a native per-player-object life token fences the loss
+        // of inventory from an old item-use intention.
+        && same_life(before, after)
         && before.player["entity_id"].as_i64().is_some()
         && before.player["entity_id"] == after.player["entity_id"]
         && before.player["dimension"].is_string()
@@ -571,7 +573,7 @@ mod tests {
     fn observation() -> Observation {
         Observation {
             revision: "1".into(),
-            player: json!({"uuid":"own","entity_id":17,"dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
+            player: json!({"uuid":"own","life_id":"life-1","entity_id":17,"dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
             world: json!({"game_time":1,"sample_clock":{"epoch":"clock","nanos":"1"},"entities":[{"entity_id":7,"uuid":"target","health":20.}]}),
             menu: json!({"menu_id":0}),
         }
@@ -591,12 +593,14 @@ mod tests {
             proof(&action, &before, &after, None).is_some(),
             "ordinary same-life held-stack change remains observable"
         );
-        after.player["entity_id"] = json!(18);
+        // Ordinary respawn retains entity ID 17, the UUID, connection and
+        // connection-scoped event history; do not invent a new numeric ID.
+        after.player["life_id"] = json!("life-2");
         assert!(
             proof(&action, &before, &after, None).is_none(),
             "death inventory loss cannot certify an old item-use intention"
         );
-        after.player["entity_id"] = Value::Null;
+        after.player["life_id"] = Value::Null;
         assert!(
             proof(&action, &before, &after, None).is_none(),
             "unknown life binding is not same-life evidence"

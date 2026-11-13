@@ -48,7 +48,11 @@ final class NativeObservation {
     }
     static Object snapshot(MinecraftServer server,ServerPlayer player){
         if(!server.isSameThread())throw new IllegalStateException("Main server thread required");
-        var sampleClock=Map.of("epoch",CLOCK_EPOCH,"nanos",Long.toUnsignedString(System.nanoTime()));
+        var life=LifeEpochs.of(player.connection.getConnection(),player);
+        // Clock comparisons are valid within one native player life. A new
+        // life invalidates cached physics, menus, targets and old effect proofs
+        // even when a client never observed the brief dead interval.
+        var sampleClock=Map.of("epoch",CLOCK_EPOCH+":"+life,"nanos",Long.toUnsignedString(System.nanoTime()));
         var world=player.serverLevel();var origin=player.blockPosition();var menu=player.containerMenu;
         var inventory=new ArrayList<Map<String,Object>>();
         for(int i=0;i<player.getInventory().getContainerSize();i++){var row=new LinkedHashMap<>(stack(player.getInventory().getItem(i),player));row.put("slot",i);inventory.add(row);}
@@ -93,7 +97,7 @@ final class NativeObservation {
             entities.add(row);
         }
         var own=new LinkedHashMap<String,Object>();own.put("uuid",player.getUUID().toString());own.put("name",player.getGameProfile().getName());own.put("entity_id",player.getId());own.put("dimension",world.dimension().location().toString());own.put("position",List.of(player.getX(),player.getY(),player.getZ()));own.put("yaw",player.getYRot());own.put("pitch",player.getXRot());own.put("on_ground",player.onGround());own.put("sprinting",player.isSprinting());own.put("sneaking",player.isShiftKeyDown());own.put("health",player.getHealth());own.put("food",player.getFoodData().getFoodLevel());own.put("inventory",inventory);own.put("selected",player.getInventory().selected);
-        own.put("native_action_effects",NativeEffects.snapshot(player));
+        own.put("life_id",life);own.put("native_action_effects",NativeEffects.snapshot(player));
         own.put("saturation",player.getFoodData().getSaturationLevel());own.put("air",player.getAirSupply());own.put("max_air",player.getMaxAirSupply());own.put("fire_ticks",player.getRemainingFireTicks());
         own.put("in_water",player.isInWater());own.put("eyes_in_water",player.isEyeInFluid(FluidTags.WATER));own.put("in_lava",player.isInLava());own.put("fall_distance",player.fallDistance);own.put("using_item",player.isUsingItem());
         own.put("use_item",stack(player.getUseItem(),player));own.put("remaining_use_ticks",player.getUseItemRemainingTicks());own.put("attack_strength",player.getAttackStrengthScale(0.5f));

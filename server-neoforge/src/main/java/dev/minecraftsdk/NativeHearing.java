@@ -15,11 +15,11 @@ public final class NativeHearing {
     private static final AtomicInteger deferred=new AtomicInteger();
     private static final Map<Connection,Inbox> inboxes=new WeakHashMap<>();
     private static final class Inbox {
-        String epoch=UUID.randomUUID().toString(),dimension="";long sequence,dropped,lastTick=Long.MIN_VALUE;int bytes;
+        String epoch=UUID.randomUUID().toString(),dimension="",life="";long sequence,dropped,lastTick=Long.MIN_VALUE;int bytes;
         final ArrayDeque<Map<String,Object>> rows=new ArrayDeque<>();
-        void scope(String next,long tick){
-            if(!dimension.equals(next)||tick<lastTick||sequence==Long.MAX_VALUE){
-                epoch=UUID.randomUUID().toString();dimension=next;sequence=0;dropped=0;bytes=0;rows.clear();
+        void scope(String nextLife,String next,long tick){
+            if(!life.equals(nextLife)||!dimension.equals(next)||tick<lastTick||sequence==Long.MAX_VALUE){
+                epoch=UUID.randomUUID().toString();life=nextLife;dimension=next;sequence=0;dropped=0;bytes=0;rows.clear();
             }
             lastTick=tick;
             while(!rows.isEmpty()&&tick-(long)rows.peekFirst().get("game_time")>RETENTION_TICKS){bytes-=rows.removeFirst().toString().length()*2;}
@@ -36,7 +36,7 @@ public final class NativeHearing {
         if(!server.isSameThread()){
             if(deferred.incrementAndGet()>64){deferred.decrementAndGet();drop(connection);return;}
             try{server.execute(()->{try{
-                if(SdkService.active==service&&service.owns(connection,player.getUUID())
+                if(SdkService.active==service&&service.owns(player)
                     &&player.connection!=null&&player.connection.getConnection()==connection&&player.level().dimension().equals(dimension))capture(player,connection,packet);
             }finally{deferred.decrementAndGet();}});}catch(RuntimeException ignored){deferred.decrementAndGet();drop(connection);}
         }else capture(player,connection,packet);
@@ -71,7 +71,7 @@ public final class NativeHearing {
             row.put("game_time",player.serverLevel().getGameTime());row.put("volume",volume);row.put("pitch",pitch);
             row.put("delivery",delivery);row.put("server_range",range);row.put("distance_at_delivery",distance);
             synchronized(inboxes){var box=inboxes.computeIfAbsent(connection,key->new Inbox());
-                box.scope(player.level().dimension().location().toString(),player.serverLevel().getGameTime());
+                box.scope(LifeEpochs.of(connection,player),player.level().dimension().location().toString(),player.serverLevel().getGameTime());
                 row.put("sequence",++box.sequence);box.rows.addLast(row);box.bytes+=row.toString().length()*2;
                 while(box.rows.size()>MAX_ROWS||box.bytes>MAX_BYTES){box.bytes-=box.rows.removeFirst().toString().length()*2;box.dropped++;}
             }
@@ -80,7 +80,7 @@ public final class NativeHearing {
     static Map<String,Object> snapshot(ServerPlayer player){
         if(!player.getServer().isSameThread())throw new IllegalStateException("Main server thread required");
         synchronized(inboxes){var box=inboxes.computeIfAbsent(player.connection.getConnection(),key->new Inbox());
-            long tick=player.serverLevel().getGameTime();box.scope(player.level().dimension().location().toString(),tick);
+            long tick=player.serverLevel().getGameTime();box.scope(LifeEpochs.of(player.connection.getConnection(),player),player.level().dimension().location().toString(),tick);
             var result=new LinkedHashMap<String,Object>();result.put("format","minecraft-sdk-auditory-v1");result.put("epoch",box.epoch);
             result.put("listener_uuid",player.getUUID().toString());result.put("dimension",box.dimension);result.put("sample_game_time",tick);
             result.put("latest_sequence",box.sequence);result.put("dropped",box.dropped);result.put("retention_ticks",RETENTION_TICKS);

@@ -1062,12 +1062,16 @@ fn main() -> AnyResult<()> {
         || !discovery["native_observation_features"]
             .as_array()
             .is_some_and(|v| {
-                ["minecraft:physics_facts", "minecraft:native_action_effects"]
-                    .iter()
-                    .all(|required| v.iter().any(|c| c == required))
+                [
+                    "minecraft:physics_facts",
+                    "minecraft:native_action_effects",
+                    "minecraft:life_identity",
+                ]
+                .iter()
+                .all(|required| v.iter().any(|c| c == required))
             })
     {
-        return Err("Unsupported native integration: alpha.10 physics and native action effects are required".into());
+        return Err("Unsupported native integration: physics, native action effects and minecraft:life_identity are required".into());
     }
     let mut players: HashMap<String, Player> = HashMap::new();
     let mut identities: HashMap<String, (String, String, String)> = HashMap::new();
@@ -1667,6 +1671,7 @@ fn dispatch(
                 }
                 if first.player["uuid"] != request.player_uuid
                     || second.player["uuid"] != request.player_uuid
+                    || !same_life(&first, &second)
                     || !first.player["dimension"].is_string()
                     || first.player["dimension"] != second.player["dimension"]
                     || first.player["using_item"] != second.player["using_item"]
@@ -1698,7 +1703,18 @@ fn dispatch(
         Err(error) => AdapterResponse::Error(error),
     }
 }
+fn same_life(before: &Observation, after: &Observation) -> bool {
+    before.player["uuid"].is_string()
+        && before.player["uuid"] == after.player["uuid"]
+        && before.player["life_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+        && before.player["life_id"] == after.player["life_id"]
+}
 fn verified_effect(action: &Action, before: &Observation, after: &Observation) -> bool {
+    if !matches!(action, Action::Respawn) && !same_life(before, after) {
+        return false;
+    }
     match action {
         Action::Move { target, .. } | Action::MotionFrame { target } => {
             position(after).is_ok_and(|p| {
@@ -1721,6 +1737,15 @@ fn verified_effect(action: &Action, before: &Observation, after: &Observation) -
         Action::Respawn => {
             before.player["health"].as_f64().is_some_and(|h| h <= 0.)
                 && after.player["health"].as_f64().is_some_and(|h| h > 0.)
+                && before.player["uuid"].is_string()
+                && before.player["uuid"] == after.player["uuid"]
+                && before.player["life_id"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                && after.player["life_id"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                && before.player["life_id"] != after.player["life_id"]
         }
         Action::Dig { block, stage, .. } => {
             let p = json!([block.x, block.y, block.z]);
@@ -1869,6 +1894,39 @@ fn compact(action: &Action, o: &Observation) -> Value {
 #[cfg(test)]
 mod movement_tests {
     use super::*;
+    #[test]
+    fn respawn_requires_same_character_and_new_native_life_not_a_new_entity_id() {
+        let before = Observation {
+            revision: "dead".into(),
+            player: json!({"uuid":"character","entity_id":17,"life_id":"old-life","health":0.}),
+            world: Value::Null,
+            menu: Value::Null,
+        };
+        let mut after = before.clone();
+        after.player["health"] = json!(20.);
+        assert!(
+            !verified_effect(&Action::Respawn, &before, &after),
+            "healing alone is not respawn evidence"
+        );
+        after.player["life_id"] = json!("new-life");
+        assert!(
+            verified_effect(&Action::Respawn, &before, &after),
+            "ordinary respawn reuses numeric entity ID"
+        );
+        after.player["selected"] = json!(0);
+        assert!(
+            !verified_effect(&Action::SelectSlot { slot: 0 }, &before, &after),
+            "a new life's default selected slot cannot certify the old life's action"
+        );
+        after.player["uuid"] = json!("other");
+        assert!(!verified_effect(&Action::Respawn, &before, &after));
+        after.player["uuid"] = json!("character");
+        after.player["life_id"] = Value::Null;
+        assert!(
+            !verified_effect(&Action::Respawn, &before, &after),
+            "old providers cannot silently certify a life change"
+        );
+    }
     #[test]
     fn correction_reports_authorized_absolute_position_and_observed_support() {
         let mut packet = Vec::new();

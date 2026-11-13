@@ -17,3 +17,15 @@ tasks.named('processResources') {
     filesMatching('META-INF/neoforge.mods.toml') { expand(mod_version:project.version) }
 }
 tasks.named('jar') { from('../LICENSE') }
+sourceSets {
+    nativeLifeTest {
+        compileClasspath+=sourceSets.main.output
+        runtimeClasspath+=sourceSets.main.output
+    }
+}
+tasks.register('nativeLifeTest',JavaExec) {
+    dependsOn nativeLifeTestClasses
+    classpath=sourceSets.nativeLifeTest.runtimeClasspath
+    mainClass='dev.minecraftsdk.LifeEpochsTest'
+}
+tasks.named('check') { dependsOn 'nativeLifeTest' }
