@@ -164,7 +164,8 @@ impl Command {
                 format!("execute in minecraft:overworld run forceload {operation} {x} {z}")
             }
         };
-        if command.len() > 2048 || command.as_bytes().contains(&0) {
+        // Keep the entire request below vanilla's 1460-byte read buffer.
+        if command.len() > 1400 || command.as_bytes().contains(&0) {
             return Err(Error::new("rcon_command_bounds"));
         }
         Ok(command)
@@ -403,22 +404,28 @@ impl RconClient {
         deadline: Instant,
     ) -> Result<Reply, Error> {
         send(&mut self.stream, id, 2, text, deadline)?;
+        // Vanilla 1.21.1 expects one request per socket read; two pipelined
+        // requests can be coalesced and rejected. Receiving the first reply
+        // proves the command was consumed before we send the boundary query.
+        let first = receive(&mut self.stream, deadline)?;
+        if first.kind != 0 {
+            return Err(Error::new("rcon_response_type"));
+        }
+        if first.id != id {
+            return Err(Error::new("rcon_response_id"));
+        }
+        let mut bytes = first.payload;
         // Minecraft responds to commands in order. A distinct, typed read-only
         // list request marks the end of even an exactly-full/multi-packet reply.
         // This avoids treating one TCP read or a short fragment as completion.
         let sentinel_command = Command::ListPlayers.render()?;
         send(&mut self.stream, sentinel, 2, &sentinel_command, deadline)?;
-        let mut bytes = Vec::new();
-        let mut seen = false;
-        for _ in 0..MAX_PACKETS {
+        for _ in 1..MAX_PACKETS {
             let packet = receive(&mut self.stream, deadline)?;
             if packet.kind != 0 {
                 return Err(Error::new("rcon_response_type"));
             }
             if packet.id == sentinel {
-                if !seen {
-                    return Err(Error::new("rcon_missing_command_response"));
-                }
                 if packet.payload.len() > MAX_SENTINEL_REPLY {
                     return Err(Error::new("rcon_sentinel_bounds"));
                 }
@@ -432,7 +439,6 @@ impl RconClient {
             if packet.id != id {
                 return Err(Error::new("rcon_response_id"));
             }
-            seen = true;
             if bytes.len().saturating_add(packet.payload.len()) > MAX_REPLY {
                 return Err(Error::new("rcon_reply_bounds"));
             }
@@ -516,7 +522,9 @@ mod tests {
         assert!(cleanup.contains("if entity @s[type=minecraft:skeleton] run kill @s"));
         assert!(!cleanup.contains("kill @a"));
         assert_eq!(
-            Command::ReadPlayerHealth { actor: actor() }.render().unwrap(),
+            Command::ReadPlayerHealth { actor: actor() }
+                .render()
+                .unwrap(),
             "data get entity 00112233-4455-6677-8899-aabbccddeeff Health"
         );
     }
@@ -582,11 +590,22 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(2);
             for expected in [2, 4] {
                 let command = receive(&mut stream, deadline).unwrap();
-                let sentinel = receive(&mut stream, deadline).unwrap();
                 assert_eq!((command.id, command.kind), (expected, 2));
+                // A request arriving before this first response would be
+                // pipelining that vanilla's socket reader does not support.
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(25)))
+                    .unwrap();
+                let mut probe = [0; 1];
+                let before_reply = stream.peek(&mut probe);
+                assert!(before_reply.is_err_and(|e| matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )));
+                send(&mut stream, expected, 0, "first", deadline).unwrap();
+                let sentinel = receive(&mut stream, deadline).unwrap();
                 assert_eq!((sentinel.id, sentinel.kind), (expected + 1, 2));
                 assert_eq!(sentinel.payload, b"list");
-                send(&mut stream, expected, 0, "first", deadline).unwrap();
                 send(&mut stream, expected, 0, "second", deadline).unwrap();
                 send(&mut stream, expected + 1, 0, "ignored list reply", deadline).unwrap();
             }
@@ -623,7 +642,6 @@ mod tests {
             auth(&mut stream, false);
             let deadline = Instant::now() + Duration::from_secs(2);
             let _ = receive(&mut stream, deadline).unwrap();
-            let _ = receive(&mut stream, deadline).unwrap();
             write_bounded(
                 &mut stream,
                 &((MAX_PACKET + 1) as i32).to_le_bytes(),
@@ -650,8 +668,8 @@ mod tests {
             auth(&mut stream, false);
             let deadline = Instant::now() + Duration::from_secs(2);
             let _ = receive(&mut stream, deadline).unwrap();
-            let _ = receive(&mut stream, deadline).unwrap();
             send(&mut stream, 2, 0, "command response", deadline).unwrap();
+            let _ = receive(&mut stream, deadline).unwrap();
             send(
                 &mut stream,
                 3,
@@ -678,7 +696,6 @@ mod tests {
         let (address, task) = server(|mut stream| {
             auth(&mut stream, false);
             let deadline = Instant::now() + Duration::from_secs(2);
-            let _ = receive(&mut stream, deadline).unwrap();
             let _ = receive(&mut stream, deadline).unwrap();
             stream.write_all(&10_i32.to_le_bytes()).unwrap();
             for byte in [2_u8, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
