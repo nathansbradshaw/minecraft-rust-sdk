@@ -1,8 +1,8 @@
 use crate::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub(crate) const REQUEST_CONTRACT: &str =
-    "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1";
+pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1";
+mod active_source;
 mod repair;
 /// Inspect a source-bound coding repair without inference, execution or writes.
 pub fn compiler_repair_preview(context: &Value) -> Value {
@@ -257,6 +257,7 @@ impl Model {
             repair.prepare(&mut context, &mut format);
             crate::fit_context(&mut context)?;
         }
+        active_source::prepare(&mut context, development);
         // Suppress only the unavailable navigation command, not reasoning or
         // code work. A body that remains urgent must not freeze the reasoner.
         navigation_schema(&context, &mut format);

@@ -23,12 +23,23 @@ successful setup actions, while the complete private trace remains available.
 
 The container-local worker can recover Cargo's actual binary entry from the
 hash-checked private stdout capture. It reads no more than the stream's existing
-4 MiB limit and supplies automatic source only up to 4 KiB. It does not guess a
-source filename, execute Cargo metadata/build scripts or ask the inference host
+4 MiB limit and supplies automatic failure-repair source up to 4 KiB. It does not
+guess a source filename, execute Cargo metadata/build scripts or ask the inference host
 to read files. A complete explicit Rust source read is also accepted. Paths must
 resolve within the bot workspace; source contents, file hash, workspace hash and
 goal revision are checked again before selecting the transition. Changed,
 partial, foreign or unavailable source leaves ordinary tools available.
+
+Active coding sessions can retain one complete `active_program_source` while
+later tools read SDK documentation. It reuses the same Cargo-entry and raw-output
+hash checks, requires the unchanged workspace and goal revision, and adds no
+model calls or development turns. The active source is limited to 8 KiB and its
+complete serialized view to 12,000 bytes; existing failure repairs retain their
+4 KiB default. The explicit engine state-directory exclusion must match the
+retained capture location, so nested state changes cannot masquerade as source
+changes. Existing verified repair views for the same entry take precedence;
+an optional source view that cannot fit the context budget is omitted. This does
+not classify successful no-op programs as failures or certify gameplay progress.
 
 For the structured `run` tool, the stdout preview hides recognized Cargo prelude
 records and keeps output after `build-finished` before the ordinary bounded
