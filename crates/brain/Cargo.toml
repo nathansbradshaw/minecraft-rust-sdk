@@ -17,5 +17,6 @@ sha2.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+minecraft-sdk-xtask = { path = "../xtask" }
 tempfile.workspace = true
 axum.workspace = true

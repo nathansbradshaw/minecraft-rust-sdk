@@ -7,6 +7,8 @@ pub mod body;
 mod completion;
 pub mod containers;
 pub mod conversation;
+#[cfg(test)]
+mod development_replay;
 mod diagnostics;
 mod discovery;
 pub mod feedback;

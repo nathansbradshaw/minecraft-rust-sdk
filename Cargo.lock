@@ -690,6 +690,7 @@ dependencies = [
  "axum",
  "libc",
  "minecraft-sdk",
+ "minecraft-sdk-xtask",
  "reqwest",
  "rusqlite",
  "serde",
@@ -782,8 +783,10 @@ dependencies = [
 name = "minecraft-sdk-xtask"
 version = "0.1.0-alpha.6"
 dependencies = [
+ "libc",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

@@ -26,6 +26,11 @@ Rust 1.89+ and Java 21 are required. The pinned NeoForge adapter is Java 767;
 install the matching server module before starting the gateway. Java is used
 only for required Minecraft/NeoForge hooks; all tools and services use Rust.
 
+For bot development, use the [recorded-failure workflow](docs/bot-development-workflow.md)
+to reproduce the latest menu stall, run a focused Rust regression, and capture
+bounded launchers with logs, observations, hashes and cleanup. The default check
+runs offline without a model or Minecraft server.
+
 ## Connect your bot
 
 Obtain the operator's HTTPS gateway origin, then keep the created profile
