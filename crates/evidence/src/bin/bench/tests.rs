@@ -96,6 +96,11 @@ pub(super) fn setup() -> Setup {
     f.container_started_at = Some("2026-11-13T00:00:00Z".into());
     f.owned_container = true;
     f.bot_dev = Some(f.sdk.clone());
+    f.runtime_check = Some("/workspace/mc-sdk-runtime-check".into());
+    f.artifacts.push(config::Artifact {
+        file: f.sdk.clone(),
+        container_path: f.runtime_check.clone().unwrap(),
+    });
     f.operator_profile = Some(base.join("operator-profile.json"));
     let mut host = json(&f.profile(), 16384).unwrap();
     host["endpoint"] = json!("http://127.0.0.1:19146/mac-eval/");
@@ -129,6 +134,7 @@ fn preflight_replies(f: &Fixture) -> VecDeque<process::Output> {
     }
     q.push_back(output("1000".into(), true));
     q.push_back(output("8180 600 1000\n8180 600 1000\n".into(), true));
+    q.push_back(output(json!({"format":"minecraft-runtime-filesystem-check-v1","unix_socket_bind":true,"socket_mode_0600":true,"probe_removed":true,"sdk_or_gameplay_calls":false}).to_string(), true));
     q.push_back(output(json!({"ready":true,"instance_id":f.instance_id,"capabilities":["minecraft:fresh_observation"]}).to_string(),true));
     q
 }
@@ -175,6 +181,25 @@ fn absent_fresh_capability_stops_preflight_before_connect() {
             .iter()
             .any(|a| a.first().is_some_and(|v| v == "connect"))
     );
+}
+#[test]
+fn unsupported_runtime_socket_stops_before_actor_connection() {
+    let s = setup();
+    let mut replies = preflight_replies(&s.f);
+    let socket_index = replies.len() - 2;
+    replies[socket_index] = output("chmod: Invalid argument".into(), false);
+    let mut fake = Fake {
+        replies,
+        calls: vec![],
+    };
+    assert!(stage(&mut fake, &s.f, &s.case, &"c".repeat(64)).is_err());
+    assert!(
+        !fake
+            .calls
+            .iter()
+            .any(|args| args.first().is_some_and(|a| a == "connect"))
+    );
+    assert!(!s.case.join("stage-intent.json").exists());
 }
 #[test]
 fn mounts_reject_rw_secret_alias_and_unreviewed_credentials() {
@@ -591,6 +616,51 @@ fn prelaunch_rcon_init_failure_attempts_one_host_disconnect() {
         json(&s.case.join("prelaunch-failure.json"), 16384).unwrap()["native_absence_verified"],
         false
     );
+}
+#[test]
+fn prepared_generation_change_disconnects_without_repeating_preflight() {
+    let s = setup();
+    let mut host = json(s.f.host_profile().unwrap(), 16384).unwrap();
+    host["session"] = json!({"session_id":"prepared-session-token","adapter_version":"test"});
+    fs::write(
+        s.f.host_profile().unwrap(),
+        serde_json::to_vec(&host).unwrap(),
+    )
+    .unwrap();
+    sync_session(&s.f, false).unwrap();
+    let mut runner = Fake {
+        replies: VecDeque::from([output(json!({"disconnected":true}).to_string(), true)]),
+        calls: vec![],
+    };
+    let mut control = Fake {
+        replies: VecDeque::from([output(
+            json!({"id":s.f.container_id,"started_at":"different-generation","running":true})
+                .to_string(),
+            true,
+        )]),
+        calls: vec![],
+    };
+    assert!(
+        launch_prepared(
+            &mut runner,
+            &mut control,
+            &s.f,
+            &s.case,
+            &"c".repeat(64),
+            true
+        )
+        .is_err()
+    );
+    assert_eq!(
+        runner.calls,
+        vec![vec![
+            "disconnect".to_owned(),
+            s.f.host_profile().unwrap().display().to_string()
+        ]]
+    );
+    assert_eq!(control.calls.len(), 1);
+    assert_eq!(control.calls[0][0], "inspect");
+    assert!(!s.case.join("handler.stdout").exists());
 }
 #[test]
 fn preexisting_or_unwritable_intent_cannot_block_disconnect() {

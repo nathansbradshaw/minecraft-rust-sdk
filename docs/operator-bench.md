@@ -25,7 +25,9 @@ lease. Run the bench on the operator host, never inside a model workspace.
 ready instance's `minecraft:fresh_observation` capability, without an actor
 connection or RCON/gameplay call. It inspects the existing container and hashes
 declared artifacts, and checks config/spec regular-file mode0600 and effective
-UID ownership inside the container. `stage` and `launch` make real connections and,
+UID ownership inside the container. Its pinned Linux runtime checker then creates
+and verifies a private Unix socket in the declared state filesystem before any
+actor connection. `stage` and `launch` make real connections and,
 when RCON is configured, the narrowly declared staging operations.
 
 ```sh
@@ -41,6 +43,8 @@ A failed command is retained, not replaced with a successful-looking attempt.
 
 The automatic `run` path requires RCON and immediately chains stage and launch;
 it remains disabled alongside standalone launch until integration verification.
+It performs expensive SDK/artifact/filesystem preflight before connecting, then
+rechecks only the frozen container generation and local fixture at launch.
 Prepare/check everything before connecting. Do not insert a manual idle window
 between staging and launch: natural hostiles can kill the unprotected actor.
 Standalone stage is an explicit manual handoff only, requiring prompt disconnect
@@ -73,7 +77,7 @@ life afterward. Each staging snapshot uses one advertised
 `minecraft:fresh_observation` query, without cached fallback or retry. Without
 RCON, it records **pending operator staging** and leaves
 the actor connected. The operator must complete staging and proceed promptly or
-run `mc-sdk disconnect /private/bot-secrets/profile.json`. Stage does not summon.
+run `mc-sdk disconnect /private/operator-only/host-profile.json`. Stage does not summon.
 
 Launch uses the existing pinned probe, with exactly:
 `CONFIG blocked|task 120 ADMISSION_SPEC`. It validates the handler's actual
@@ -163,9 +167,11 @@ admission budget. The handler enables the protective body after admission.
   "artifacts": [
     {"file":{"path":"/private/pins/body-probe","sha256":"ACTUAL_SHA256"},"container_path":"/workspace/body-probe"},
     {"file":{"path":"/private/pins/config.json","sha256":"ACTUAL_SHA256"},"container_path":"/workspace/config.json"},
-    {"file":{"path":"/private/pins/spec.json","sha256":"ACTUAL_SHA256"},"container_path":"/workspace/spec.json"}
+    {"file":{"path":"/private/pins/spec.json","sha256":"ACTUAL_SHA256"},"container_path":"/workspace/spec.json"},
+    {"file":{"path":"/private/pins/mc-sdk-runtime-check","sha256":"ACTUAL_SHA256"},"container_path":"/workspace/mc-sdk-runtime-check"}
   ],
   "handler": "/workspace/body-probe",
+  "runtime_check": "/workspace/mc-sdk-runtime-check",
   "handler_args": ["/workspace/config.json","blocked","120","/workspace/spec.json"],
   "expected_player_position": [262.5,63.0,-720.5],
   "expected_npc_position": [262.5,64.0,-709.5],
@@ -200,6 +206,10 @@ owned container if closure remains unknown. Before emergency stop it attempts a
 three-second nonquiescent archive, explicitly incomplete. Normal closure uses
 existing `bot-dev capture` for an untouched compressed tar of workspace and the
 distinct pinned config `state` path, preserving path hierarchy and runtime journals.
+This is a bounded file snapshot before final container stop; the old handler's
+exit and actor absence do not establish that remaining descendants have stopped
+writing. The archive explicitly records that limit, and the final container stop
+closes those remaining processes.
 The state path must be a scoped workspace or `/tmp` child outside secrets.
 It excludes credential-file patterns/cache/target; arbitrary embedded content is
 not certified keyfree. Failed normal archives preserve the container/tmpfs and
@@ -209,8 +219,8 @@ verify those ownership fields before recovery, never stop a container by a reuse
 
 Private directory readability does not prove Unix-socket support. Use the
 separately pinned Linux `mc-sdk-runtime-check` described in
-[runtime-filesystem-check.md](runtime-filesystem-check.md) before connecting;
-automatic invocation is pending parent integration. The strict0600 policy is
+[runtime-filesystem-check.md](runtime-filesystem-check.md); preflight requires and
+invokes it before connecting. The strict0600 policy is
 unchanged. A completion-kit claim additionally needs external retained player
 inventory proof of both table and wooden pickaxe; cursor/grid/placed blocks or a
 model subgoal cannot substitute. A reconnect's changed menu is a new starting

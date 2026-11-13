@@ -62,7 +62,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     }
     if args.is_empty() || (args.len() == 1 && args[0] == "--help") {
         println!(
-            "mc-sdk-bench rcon-list LOOPBACK_ADDR PRIVATE_PASSWORD_FILE\nmc-sdk-bench preflight|stage|launch FIXTURE.json SHA256 CASE_DIR\nmc-sdk-bench nativecapture FIXTURE.json SHA256 NEW_CAPTURE_DIR GATEWAY.sqlite TRACE.log SPEC_TEMPLATE.json [SAVED_JSON ...]\nSee docs/operator-bench.md. Stage/launch make real connections only when the operator runs them; no command awards a PASS."
+            "mc-sdk-bench rcon-list LOOPBACK_ADDR PRIVATE_PASSWORD_FILE\nmc-sdk-bench preflight|stage|run|launch FIXTURE.json SHA256 CASE_DIR\nmc-sdk-bench nativecapture FIXTURE.json SHA256 NEW_CAPTURE_DIR GATEWAY.sqlite TRACE.log SPEC_TEMPLATE.json [SAVED_JSON ...]\nSee docs/operator-bench.md. Stage/run/launch make real connections only when the operator runs them; no command awards a PASS."
         );
         return Ok(());
     }
@@ -114,7 +114,14 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                 "automatic run requires private typed RCON; no connected manual gap",
             )?;
             stage(&mut runner, &fixture, case, hash)?;
-            launch(&mut runner, &mut SystemRunner::new(), &fixture, case, hash)?;
+            launch_prepared(
+                &mut runner,
+                &mut SystemRunner::new(),
+                &fixture,
+                case,
+                hash,
+                true,
+            )?;
         }
         "launch" if args.len() == 4 => {
             ensure(
@@ -141,6 +148,10 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
 }
 fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> Result<()> {
     f.validate()?;
+    let checker = f
+        .runtime_check
+        .as_deref()
+        .ok_or("pinned runtime filesystem checker required before connecting an actor")?;
     let format = "{\"running\":{{json .State.Running}},\"readonly_rootfs\":{{json .HostConfig.ReadonlyRootfs}},\"privileged\":{{json .HostConfig.Privileged}},\"user\":{{json .Config.User}},\"memory\":{{json .HostConfig.Memory}},\"nano_cpus\":{{json .HostConfig.NanoCpus}},\"pids\":{{json .HostConfig.PidsLimit}},\"cap_drop\":{{json .HostConfig.CapDrop}},\"cap_add\":{{json .HostConfig.CapAdd}},\"security\":{{json .HostConfig.SecurityOpt}},\"network\":{{json .HostConfig.NetworkMode}},\"pid_mode\":{{json .HostConfig.PidMode}},\"ipc_mode\":{{json .HostConfig.IpcMode}},\"devices\":{{json .HostConfig.Devices}},\"ca_env\":\"\",\"env_names\":[{{range $i,$e := .Config.Env}}{{if $i}},{{end}}{{json (index (split $e \"=\") 0)}}{{end}}],\"mounts\":{{json .Mounts}}}";
     let format = [
         "{\"id\":{{json .Id}},\"started_at\":{{json .State.StartedAt}},",
@@ -203,6 +214,27 @@ fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> 
     for line in lines {
         validate_private_metadata(line, uid)?;
     }
+    let runtime = process::call(
+        runner,
+        f,
+        &f.docker,
+        vec![
+            "exec".into(),
+            f.target()?.into(),
+            checker.into(),
+            f.state_path()?,
+        ],
+        case,
+        &format!("{label}-runtime-filesystem"),
+    )?;
+    ensure(
+        runtime["format"] == "minecraft-runtime-filesystem-check-v1"
+            && runtime["unix_socket_bind"] == true
+            && runtime["socket_mode_0600"] == true
+            && runtime["probe_removed"] == true
+            && runtime["sdk_or_gameplay_calls"] == false,
+        "actual container runtime must support private Unix sockets before actor connection",
+    )?;
     let endpoint = json(f.host_profile()?, 16384)?["endpoint"]
         .as_str()
         .ok_or("profile endpoint missing")?
@@ -225,7 +257,7 @@ fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> 
     )?;
     save(
         &case.join(format!("{label}.json")),
-        &json!({"case_id":f.case_id,"player_uuid":f.player_uuid,"npc_uuid":f.npc_uuid,"artifact_and_mount_checks":true,"free_bytes":free_bytes(case)?,"scoped_model_allocation":"operator-attested bot-scoped proxy; no provider account mounted","console_ready":f.operator_rcon.is_some(),"console_readiness_scope":"Configuration only, no connection or service restart during preflight","certifies_goal_completion":false}),
+        &json!({"case_id":f.case_id,"player_uuid":f.player_uuid,"npc_uuid":f.npc_uuid,"artifact_and_mount_checks":true,"runtime_socket_mode_0600_verified":true,"free_bytes":free_bytes(case)?,"scoped_model_allocation":"operator-attested bot-scoped proxy; no provider account mounted","console_ready":f.operator_rcon.is_some(),"console_readiness_scope":"Configuration only, no connection or service restart during preflight","certifies_goal_completion":false}),
     )
 }
 fn validate_private_metadata(line: &str, uid: u32) -> Result<()> {
@@ -509,8 +541,26 @@ fn launch(
     case: &Path,
     hash: &str,
 ) -> Result<()> {
+    launch_prepared(runner, control, f, case, hash, false)
+}
+fn launch_prepared(
+    runner: &mut dyn Runner,
+    control: &mut dyn Runner,
+    f: &Fixture,
+    case: &Path,
+    hash: &str,
+    preflight_completed: bool,
+) -> Result<()> {
     let mut disconnect_attempted = false;
-    let result = launch_inner(runner, control, f, case, hash, &mut disconnect_attempted);
+    let result = launch_inner(
+        runner,
+        control,
+        f,
+        case,
+        hash,
+        &mut disconnect_attempted,
+        preflight_completed,
+    );
     if result.is_err() && !disconnect_attempted {
         let _ = disconnect_launch(runner, f, case, &mut disconnect_attempted);
         let _ = save(
@@ -614,8 +664,20 @@ fn launch_inner(
     case: &Path,
     hash: &str,
     disconnect_attempted: &mut bool,
+    preflight_completed: bool,
 ) -> Result<()> {
-    preflight(runner, f, case, "launch-preflight")?;
+    if preflight_completed {
+        // Automatic run already completed expensive checks before stage connected
+        // the actor. Recheck the frozen generation without a second unprotected
+        // SDK discovery/artifact/filesystem preflight window.
+        f.validate()?;
+        ensure(
+            remote::snapshot(control, f, case, "launch-container-before")?,
+            "prepared container stopped before launch",
+        )?;
+    } else {
+        preflight(runner, f, case, "launch-preflight")?;
+    }
     let stage = json(&case.join("stage.json"), 16384)?;
     ensure(
         stage["fixture_sha256"] == hash

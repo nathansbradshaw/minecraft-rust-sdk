@@ -13,8 +13,24 @@ pub enum State {
     Unknown,
 }
 fn tool(runner: &mut dyn Runner, f: &Fixture, args: Vec<String>) -> Result<process::Output> {
+    tool_with_timeout(runner, f, args, 2)
+}
+fn tool_with_timeout(
+    runner: &mut dyn Runner,
+    f: &Fixture,
+    args: Vec<String>,
+    seconds: u64,
+) -> Result<process::Output> {
     f.docker.verify()?;
-    runner.run(&f.docker.path, &args, 2, &f.secrets()?, &mut |_| Ok(()))
+    // These fixed metadata/control commands neither read nor persist credentials.
+    // A damaged bot profile must not prevent closure of its frozen container.
+    runner.run(
+        &f.docker.path,
+        &args,
+        seconds,
+        &Secrets(vec![]),
+        &mut |_| Ok(()),
+    )
 }
 pub fn snapshot(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> Result<bool> {
     let out=tool(runner,f,vec!["inspect".into(),"--format".into(),"{\"id\":{{json .Id}},\"started_at\":{{json .State.StartedAt}},\"running\":{{json .State.Running}}}".into(),f.target()?.into()])?;
@@ -26,7 +42,9 @@ pub fn snapshot(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) 
             && value["running"].is_boolean(),
         "container ID/start ownership changed",
     )?;
-    save(&case.join(format!("{label}.json")), &value)?;
+    // Preserve the ownership fence even when evidence storage has failed. The
+    // surrounding launch still fails if its required final record cannot save.
+    let _ = save(&case.join(format!("{label}.json")), &value);
     Ok(value["running"] == true)
 }
 fn pids(runner: &mut dyn Runner, f: &Fixture) -> Result<Vec<u32>> {
@@ -186,10 +204,9 @@ pub fn stop(runner: &mut dyn Runner, f: &Fixture, case: &Path) -> Result<bool> {
     if !snapshot(runner, f, case, "stop-container-before")? {
         return Ok(true);
     }
-    let _ = process::execute(
+    let stopped = tool_with_timeout(
         runner,
         f,
-        &f.docker,
         vec![
             "stop".into(),
             "--time".into(),
@@ -197,10 +214,11 @@ pub fn stop(runner: &mut dyn Runner, f: &Fixture, case: &Path) -> Result<bool> {
             f.target()?.into(),
         ],
         10,
-        case,
-        "stop-owned-container",
-        &mut |_| Ok(()),
     )?;
+    let _ = save(
+        &case.join("stop-owned-container.json"),
+        &json!({"container_id":f.target()?,"command_acknowledged":stopped.success,"timed_out":stopped.timed_out,"native_state_verified":false}),
+    );
     Ok(!snapshot(runner, f, case, "stop-container-after")?)
 }
 pub fn archive(
@@ -208,7 +226,7 @@ pub fn archive(
     f: &Fixture,
     case: &Path,
     seconds: u64,
-    quiescent: bool,
+    handler_and_actor_closed: bool,
 ) -> Result<bool> {
     ensure(
         snapshot(runner, f, case, "archive-container-before")?,
@@ -278,10 +296,10 @@ pub fn archive(
         && summary["signal"].is_null();
     let path = archive.join("stdout.log");
     let bytes = read(&path, 16 * 1024 * 1024)?;
-    let complete = complete && bytes.starts_with(&[0x1f, 0x8b]) && quiescent;
+    let complete = complete && bytes.starts_with(&[0x1f, 0x8b]) && handler_and_actor_closed;
     save(
         &case.join("workspace-archive.json"),
-        &json!({"complete":complete,"compressed_tar_file":"workspace-archive/stdout.log","sha256":sha256(&bytes),"bytes":bytes.len(),"secret_mount_outside_workspace":true,"credential_file_patterns_excluded":true,"arbitrary_embedded_content_certified_keyfree":false,"scope":"Existing bot-dev binary capture preserves compressed bytes; operator must verify workspace content before publication; not text-scrubbed"}),
+        &json!({"complete":complete,"compressed_tar_file":"workspace-archive/stdout.log","sha256":sha256(&bytes),"bytes":bytes.len(),"handler_and_actor_closure_verified":handler_and_actor_closed,"descendant_quiescence_verified":false,"secret_mount_outside_workspace":true,"credential_file_patterns_excluded":true,"arbitrary_embedded_content_certified_keyfree":false,"scope":"Existing bot-dev preserves a bounded selected-file snapshot before final container stop, not final writes of remaining descendants. Operator must verify content before publication; compressed bytes are not text-scrubbed."}),
     )?;
     Ok(complete)
 }
@@ -401,5 +419,23 @@ mod tests {
         assert!(stop(&mut c, &s.f, &s.case).unwrap());
         assert_eq!(c.stops, 1);
         assert!(!c.running);
+    }
+    #[test]
+    fn damaged_profile_and_existing_evidence_do_not_block_owned_container_stop() {
+        let s = super::super::tests::setup();
+        let mut c = fake(&s.f);
+        fs::write(s.f.profile(), b"invalid profile").unwrap();
+        save(
+            &s.case.join("stop-container-before.json"),
+            &json!({"old":true}),
+        )
+        .unwrap();
+        assert!(stop(&mut c, &s.f, &s.case).unwrap());
+        assert_eq!(c.stops, 1);
+        assert!(!c.running);
+        assert_eq!(
+            json(&s.case.join("stop-container-before.json"), 1024).unwrap()["old"],
+            true
+        );
     }
 }

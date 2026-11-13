@@ -30,6 +30,6 @@ state such as `/tmp/brain-state` can avoid that mount limitation. Keep the priva
 socket policy, and archive the declared runtime state together with the workspace
 before stopping a container whose state is on tmpfs.
 
-The operator bench must run this check before its first connection when the
-helper is integrated and pinned; otherwise socket preflight remains explicitly
-pending. Build and test the helper in the shared compiler lane before live use.
+The operator bench requires a pinned `runtime_check` artifact and runs it before
+its first connection, including standalone stage. Build and test the helper in
+the shared compiler lane before live use.

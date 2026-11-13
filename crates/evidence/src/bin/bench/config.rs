@@ -51,6 +51,7 @@ pub struct Fixture {
     pub evidence: Pinned,
     pub artifacts: Vec<Artifact>,
     pub handler: String,
+    pub runtime_check: Option<String>,
     pub handler_args: Vec<String>,
     pub expected_player_position: [f64; 3],
     pub expected_npc_position: [f64; 3],
@@ -282,6 +283,13 @@ impl Fixture {
                     .all(|a| !a.is_empty() && a.len() <= 512 && !a.contains(['\n', '\r', '\0'])),
             "reviewed handler and bounded argv required",
         )?;
+        if let Some(check) = &self.runtime_check {
+            container_path(check)?;
+            ensure(
+                paths.contains(check) && check != &self.handler,
+                "runtime filesystem checker must be a distinct pinned artifact",
+            )?;
+        }
         ensure(
             self.trace_action_prefix.as_deref().is_none_or(id),
             "invalid optional exact action prefix",
