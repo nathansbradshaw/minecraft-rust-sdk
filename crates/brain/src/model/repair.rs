@@ -143,7 +143,17 @@ fn complete_gameplay_experiment(experiment: &Value) -> Option<Value> {
     full["trace_recovered_from_private_journal"] = json!(true);
     Some(full)
 }
-fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
+pub(super) fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
+    run_source_bounded(root, experiment, 4096)
+}
+pub(super) fn run_source_bounded(
+    root: &Path,
+    experiment: &Value,
+    byte_limit: usize,
+) -> Option<Value> {
+    if !(1..=8192).contains(&byte_limit) {
+        return None;
+    }
     let bin = experiment["command"].as_str()?;
     if experiment["tool"] != "terminal"
         && (bin.is_empty()
@@ -191,17 +201,19 @@ fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
         source = Some(file);
     }
     let file = source?;
-    let bytes = crate::private_read(&file, 4096).ok().or_else(|| {
-        // Public Rust source need not be mode0600; keep the same strict byte cap.
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        fs::File::open(&file)
-            .ok()?
-            .take(4097)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        (bytes.len() <= 4096).then_some(bytes)
-    })?;
+    let bytes = crate::private_read(&file, byte_limit as u64)
+        .ok()
+        .or_else(|| {
+            // Public Rust source need not be mode0600; keep the same strict byte cap.
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            fs::File::open(&file)
+                .ok()?
+                .take(byte_limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            (bytes.len() <= byte_limit).then_some(bytes)
+        })?;
     Some(
         json!({"view":"file","path":file,"source_sha256":crate::digest(&bytes),"source_bytes":bytes.len(),
         "content_complete":true,"content":std::str::from_utf8(&bytes).ok()?}),
