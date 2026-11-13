@@ -216,7 +216,7 @@ fn closes_recalled_shooter(o: &Observation, target: [f64; 3]) -> bool {
                 || e["ranged_attack"] != true
                 || memory["kind"] != "last_visible_ranged_threat"
                 || memory["expires_after_ticks"] != 160
-                || !memory["age_ticks"].as_u64().is_some_and(|age| age <= 160)
+                || memory["age_ticks"].as_u64().is_none_or(|age| age > 160)
             {
                 return false;
             }
