@@ -102,7 +102,7 @@ impl Handle {
                         sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;
                         if selected {
                             brain.set("develop_next","false")?;
-                            brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Rust program for composed work. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
+                            brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Lua behavior for composed work. The SDK and Brain remain Rust. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
                         } else {
                             journal.event("conversation_goal_retained",json!({"requested_revision":requested_revision,"current_revision":brain.get("goal_revision")?,"proposed_action":reply.goal_action,"goal":reply.goal,"chat_sequence":sequence}))?;
                         }
