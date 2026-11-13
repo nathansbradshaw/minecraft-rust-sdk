@@ -357,7 +357,7 @@ fn run() -> Result<bool> {
         }
         Some("capture") if args.len()>=5 && args[3]=="--" => {
             let seconds: u64 = argument(&args,2)?.to_str().ok_or("Numeric timeout required")?.parse()?;
-            if !(1..=600).contains(&seconds) { return Err("Timeout must be1..600seconds".into()); }
+            if !(1..=1500).contains(&seconds) { return Err("Timeout must be1..1500seconds".into()); }
             let mut command = Command::new(&args[4]);
             command.args(&args[5..]);
             let report = capture(Path::new(&args[1]), command, Duration::from_secs(seconds))?;
