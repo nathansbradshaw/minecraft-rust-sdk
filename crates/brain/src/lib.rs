@@ -139,7 +139,7 @@ fn conversation_default() -> bool {
     true
 }
 fn model_context_contract(instructions: &str) -> String {
-    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v3/compiler-error-view-v1/bounded-investigation-routing-v2/native-navigation-feedback-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
+    digest(json!({"format":"sdk-shaped-observation-v1/focused-observation-v1/retrievable-memory-v1/container-inspection-memory-v1/bounded-history-context-v3/compiler-error-view-v1/bounded-investigation-routing-v2/native-navigation-feedback-v1","navigation_scheduling_contract":"changed-ready-control-pause-v1","model_request_contract":model::REQUEST_CONTRACT,"sdk_reference":include_str!("sdk.md"),"command_schema":model::schema(),"system_prompt":include_str!("system.md"),"deployment_instructions":instructions}).to_string().as_bytes())
 }
 pub struct Journal {
     db: Connection,
