@@ -14,11 +14,23 @@ mod config;
 mod io;
 mod process;
 mod rcon;
+mod remote;
 use config::{Fixture, Pinned};
 use io::*;
 use process::{Runner, SystemRunner};
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+extern "C" fn interrupt_signal(_: i32) {
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+pub(super) fn take_interrupt() -> bool {
+    INTERRUPTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn run(args: Vec<OsString>) -> Result<()> {
+    unsafe {
+        libc::signal(libc::SIGINT, interrupt_signal as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, interrupt_signal as libc::sighandler_t);
+    }
     if args.first().is_some_and(|a| a == "rcon-list") {
         ensure(
             args.len() == 3,
@@ -92,12 +104,24 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     match command {
         "preflight" if args.len() == 4 => preflight(&mut runner, &fixture, case, "preflight")?,
         "stage" if args.len() == 4 => stage(&mut runner, &fixture, case, hash)?,
+        "run" if args.len() == 4 => {
+            ensure(
+                false,
+                "run disabled until owned finalization integration is verified",
+            )?;
+            ensure(
+                fixture.operator_rcon.is_some(),
+                "automatic run requires private typed RCON; no connected manual gap",
+            )?;
+            stage(&mut runner, &fixture, case, hash)?;
+            launch(&mut runner, &mut SystemRunner::new(), &fixture, case, hash)?;
+        }
         "launch" if args.len() == 4 => {
             ensure(
                 false,
                 "launch disabled until owned remote finalization and archive integration are verified",
             )?;
-            launch(&mut runner, &fixture, case, hash)?;
+            launch(&mut runner, &mut SystemRunner::new(), &fixture, case, hash)?;
         }
         "nativecapture" if (7..=11).contains(&args.len()) => capture::native(
             &fixture,
@@ -118,6 +142,11 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
 fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> Result<()> {
     f.validate()?;
     let format = "{\"running\":{{json .State.Running}},\"readonly_rootfs\":{{json .HostConfig.ReadonlyRootfs}},\"privileged\":{{json .HostConfig.Privileged}},\"user\":{{json .Config.User}},\"memory\":{{json .HostConfig.Memory}},\"nano_cpus\":{{json .HostConfig.NanoCpus}},\"pids\":{{json .HostConfig.PidsLimit}},\"cap_drop\":{{json .HostConfig.CapDrop}},\"cap_add\":{{json .HostConfig.CapAdd}},\"security\":{{json .HostConfig.SecurityOpt}},\"network\":{{json .HostConfig.NetworkMode}},\"pid_mode\":{{json .HostConfig.PidMode}},\"ipc_mode\":{{json .HostConfig.IpcMode}},\"devices\":{{json .HostConfig.Devices}},\"ca_env\":\"\",\"env_names\":[{{range $i,$e := .Config.Env}}{{if $i}},{{end}}{{json (index (split $e \"=\") 0)}}{{end}}],\"mounts\":{{json .Mounts}}}";
+    let format = [
+        "{\"id\":{{json .Id}},\"started_at\":{{json .State.StartedAt}},",
+        &format[1..],
+    ]
+    .concat();
     let inspect = process::call(
         runner,
         f,
@@ -125,17 +154,88 @@ fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> 
         vec![
             "inspect".into(),
             "--format".into(),
-            format.into(),
-            f.container.clone(),
+            format,
+            f.target()?.into(),
         ],
         case,
         &format!("{label}-container"),
     )?;
     config::validate_mounts(f, &inspect)?;
     verify_container_artifacts(runner, f, case, label)?;
+    let uid = process::execute(
+        runner,
+        f,
+        &f.docker,
+        vec!["exec".into(), f.target()?.into(), "id".into(), "-u".into()],
+        10,
+        case,
+        &format!("{label}-effective-uid"),
+        &mut |_| Ok(()),
+    )?;
+    ensure(uid.success, "container UID unavailable")?;
+    let uid: u32 = std::str::from_utf8(&uid.stdout)?.trim().parse()?;
+    ensure(uid != 0, "effective container user must be nonroot")?;
+    let metadata = process::execute(
+        runner,
+        f,
+        &f.docker,
+        vec![
+            "exec".into(),
+            f.target()?.into(),
+            "stat".into(),
+            "-c".into(),
+            "%f %a %u".into(),
+            "--".into(),
+            f.handler_args[0].clone(),
+            f.handler_args[3].clone(),
+        ],
+        10,
+        case,
+        &format!("{label}-private-input-metadata"),
+        &mut |_| Ok(()),
+    )?;
+    ensure(
+        metadata.success,
+        "container private-input metadata unavailable",
+    )?;
+    let lines: Vec<_> = std::str::from_utf8(&metadata.stdout)?.lines().collect();
+    ensure(lines.len() == 2, "both config/spec metadata required")?;
+    for line in lines {
+        validate_private_metadata(line, uid)?;
+    }
+    let endpoint = json(f.host_profile()?, 16384)?["endpoint"]
+        .as_str()
+        .ok_or("profile endpoint missing")?
+        .to_owned();
+    let server = process::call(
+        runner,
+        f,
+        &f.sdk,
+        vec!["discover".into(), endpoint],
+        case,
+        &format!("{label}-sdk-discovery"),
+    )?;
+    ensure(
+        server["ready"] == true
+            && server["instance_id"] == f.instance_id
+            && server["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|c| c == "minecraft:fresh_observation")),
+        "actual SDK discovery must advertise fresh observation on the frozen ready instance",
+    )?;
     save(
         &case.join(format!("{label}.json")),
         &json!({"case_id":f.case_id,"player_uuid":f.player_uuid,"npc_uuid":f.npc_uuid,"artifact_and_mount_checks":true,"free_bytes":free_bytes(case)?,"scoped_model_allocation":"operator-attested bot-scoped proxy; no provider account mounted","console_ready":f.operator_rcon.is_some(),"console_readiness_scope":"Configuration only, no connection or service restart during preflight","certifies_goal_completion":false}),
+    )
+}
+fn validate_private_metadata(line: &str, uid: u32) -> Result<()> {
+    let words: Vec<_> = line.split_whitespace().collect();
+    ensure(words.len() == 3, "container stat shape differs")?;
+    ensure(
+        u32::from_str_radix(words[0], 16)? & 0o170000 == 0o100000
+            && u32::from_str_radix(words[1], 8)? == 0o600
+            && words[2].parse::<u32>()? == uid,
+        "container config/spec must be nonsymlink regular0600 files owned by effectiveUID",
     )
 }
 fn verify_container_artifacts(
@@ -152,7 +252,7 @@ fn verify_container_artifacts(
             &f.docker,
             vec![
                 "exec".into(),
-                f.container.clone(),
+                f.target()?.into(),
                 "sha256sum".into(),
                 artifact.container_path.clone(),
             ],
@@ -181,7 +281,7 @@ fn verify_container_artifacts(
             &f.docker,
             vec![
                 "exec".into(),
-                f.container.clone(),
+                f.target()?.into(),
                 "test".into(),
                 "-r".into(),
                 path,
@@ -206,11 +306,14 @@ fn sdk(
     operation: &str,
     tail: &[String],
 ) -> Result<Value> {
-    let mut args = vec![operation.into(), f.profile().display().to_string()];
+    let mut args = vec![operation.into(), f.host_profile()?.display().to_string()];
     args.extend_from_slice(tail);
     process::call(runner, f, &f.sdk, args, case, label)
 }
 fn rcon_client(f: &Fixture) -> Result<Option<rcon::RconClient>> {
+    rcon_with_timeout(f, Duration::from_secs(5))
+}
+fn rcon_with_timeout(f: &Fixture, timeout: Duration) -> Result<Option<rcon::RconClient>> {
     match &f.operator_rcon {
         None => Ok(None),
         Some(cfg) => {
@@ -223,7 +326,7 @@ fn rcon_client(f: &Fixture) -> Result<Option<rcon::RconClient>> {
             Ok(Some(rcon::RconClient::connect(
                 cfg.address,
                 password,
-                Duration::from_secs(5),
+                timeout,
             )?))
         }
     }
@@ -286,7 +389,8 @@ fn rcon_execute(
 fn stage(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Result<()> {
     preflight(runner, f, case, "stage-preflight")?;
     ensure(
-        json(&f.profile(), 16384)?["session"].is_null(),
+        json(&f.profile(), 16384)?["session"].is_null()
+            && json(f.host_profile()?, 16384)?["session"].is_null(),
         "stage requires disconnected scoped profile",
     )?;
     // Durable intent precedes the one connection attempt. Re-running cannot allocate a new ID.
@@ -303,6 +407,7 @@ fn stage(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resul
             "connect",
             std::slice::from_ref(&f.connection_request_id),
         )?;
+        sync_session(f, false)?;
         let observed = fresh(runner, f, case, "stage-before")?;
         validate_player(f, &observed, false)?;
         let life = observed["player"]["life_id"]
@@ -336,7 +441,10 @@ fn stage(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resul
         Ok(())
     })();
     if result.is_err() {
-        let _ = sdk(runner, f, case, "stage-error-disconnect", "disconnect", &[]);
+        let closed = sdk(runner, f, case, "stage-error-disconnect", "disconnect", &[]);
+        if closed.as_ref().is_ok_and(|v| v["disconnected"] == true) {
+            let _ = sync_session(f, true);
+        }
     }
     result
 }
@@ -397,7 +505,41 @@ fn empty_stack(value: &Value) -> bool {
         .as_object()
         .is_some_and(|_| value["count"].as_u64() == Some(0) && value["item"] == "minecraft:air")
 }
-fn launch(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Result<()> {
+fn launch(
+    runner: &mut dyn Runner,
+    control: &mut dyn Runner,
+    f: &Fixture,
+    case: &Path,
+    hash: &str,
+) -> Result<()> {
+    let result = launch_inner(runner, control, f, case, hash);
+    if result.is_err() && !case.join("launch-disconnect-intent.json").exists() {
+        let _ = disconnect_launch(runner, f, case);
+        save(
+            &case.join("prelaunch-failure.json"),
+            &json!({"ordinary_disconnect_attempted":true,"native_absence_verified":false,"certifies_goal_completion":false}),
+        )?;
+    }
+    result
+}
+fn disconnect_launch(runner: &mut dyn Runner, f: &Fixture, case: &Path) -> Result<Value> {
+    save(
+        &case.join("launch-disconnect-intent.json"),
+        &json!({"player_uuid":f.player_uuid,"attempted_utc_ms":utc_ms()?,"automatic_retry":false}),
+    )?;
+    let result = sdk(runner, f, case, "launch-disconnect", "disconnect", &[]);
+    if result.as_ref().is_ok_and(|v| v["disconnected"] == true) {
+        sync_session(f, true)?;
+    }
+    result
+}
+fn launch_inner(
+    runner: &mut dyn Runner,
+    control: &mut dyn Runner,
+    f: &Fixture,
+    case: &Path,
+    hash: &str,
+) -> Result<()> {
     preflight(runner, f, case, "launch-preflight")?;
     let stage = json(&case.join("stage.json"), 16384)?;
     ensure(
@@ -407,6 +549,7 @@ fn launch(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resu
         "matching staged connection required",
     )?;
     let expected_life = stage["life_id"].as_str().ok_or("staged life absent")?;
+    sync_session(f, false)?;
     ensure(
         json(&f.profile(), 16384)?["session"].is_object(),
         "staged controller session required",
@@ -417,6 +560,11 @@ fn launch(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resu
     let mut summon_attempted = false;
     let mut last_npc = f.expected_npc_position;
     let mut npc_native_seen = false;
+    let mut remote_identity = None;
+    save(
+        &case.join("recovery.json"),
+        &json!({"container_id":f.target()?,"container_started_at":f.container_started_at,"scope":"Missing finalization is unknown, including SIGKILL/host loss. Verify ID/start before stopping only this owned container.","inspect_argv":[f.docker.path,"inspect",f.target()?],"stop_after_ownership_verification_argv":[f.docker.path,"stop","--time","2",f.target()?],"ordinary_disconnect_argv":[f.sdk.path,"disconnect",f.profile()]}),
+    )?;
     save(
         &case.join("launch-intent.json"),
         &json!({"fixture_sha256":hash,"player_uuid":f.player_uuid,"life_id":expected_life,"duration_secs":120,"utc_ms":utc_ms()?}),
@@ -429,7 +577,7 @@ fn launch(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resu
         ]);
     }
     args.extend([
-        f.container.clone(),
+        f.target()?.into(),
         "timeout".into(),
         "--signal=TERM".into(),
         "--kill-after=5s".into(),
@@ -446,22 +594,18 @@ fn launch(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resu
         case,
         "handler",
         &mut |value| {
-            if let Some(entities) = value["data"]["observation"]["world"]["entities"].as_array() {
-                if let Some(enemy) = entities
+            if let Some(entities) = value["data"]["observation"]["world"]["entities"].as_array()
+                && let Some(enemy) = entities
                     .iter()
                     .find(|e| e["uuid"] == f.npc_uuid && e["type"] == "minecraft:skeleton")
-                {
-                    if let Some(p) = enemy["position"].as_array().filter(|p| p.len() == 3) {
-                        let coords: Option<Vec<f64>> = p
-                            .iter()
-                            .map(|v| v.as_f64().filter(|n| n.is_finite()))
-                            .collect();
-                        if let Some(p) = coords {
-                            last_npc = [p[0], p[1], p[2]];
-                            npc_native_seen = true;
-                        }
-                    }
-                }
+                && let Some(p) = enemy["position"].as_array().filter(|p| p.len() == 3)
+                && let Some(p) = p
+                    .iter()
+                    .map(|v| v.as_f64().filter(|n| n.is_finite()))
+                    .collect::<Option<Vec<f64>>>()
+            {
+                last_npc = [p[0], p[1], p[2]];
+                npc_native_seen = true;
             }
             if value["event"] == "body_probe_ready" {
                 ensure(!ready, "duplicate READY")?;
@@ -476,6 +620,7 @@ fn launch(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resu
                 )?;
                 save(&case.join("ready-native.json"), value)?;
                 ready = true;
+                remote_identity = Some(remote::bind(control, f, case)?);
                 if let Some(client) = &mut console {
                     summon_attempted = true;
                     save(
@@ -522,27 +667,78 @@ fn launch(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resu
             Ok(())
         },
     );
-    // Always attempt ordinary disconnection after a launched handler, including fatal output/timeout.
-    let disconnected = sdk(runner, f, case, "launch-disconnect", "disconnect", &[]);
-    let post_hash = verify_container_artifacts(runner, f, case, "post-launch");
-    save(
+    // A host docker-exec exit does not establish remote closure.
+    let remote_closed = remote::close(control, f, case, remote_identity).unwrap_or(false);
+    let mut container_stopped = false;
+    let mut stop_attempted = false;
+    if !remote_closed {
+        stop_attempted = true;
+        let _ = remote::archive(control, f, case, 3, false);
+        container_stopped = remote::stop(control, f, case).unwrap_or(false);
+    }
+    // Ordinary scoped disconnection is attempted even after emergency container stop.
+    let disconnected = disconnect_launch(runner, f, case);
+    let post_hash = if container_stopped {
+        Err("post-stop container artifact hashes unavailable".into())
+    } else {
+        verify_container_artifacts(runner, f, case, "post-launch")
+    };
+    let native_actor_absent = (|| -> Result<bool> {
+        let Some(mut client) = rcon_client(f)? else {
+            return Ok(false);
+        };
+        let reply = rcon_execute(
+            &mut client,
+            rcon::Command::ReadPlayerHealth {
+                actor: rcon::EntityUuid::parse(&f.player_uuid)?,
+            },
+            case,
+            "disconnect-native-player-check",
+        )?;
+        Ok(reply.text.trim() == "No entity was found")
+    })()
+    .unwrap_or(false);
+    let session_cleared = native_actor_absent && sync_session(f, true).is_ok();
+    let _ = save(
         &case.join("last-known-npc.json"),
         &json!({"npc_uuid":f.npc_uuid,"position":last_npc,"native_seen":npc_native_seen,"fallback_scope":"Declared spawn position if no native NPC snapshot was recorded; does not prove absence outside bounded ring"}),
-    )?;
+    );
     let mut cleanup_complete = !summon_attempted && !admitted;
-    if summon_attempted && let Ok(Some(mut client)) = rcon_client(f) {
+    if summon_attempted && let Ok(Some(mut client)) = rcon_with_timeout(f, Duration::from_secs(1)) {
         cleanup_complete = cleanup::run(&mut client, f, case, last_npc).is_ok();
     }
     let handler_ok = result.as_ref().is_ok_and(|o| o.success);
     let closed = disconnected
         .as_ref()
         .is_ok_and(|v| v["disconnected"] == true);
+    let mut archive_complete = false;
+    if remote_closed && native_actor_absent {
+        archive_complete = remote::archive(control, f, case, 45, true).unwrap_or(false);
+        if archive_complete {
+            stop_attempted = true;
+            container_stopped = remote::stop(control, f, case).unwrap_or(false);
+        }
+        // Archive failure with a proven gone handler and ordinary disconnect retains
+        // the idle owned container/tmpfs for recovery, rather than losing source.
+    } else if !stop_attempted {
+        stop_attempted = true;
+        container_stopped = remote::stop(control, f, case).unwrap_or(false);
+    }
     save(
         &case.join("launch-result.json"),
-        &json!({"ready_native_verified":ready,"admitted_native_verified":admitted,"handler_exit_success":handler_ok,"sdk_disconnected":closed,"artifact_hashes_unchanged":post_hash.is_ok(),"owned_npc_cleanup_attempted":summon_attempted,"cleanup_complete":cleanup_complete,"certifies_goal_completion":false,"original_errors_retained":true}),
+        &json!({"ready_native_verified":ready,"admitted_native_verified":admitted,"handler_exit_success":handler_ok,"owned_remote_handler_gone":remote_closed,"owned_container_stop_attempted":stop_attempted,"owned_container_stopped":container_stopped,"sdk_disconnect_acknowledged":closed,"sdk_disconnected":closed,"native_actor_absent":native_actor_absent,"archive_complete":archive_complete,"idle_container_preserved_for_archive_recovery":remote_closed && native_actor_absent && !archive_complete && !container_stopped,"artifact_hashes_unchanged":post_hash.is_ok(),"owned_npc_cleanup_attempted":summon_attempted,"cleanup_complete":cleanup_complete,"saved_state_evidence":"Pending independent before/after projection capture; entity absence does not prove saved health/deaths/inventory","certifies_goal_completion":false,"original_errors_retained":true}),
     )?;
     ensure(
-        handler_ok && closed && ready && admitted && post_hash.is_ok() && cleanup_complete,
+        handler_ok
+            && remote_closed
+            && container_stopped
+            && native_actor_absent
+            && session_cleared
+            && archive_complete
+            && ready
+            && admitted
+            && post_hash.is_ok()
+            && cleanup_complete,
         "launch failed/incomplete; retained outputs are not a PASS",
     )
 }

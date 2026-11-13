@@ -80,7 +80,49 @@ pub fn free_bytes(path: &Path) -> Result<u64> {
         "disk measurement failed",
     )?;
     let stat = unsafe { stat.assume_init() };
-    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    // libc's statvfs integer widths vary across supported Unix targets.
+    #[allow(clippy::unnecessary_cast)]
+    let bytes = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+    Ok(bytes)
+}
+fn replace_private_json(path: &Path, value: &Value) -> Result<()> {
+    canonical(path)?;
+    read(path, 16384)?;
+    let temporary = path.with_extension("bench-session.new");
+    let mut out = create(&temporary)?;
+    let result = (|| -> Result<()> {
+        out.write_all(&serde_json::to_vec(value)?)?;
+        out.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(path.parent().ok_or("profile parent absent")?)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+/// Keep each endpoint/credential unchanged; synchronize only the session field.
+pub fn sync_session(f: &Fixture, clear: bool) -> Result<()> {
+    let mut host = json(f.host_profile()?, 16384)?;
+    let mut internal = json(&f.profile(), 16384)?;
+    ensure(
+        host["instance_id"] == f.instance_id
+            && host["credential"] == internal["credential"]
+            && internal["instance_id"] == f.instance_id,
+        "profile identity differs during session sync",
+    )?;
+    internal["session"] = if clear {
+        Value::Null
+    } else {
+        host["session"].clone()
+    };
+    replace_private_json(&f.profile(), &internal)?;
+    if clear {
+        host["session"] = Value::Null;
+        replace_private_json(f.host_profile()?, &host)?;
+    }
+    Ok(())
 }
 pub fn utc_ms() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())

@@ -21,14 +21,16 @@ harness, heal, respawn, roll back the world or award a Survival PASS.
 
 Build/review the evidence package under the operator's coordinated compiler
 lease. Run the bench on the operator host, never inside a model workspace.
-`preflight` makes no SDK/gameplay/RCON calls; it inspects the existing container
-and hashes its declared artifacts. `stage` and `launch` make real connections and,
+`preflight` uses read-only SDK `discover ENDPOINT` to require the actual frozen
+ready instance's `minecraft:fresh_observation` capability, without an actor
+connection or RCON/gameplay call. It inspects the existing container and hashes
+declared artifacts, and checks config/spec regular-file mode0600 and effective
+UID ownership inside the container. `stage` and `launch` make real connections and,
 when RCON is configured, the narrowly declared staging operations.
 
 ```sh
 mc-sdk-bench preflight /private/case/fixture.json FIXTURE_SHA256 /private/case/run
-mc-sdk-bench stage /private/case/fixture.json FIXTURE_SHA256 /private/case/run
-mc-sdk-bench launch /private/case/fixture.json FIXTURE_SHA256 /private/case/run
+bot-dev capture /private/case/outer 600 -- mc-sdk-bench run /private/case/fixture.json FIXTURE_SHA256 /private/case/run
 ```
 
 Use an absolute canonical mode-700 case directory outside bot mounts. Its files
@@ -37,7 +39,15 @@ SHA-256 of the reviewed fixture, with real allocated UUIDs and pinned artifacts;
 placeholders fail validation. Each command is attempted once in that directory.
 A failed command is retained, not replaced with a successful-looking attempt.
 
-Stage connects the **already allocated, disconnected** bot profile using the
+The automatic `run` path requires RCON and immediately chains stage and launch;
+it remains disabled alongside standalone launch until integration verification.
+Prepare/check everything before connecting. Do not insert a manual idle window
+between staging and launch: natural hostiles can kill the unprotected actor.
+Standalone stage is an explicit manual handoff only, requiring prompt disconnect
+if launch cannot proceed. Post-stage launch initialization failures attempt the
+ordinary scoped disconnect without replaying mutations.
+
+Stage connects the **already allocated, disconnected** operator profile using the
 fixture's original request ID. The dedicated secret directory must be mounted
 read-only into the container: a directory mount sees the CLI's atomic session
 profile updates, unlike an old single-file bind mount. It may contain only this
@@ -50,6 +60,12 @@ of actor-unique or server-enforced model authority. Opaque key text alone cannot
 prove its authority. Personal/provider account credential
 files, native/server tokens, Docker sockets and unrelated host bind mounts are
 not permitted. Common personal/provider key formats are refused as well.
+The separate mode600 `operator_profile` stays outside all bot mounts and can use
+the host loopback endpoint. Its instance and complete bot credential must match
+the internal profile. Only the session field is atomically synchronized into the
+internal profile, preserving its container HTTPS endpoint and credential; both
+sessions are cleared after disconnection/verified native absence. Profiles are
+never logged.
 
 With RCON, stage checks the actual SDK actor/life, full HP20/food20 and empty
 inventory/cursor, requests guarded teleport, and checks native pose and unchanged
@@ -127,11 +143,16 @@ admission budget. The handler enables the protective body after admission.
   "duration_secs": 120,
   "source_revision": "ACTUAL_40_HEX_SOURCE_COMMIT",
   "container": "existing-operator-container",
+  "container_id": "ACTUAL_64_HEX_DOCKER_ID",
+  "container_started_at": "ACTUAL_DOCKER_STARTED_AT_UTC",
+  "owned_container": true,
+  "bot_dev": {"path":"/private/bin/bot-dev","sha256":"ACTUAL_SHA256"},
   "workspace": "/private/operator/workspace",
   "container_workspace": "/workspace",
   "secret_dir": "/private/operator/bot-secrets",
   "container_secret_dir": "/run/bench-secrets",
   "profile_name": "profile.json",
+  "operator_profile": "/private/operator-only/host-profile.json",
   "model_key_name": null,
   "allocated_model_actor_uuid": null,
   "allocated_model_kind": null,
@@ -171,6 +192,29 @@ optional operator context, not proof that a shared proxy key is actor-unique.
 The public CA may be null, included in the scoped directory, or a separately
 pinned read-only mount. The bench sets `MC_SDK_CA_CERT` to its host path for SDK
 commands and its container path for the handler, retaining normal TLS verification.
+
+Remote finalization binds the frozen container ID/start and actual handler
+PID/start/executable at READY. Host process exit alone is not remote closure.
+On error it checks that identity, sends bounded SIGINT, and stops only the same
+owned container if closure remains unknown. Before emergency stop it attempts a
+three-second nonquiescent archive, explicitly incomplete. Normal closure uses
+existing `bot-dev capture` for an untouched compressed tar of workspace and the
+distinct pinned config `state` path, preserving path hierarchy and runtime journals.
+The state path must be a scoped workspace or `/tmp` child outside secrets.
+It excludes credential-file patterns/cache/target; arbitrary embedded content is
+not certified keyfree. Failed normal archives preserve the container/tmpfs and
+return incomplete rather than discarding source. Recovery argv and ownership
+metadata are saved before handler launch. SIGKILL/host loss remains unknown;
+verify those ownership fields before recovery, never stop a container by a reused name.
+
+Private directory readability does not prove Unix-socket support. Use the
+separately pinned Linux `mc-sdk-runtime-check` described in
+[runtime-filesystem-check.md](runtime-filesystem-check.md) before connecting;
+automatic invocation is pending parent integration. The strict0600 policy is
+unchanged. A completion-kit claim additionally needs external retained player
+inventory proof of both table and wooden pickaxe; cursor/grid/placed blocks or a
+model subgoal cannot substitute. A reconnect's changed menu is a new starting
+state, not an exact replay or fresh-world claim.
 
 ## Capture every original action
 

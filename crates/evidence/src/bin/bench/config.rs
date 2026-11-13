@@ -31,11 +31,17 @@ pub struct Fixture {
     pub duration_secs: u64,
     pub source_revision: String,
     pub container: String,
+    pub container_id: Option<String>,
+    pub container_started_at: Option<String>,
+    #[serde(default)]
+    pub owned_container: bool,
+    pub bot_dev: Option<Pinned>,
     pub workspace: PathBuf,
     pub container_workspace: String,
     pub secret_dir: PathBuf,
     pub container_secret_dir: String,
     pub profile_name: String,
+    pub operator_profile: Option<PathBuf>,
     pub model_key_name: Option<String>,
     pub allocated_model_actor_uuid: Option<String>,
     pub allocated_model_kind: Option<String>,
@@ -86,6 +92,36 @@ impl Fixture {
     pub fn container_profile(&self) -> String {
         format!("{}/{}", self.container_secret_dir, self.profile_name)
     }
+    pub fn host_profile(&self) -> Result<&Path> {
+        self.operator_profile
+            .as_deref()
+            .ok_or_else(|| "operator profile outside bot mounts required".into())
+    }
+    pub fn target(&self) -> Result<&str> {
+        self.container_id
+            .as_deref()
+            .ok_or_else(|| "frozen owned container ID required".into())
+    }
+    pub fn state_path(&self) -> Result<String> {
+        let artifact = self
+            .artifacts
+            .iter()
+            .find(|a| a.container_path == self.handler_args[0])
+            .ok_or("config artifact absent")?;
+        let value = json(&artifact.file.path, 65536)?;
+        let state = value["state"]
+            .as_str()
+            .ok_or("pinned runtime state path required")?;
+        container_path(state)?;
+        ensure(
+            (Path::new(state).starts_with(&self.container_workspace)
+                || Path::new(state).starts_with("/tmp"))
+                && !Path::new(state).starts_with(&self.container_secret_dir)
+                && !Path::new(&self.container_secret_dir).starts_with(state),
+            "runtime state must be a scoped workspace/tmp path outside secrets",
+        )?;
+        Ok(state.into())
+    }
     pub fn validate(&self) -> Result<()> {
         ensure(
             self.version == 1
@@ -94,6 +130,22 @@ impl Fixture {
                 && id(&self.connection_request_id),
             "invalid case/container/request identity",
         )?;
+        ensure(
+            self.owned_container
+                && self
+                    .container_id
+                    .as_deref()
+                    .is_some_and(|id| valid_hash(id, 64))
+                && self
+                    .container_started_at
+                    .as_deref()
+                    .is_some_and(|s| s.len() <= 40 && s.ends_with('Z') && s.contains('T')),
+            "frozen exclusively-owned container ID/start required",
+        )?;
+        self.bot_dev
+            .as_ref()
+            .ok_or("pinned bot-dev required")?
+            .verify()?;
         ensure(
             uuid(&self.player_uuid)
                 && uuid(&self.npc_uuid)
@@ -128,6 +180,12 @@ impl Fixture {
             "explicit operator-attested model allocation required",
         )?;
         canonical(&self.workspace)?;
+        canonical(self.host_profile()?)?;
+        ensure(
+            !self.host_profile()?.starts_with(&self.workspace)
+                && !self.host_profile()?.starts_with(&self.secret_dir),
+            "operator profile must be outside bot workspace and secret mount",
+        )?;
         directory(&self.secret_dir)?;
         canonical(&self.secret_dir)?;
         ensure(
@@ -192,7 +250,10 @@ impl Fixture {
                 )?;
             }
         }
-        for tool in [&self.sdk, &self.docker, &self.evidence] {
+        for tool in [&self.sdk, &self.docker, &self.evidence]
+            .into_iter()
+            .chain(self.bot_dev.iter())
+        {
             ensure(
                 !tool.path.starts_with(&self.workspace) && !tool.path.starts_with(&self.secret_dir),
                 "operator tools must be outside bot workspace and secrets",
@@ -304,10 +365,17 @@ impl Fixture {
             )?;
         }
         self.secrets()?;
+        self.state_path()?;
         Ok(())
     }
     pub fn secrets(&self) -> Result<Secrets> {
         let profile = json(&self.profile(), 16384)?;
+        let operator = json(self.host_profile()?, 16384)?;
+        ensure(
+            operator["instance_id"] == profile["instance_id"]
+                && operator["credential"] == profile["credential"],
+            "operator/internal profiles must have identical instance and scoped credential",
+        )?;
         ensure(
             profile["instance_id"] == self.instance_id
                 && profile["credential"]["player_uuid"] == self.player_uuid
@@ -336,6 +404,9 @@ impl Fixture {
         if let Some(session) = profile["session"]["session_id"].as_str() {
             values.push(session.to_owned());
         }
+        if let Some(session) = operator["session"]["session_id"].as_str() {
+            values.push(session.to_owned());
+        }
         Ok(Secrets(values))
     }
 }
@@ -360,6 +431,11 @@ fn same_point(value: &Value, expected: [f64; 3]) -> bool {
 }
 /// Inspect only selected Docker fields, never Config.Env or full inspect output.
 pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
+    ensure(
+        value["id"].as_str() == f.container_id.as_deref()
+            && value["started_at"].as_str() == f.container_started_at.as_deref(),
+        "container ID/start differs from frozen owner",
+    )?;
     let names = value["env_names"]
         .as_array()
         .ok_or("container environment-name inventory absent")?;
@@ -451,6 +527,10 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
             .as_str()
             .ok_or("mount destination absent")?;
         let rw = mount["RW"].as_bool().ok_or("mount access absent")?;
+        ensure(
+            source.is_empty() || !f.host_profile()?.starts_with(source),
+            "operator profile exposed by bot mount",
+        )?;
         if let Some(rcon) = &f.operator_rcon {
             ensure(
                 source.is_empty() || !rcon.password_file.starts_with(source),

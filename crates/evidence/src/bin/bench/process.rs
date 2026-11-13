@@ -10,6 +10,7 @@ use std::{
 pub struct Output {
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+    pub interrupted: bool,
     pub success: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -114,9 +115,15 @@ impl Runner for SystemRunner {
         let mut stderr = Vec::new();
         let mut pending = Vec::new();
         let mut timed_out = false;
+        let mut interrupted = false;
         let mut failed = false;
         let mut status = None;
         loop {
+            if take_interrupt() {
+                interrupted = true;
+                let _ = child.kill();
+                break;
+            }
             if started.elapsed() >= Duration::from_secs(seconds) {
                 timed_out = true;
                 let _ = child.kill();
@@ -135,12 +142,12 @@ impl Runner for SystemRunner {
                         pending.extend_from_slice(&bytes);
                         while let Some(n) = pending.iter().position(|b| *b == b'\n') {
                             let line: Vec<_> = pending.drain(..=n).collect();
-                            if let Ok(value) = serde_json::from_slice(&line) {
-                                if on_line(&value).is_err() {
-                                    failed = true;
-                                    let _ = child.kill();
-                                    break;
-                                }
+                            if let Ok(value) = serde_json::from_slice(&line)
+                                && on_line(&value).is_err()
+                            {
+                                failed = true;
+                                let _ = child.kill();
+                                break;
                             }
                         }
                         if pending.len() > 1024 * 1024 {
@@ -176,23 +183,27 @@ impl Runner for SystemRunner {
             Some(s) => s,
             None => child.wait()?,
         };
-        if !pending.is_empty() && !failed && !timed_out {
-            if let Ok(value) = serde_json::from_slice(&pending) {
-                if on_line(&value).is_err() {
-                    failed = true;
-                }
-            }
+        if !pending.is_empty()
+            && !failed
+            && !timed_out
+            && let Ok(value) = serde_json::from_slice(&pending)
+            && on_line(&value).is_err()
+        {
+            failed = true;
         }
         Ok(Output {
             exit_code: status.code(),
             signal: std::os::unix::process::ExitStatusExt::signal(&status),
-            success: status.success() && !failed && !timed_out,
+            success: status.success() && !failed && !timed_out && !interrupted,
+            interrupted,
             stdout: secrets.scrub(&stdout),
             stderr: secrets.scrub(&stderr),
             timed_out,
         })
     }
 }
+// One explicit operator boundary carries fixture, private ledger and streaming READY callback.
+#[allow(clippy::too_many_arguments)]
 pub fn execute(
     runner: &mut dyn Runner,
     f: &Fixture,
@@ -233,7 +244,7 @@ pub fn execute(
     stderr.sync_all()?;
     save(
         &case.join(format!("{label}.status.json")),
-        &json!({"started_utc_ms":started,"finished_utc_ms":utc_ms()?,"success":out.success,"exit_code":out.exit_code,"signal":out.signal,"timed_out":out.timed_out,"stdout_sha256":sha256(&out.stdout),"stderr_sha256":sha256(&out.stderr),"argv_retained":false}),
+        &json!({"started_utc_ms":started,"finished_utc_ms":utc_ms()?,"success":out.success,"exit_code":out.exit_code,"signal":out.signal,"interrupted":out.interrupted,"timed_out":out.timed_out,"stdout_sha256":sha256(&out.stdout),"stderr_sha256":sha256(&out.stderr),"argv_retained":false}),
     )?;
     Ok(out)
 }

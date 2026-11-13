@@ -35,7 +35,10 @@ impl Runner for Fake {
         out.stderr = secrets.scrub(&out.stderr);
         for line in out.stdout.split(|b| *b == b'\n') {
             if let Ok(v) = serde_json::from_slice(line) {
-                on_line(&v)?;
+                if on_line(&v).is_err() {
+                    out.success = false;
+                    break;
+                }
             }
         }
         Ok(out)
@@ -45,6 +48,7 @@ fn output(text: String, success: bool) -> process::Output {
     process::Output {
         exit_code: Some(if success { 0 } else { 1 }),
         signal: None,
+        interrupted: false,
         stdout: text.into_bytes(),
         stderr: Vec::new(),
         success,
@@ -76,7 +80,7 @@ pub(super) fn setup() -> Setup {
         &base.join("secrets/model.key"),
         b"allocated-proxy-key-not-for-output",
     );
-    let config = json!({"profile":"/run/bench-secrets/profile.json","model_key":"/run/bench-secrets/model.key","workspace":"/workspace/program","body":{"enabled":false,"period_ms":150,"decision_samples":128}});
+    let config = json!({"profile":"/run/bench-secrets/profile.json","model_key":"/run/bench-secrets/model.key","workspace":"/workspace/program","state":"/tmp/brain-state","body":{"enabled":false,"period_ms":150,"decision_samples":128}});
     let spec = json!({"entity_uuid":"a3af7dfd-4558-4ef8-bccb-4c5379960383","entity_type":"minecraft:skeleton","entity_health":20,"main_hand":"minecraft:bow","position_tolerance":0.5,"player_health":20,"player_food":20,"player_position":[262.5,63.0,-720.5],"entity_position":[262.5,64.0,-709.5],"timeout_secs":120});
     write(&base.join("handler"), b"reviewed handler");
     write(
@@ -87,7 +91,18 @@ pub(super) fn setup() -> Setup {
     write(&base.join("tool"), b"fake tool");
     let pinned =
         |name: &str| json!({"path":base.join(name),"sha256":hash_file(&base.join(name)).unwrap()});
-    let f:Fixture=serde_json::from_value(json!({"version":1,"case_id":"test-case","instance_id":"a".repeat(64),"player_uuid":"941dfe08-5bbd-4715-8640-898ba50f443d","npc_uuid":"a3af7dfd-4558-4ef8-bccb-4c5379960383","connection_request_id":"test-connect-once","duration_secs":120,"source_revision":"b".repeat(40),"container":"existing-test-container","workspace":base.join("workspace"),"container_workspace":"/workspace","secret_dir":base.join("secrets"),"container_secret_dir":"/run/bench-secrets","profile_name":"profile.json","model_key_name":"model.key","allocated_model_actor_uuid":"941dfe08-5bbd-4715-8640-898ba50f443d","allocated_model_kind":"operator-allocated-proxy","sdk":pinned("tool"),"docker":pinned("tool"),"evidence":pinned("tool"),"artifacts":[{"file":pinned("handler"),"container_path":"/workspace/handler"},{"file":pinned("config.json"),"container_path":"/workspace/config.json"},{"file":pinned("spec.json"),"container_path":"/workspace/spec.json"}],"handler":"/workspace/handler","handler_args":["/workspace/config.json","blocked","120","/workspace/spec.json"],"expected_player_position":[262.5,63.0,-720.5],"expected_npc_position":[262.5,64.0,-709.5],"position_tolerance":0.5,"expected_health":20.0,"expected_food":20,"trace_action_prefix":"body-owned-","operator_rcon":null})).unwrap();
+    let mut f:Fixture=serde_json::from_value(json!({"version":1,"case_id":"test-case","instance_id":"a".repeat(64),"player_uuid":"941dfe08-5bbd-4715-8640-898ba50f443d","npc_uuid":"a3af7dfd-4558-4ef8-bccb-4c5379960383","connection_request_id":"test-connect-once","duration_secs":120,"source_revision":"b".repeat(40),"container":"existing-test-container","workspace":base.join("workspace"),"container_workspace":"/workspace","secret_dir":base.join("secrets"),"container_secret_dir":"/run/bench-secrets","profile_name":"profile.json","model_key_name":"model.key","allocated_model_actor_uuid":"941dfe08-5bbd-4715-8640-898ba50f443d","allocated_model_kind":"operator-allocated-proxy","sdk":pinned("tool"),"docker":pinned("tool"),"evidence":pinned("tool"),"artifacts":[{"file":pinned("handler"),"container_path":"/workspace/handler"},{"file":pinned("config.json"),"container_path":"/workspace/config.json"},{"file":pinned("spec.json"),"container_path":"/workspace/spec.json"}],"handler":"/workspace/handler","handler_args":["/workspace/config.json","blocked","120","/workspace/spec.json"],"expected_player_position":[262.5,63.0,-720.5],"expected_npc_position":[262.5,64.0,-709.5],"position_tolerance":0.5,"expected_health":20.0,"expected_food":20,"trace_action_prefix":"body-owned-","operator_rcon":null})).unwrap();
+    f.container_id = Some("d".repeat(64));
+    f.container_started_at = Some("2026-11-13T00:00:00Z".into());
+    f.owned_container = true;
+    f.bot_dev = Some(f.sdk.clone());
+    f.operator_profile = Some(base.join("operator-profile.json"));
+    let mut host = json(&f.profile(), 16384).unwrap();
+    host["endpoint"] = json!("http://127.0.0.1:19146/mac-eval/");
+    write(
+        f.host_profile().unwrap(),
+        &serde_json::to_vec(&host).unwrap(),
+    );
     Setup {
         _temp: temp,
         f,
@@ -98,7 +113,7 @@ fn observation(f: &Fixture) -> Value {
     json!({"revision":"test","player":{"uuid":f.player_uuid,"life_id":"eac7697a-2c77-4ae2-a7f9-a9ed7aac21b5","dimension":"minecraft:overworld","health":20.0,"food":20,"position":f.expected_player_position,"inventory":[]},"world":{},"menu":{"menu_id":0,"slots":[],"carried":{"item":"minecraft:air","count":0}}})
 }
 fn mounts(f: &Fixture) -> Value {
-    json!({"running":true,"readonly_rootfs":true,"privileged":false,"user":"1000:1000","memory":536870912,"nano_cpus":1000000000u64,"pids":256,"cap_drop":["ALL"],"cap_add":[],"security":["no-new-privileges:true"],"network":"existing-private-network","pid_mode":"","ipc_mode":"private","devices":[],"env_names":["PATH","HOME"],"mounts":[{"Type":"bind","Source":f.secret_dir,"Destination":f.container_secret_dir,"RW":false},{"Type":"tmpfs","Source":"","Destination":"/workspace","RW":true}]})
+    json!({"id":f.container_id,"started_at":f.container_started_at,"running":true,"readonly_rootfs":true,"privileged":false,"user":"1000:1000","memory":536870912,"nano_cpus":1000000000u64,"pids":256,"cap_drop":["ALL"],"cap_add":[],"security":["no-new-privileges:true"],"network":"existing-private-network","pid_mode":"","ipc_mode":"private","devices":[],"env_names":["PATH","HOME"],"mounts":[{"Type":"bind","Source":f.secret_dir,"Destination":f.container_secret_dir,"RW":false},{"Type":"tmpfs","Source":"","Destination":"/workspace","RW":true}]})
 }
 fn preflight_replies(f: &Fixture) -> VecDeque<process::Output> {
     let mut q = VecDeque::from([output(mounts(f).to_string(), true)]);
@@ -112,6 +127,9 @@ fn preflight_replies(f: &Fixture) -> VecDeque<process::Output> {
     if f.model_key_name.is_some() {
         q.push_back(output(String::new(), true));
     }
+    q.push_back(output("1000".into(), true));
+    q.push_back(output("8180 600 1000\n8180 600 1000\n".into(), true));
+    q.push_back(output(json!({"ready":true,"instance_id":f.instance_id,"capabilities":["minecraft:fresh_observation"]}).to_string(),true));
     q
 }
 #[test]
@@ -126,6 +144,37 @@ fn fixture_rejects_credential_copy_extra_mount_files_and_drift() {
     fs::remove_file(s.f.secret_dir.join("server-native.token")).unwrap();
     fs::write(&s.f.artifacts[0].file.path, b"changed handler").unwrap();
     assert!(s.f.validate().is_err());
+}
+#[test]
+fn list_fastpath_refuses_nonloopback_before_opening_any_fixture_or_secret() {
+    assert!(
+        run(vec![
+            "rcon-list".into(),
+            "192.0.2.1:25575".into(),
+            "/nonexistent/password".into()
+        ])
+        .is_err()
+    );
+}
+#[test]
+fn absent_fresh_capability_stops_preflight_before_connect() {
+    let s = setup();
+    let mut replies = preflight_replies(&s.f);
+    *replies.back_mut().unwrap() = output(
+        json!({"ready":true,"instance_id":s.f.instance_id,"capabilities":[]}).to_string(),
+        true,
+    );
+    let mut fake = Fake {
+        replies,
+        calls: vec![],
+    };
+    assert!(preflight(&mut fake, &s.f, &s.case, "no-cap").is_err());
+    assert!(
+        !fake
+            .calls
+            .iter()
+            .any(|a| a.first().is_some_and(|v| v == "connect"))
+    );
 }
 #[test]
 fn mounts_reject_rw_secret_alias_and_unreviewed_credentials() {
@@ -168,6 +217,34 @@ fn blocked_requires_no_model_key_but_task_does() {
     s.f.validate().unwrap();
     s.f.handler_args[1] = "task".into();
     assert!(s.f.validate().is_err());
+}
+#[test]
+fn session_sync_changes_only_session_and_keeps_endpoints_separate() {
+    let s = setup();
+    let original = json(&s.f.profile(), 16384).unwrap();
+    let mut host = json(s.f.host_profile().unwrap(), 16384).unwrap();
+    host["session"] = json!({"session_id":"new-shared-session-identity","adapter_version":"test"});
+    fs::write(
+        s.f.host_profile().unwrap(),
+        serde_json::to_vec(&host).unwrap(),
+    )
+    .unwrap();
+    sync_session(&s.f, false).unwrap();
+    let internal = json(&s.f.profile(), 16384).unwrap();
+    assert_eq!(internal["endpoint"], original["endpoint"]);
+    assert_eq!(internal["credential"], original["credential"]);
+    assert_eq!(internal["session"], host["session"]);
+    assert_ne!(internal["endpoint"], host["endpoint"]);
+    sync_session(&s.f, true).unwrap();
+    assert!(json(&s.f.profile(), 16384).unwrap()["session"].is_null());
+    assert!(json(s.f.host_profile().unwrap(), 16384).unwrap()["session"].is_null());
+}
+#[test]
+fn container_private_inputs_require_mode_owner_and_nonsymlink() {
+    validate_private_metadata("8180 600 1000", 1000).unwrap();
+    for bad in ["81a4 644 1000", "a180 600 1000", "8180 600 0"] {
+        assert!(validate_private_metadata(bad, 1000).is_err());
+    }
 }
 #[test]
 fn invalid_profile_after_child_withholds_raw_output() {
@@ -240,10 +317,10 @@ fn fake_stage_connects_exact_id_and_leaves_console_handoff_pending() {
     };
     stage(&mut fake, &s.f, &s.case, &"c".repeat(64)).unwrap();
     assert_eq!(
-        fake.calls[6],
+        fake.calls[9],
         vec![
             "connect",
-            s.f.profile().to_str().unwrap(),
+            s.f.host_profile().unwrap().to_str().unwrap(),
             "test-connect-once"
         ]
     );
@@ -271,6 +348,13 @@ fn fake_launch_retains_fatal_tail_and_disconnects_without_pass() {
     let mut profile = json(&s.f.profile(), 16384).unwrap();
     profile["session"] = json!({"session_id":"private-session-never-log","adapter_version":"test"});
     fs::write(s.f.profile(), serde_json::to_vec(&profile).unwrap()).unwrap();
+    let mut host = json(s.f.host_profile().unwrap(), 16384).unwrap();
+    host["session"] = profile["session"].clone();
+    fs::write(
+        s.f.host_profile().unwrap(),
+        serde_json::to_vec(&host).unwrap(),
+    )
+    .unwrap();
     save(&s.case.join("stage.json"),&json!({"fixture_sha256":hash,"player_uuid":s.f.player_uuid,"life_id":obs["player"]["life_id"],"connected":true})).unwrap();
     let ready =
         json!({"event":"body_probe_ready","data":{"entity_uuid":s.f.npc_uuid,"observation":obs}});
@@ -292,7 +376,20 @@ fn fake_launch_retains_fatal_tail_and_disconnects_without_pass() {
         replies,
         calls: Vec::new(),
     };
-    assert!(launch(&mut fake, &s.f, &s.case, &hash).is_err());
+    struct Unavailable;
+    impl Runner for Unavailable {
+        fn run(
+            &mut self,
+            _: &Path,
+            _: &[String],
+            _: u64,
+            _: &Secrets,
+            _: &mut dyn FnMut(&Value) -> Result<()>,
+        ) -> Result<process::Output> {
+            Err("fake remote control unavailable".into())
+        }
+    }
+    assert!(launch(&mut fake, &mut Unavailable, &s.f, &s.case, &hash).is_err());
     let raw =
         String::from_utf8(read(&s.case.join("handler.stdout"), 1024 * 1024).unwrap()).unwrap();
     assert!(raw.contains("FATAL [REDACTED]"));
