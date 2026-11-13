@@ -219,6 +219,9 @@ pub fn water_danger(o: &Observation) -> bool {
 /// immediate protection. This grants no new control and never suppresses
 /// hostile, fire or projectile preemption.
 pub(super) fn bounded_surface_swim(o: &Observation, owned_control: &str) -> bool {
+    if o.player["in_water"] != true {
+        return false;
+    }
     let active = &o.player["control"];
     let Some(id) = active["action_id"].as_str().filter(|id| !id.is_empty()) else {
         return false;
@@ -1560,6 +1563,9 @@ mod tests {
         o.player["control"] = json!({"action_id":"foreground-swim","outcome":"running",
             "target":[0.5,2.,0.5],"progress":{"elapsed_ms":500,"releasing":false}});
         assert!(bounded_surface_swim(&o, "body-own"));
+        let mut land = o.clone();
+        land.player["in_water"] = json!(false);
+        assert!(!bounded_surface_swim(&land, "body-own"));
         assert!(
             water_danger(&o),
             "grace does not erase the raw water danger"
