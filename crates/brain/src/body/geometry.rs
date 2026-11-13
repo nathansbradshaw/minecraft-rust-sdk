@@ -198,6 +198,36 @@ pub fn threatened(o: &Observation) -> bool {
 fn perceived(entity: &Value) -> bool {
     entity["visible"] == true || entity["client_memory"]["kind"] == "last_visible_ranged_threat"
 }
+/// Ordinary retreat must not buy endpoint separation by first closing on a
+/// recently recalled nearby shooter. This uses only the existing memory lease,
+/// never an unseen current pose or an extension of its lifetime.
+fn closes_recalled_shooter(o: &Observation, target: [f64; 3]) -> bool {
+    let Some(start) = point(&o.player["position"]) else {
+        return false;
+    };
+    o.world["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|e| {
+            let memory = &e["client_memory"];
+            if e["visible"] != false
+                || e["hostile"] != true
+                || e["ranged_attack"] != true
+                || memory["kind"] != "last_visible_ranged_threat"
+                || memory["expires_after_ticks"] != 160
+                || !memory["age_ticks"].as_u64().is_some_and(|age| age <= 160)
+            {
+                return false;
+            }
+            point(&e["position"]).is_some_and(|enemy| {
+                let radial = [start[0] - enemy[0], start[2] - enemy[2]];
+                (0..3).map(|i| (start[i] - enemy[i]).powi(2)).sum::<f64>() < 25.
+                    && radial[0] * (target[0] - start[0]) + radial[1] * (target[2] - start[2])
+                        < -1e-9
+            })
+        })
+}
 /// The same close-threat rule gates selection and preemption. Recalled hidden
 /// poses cannot become current visible enemies through this predicate.
 pub(super) fn toward_close_threat(o: &Observation, target: [f64; 3]) -> bool {
@@ -987,6 +1017,9 @@ pub(super) fn evade_policy(
         let dy = p[1] - start[1];
         let length = ((p[0] - start[0]).powi(2) + (p[2] - start[2]).powi(2)).sqrt();
         for jump in [false, true] {
+            if !burning && !projectile_danger && !blast_escape && closes_recalled_shooter(o, p) {
+                continue;
+            }
             if toward_close_threat(o, p) {
                 continue;
             }
@@ -1103,6 +1136,90 @@ pub(super) fn evade_policy(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn smoke05_44_ordinary_retreat_refuses_a_closing_prefix_to_leased_shooter_memory() {
+        // F05 control44 translated onto synthetic floor: a policy regression,
+        // not an exact terrain/physics replay or proof of damage prevention.
+        let mut o = world();
+        let start = [262.4960189799556, 63., -718.5000016714098];
+        let enemy = [259.5537836805055, 63., -716.1417898850004];
+        let target = [263.5, 63., -715.5];
+        let translate = |p: [f64; 3]| {
+            [
+                p[0] - start[0] + 0.5,
+                p[1] - start[1] + 1.,
+                p[2] - start[2] + 0.5,
+            ]
+        };
+        o.player = json!({"position":[0.5,1.,0.5],"on_ground":true});
+        o.world["entities"] = json!([{"visible":false,"hostile":true,"ranged_attack":true,
+            "position":translate(enemy),"client_memory":{"kind":"last_visible_ranged_threat",
+                "age_ticks":14,"expires_after_ticks":160}}]);
+        let bad = translate(target);
+        assert!(closes_recalled_shooter(&o, bad));
+        let only_bad = [Admitted {
+            target: bad,
+            jump: false,
+        }];
+        assert!(evade_with_native(&o, &[], &[], &[], 3.5, &only_bad).is_none());
+        let outward = [1.5, 1., -0.5];
+        assert!(!closes_recalled_shooter(&o, outward));
+        let radial = [start[0] - enemy[0], start[2] - enemy[2]];
+        assert!(
+            !closes_recalled_shooter(&o, [0.5 - radial[1] * 0.2, 1., 0.5 + radial[0] * 0.2]),
+            "a lateral step remains available"
+        );
+        let choices = [
+            only_bad[0].clone(),
+            Admitted {
+                target: outward,
+                jump: false,
+            },
+        ];
+        let selected = evade_with_native(&o, &[], &[], &[], 3.5, &choices).unwrap();
+        assert_eq!(
+            [selected.target.x, selected.target.y, selected.target.z],
+            outward
+        );
+        let mut expired = o.clone();
+        expired.world["entities"][0]["client_memory"]["age_ticks"] = json!(161);
+        assert!(!closes_recalled_shooter(&expired, bad));
+        let mut unseen = o.clone();
+        unseen.world["entities"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("client_memory");
+        assert!(
+            !closes_recalled_shooter(&unseen, bad),
+            "raw hidden poses grant no memory"
+        );
+        let mut visible = o.clone();
+        visible.world["entities"][0]["visible"] = json!(true);
+        assert!(
+            !closes_recalled_shooter(&visible, bad),
+            "current visibility keeps its existing rule"
+        );
+        let mut fire = o.clone();
+        fire.player["fire_ticks"] = json!(20);
+        assert!(
+            evade_with_native(&fire, &[], &[], &[], 3.5, &only_bad).is_some(),
+            "fire escape is not fenced"
+        );
+        let mut projectile = o.clone();
+        projectile.world["entities"].as_array_mut().unwrap().push(
+            json!({"visible":true,"projectile":true,"entity_id":20,"position":[0.5,1.9,-1.],"velocity":[0.,0.,0.3]}));
+        assert!(
+            evade_with_native(&projectile, &[], &[], &[], 3.5, &only_bad).is_some(),
+            "active projectile escape is not fenced"
+        );
+        let mut blast = o.clone();
+        blast.world["entities"].as_array_mut().unwrap().push(
+            json!({"visible":true,"hostile":true,"position":[0.5,1.,-2.5],"creeper":{"ignited":true}}));
+        assert!(
+            evade_with_native(&blast, &[], &[], &[], 3.5, &only_bad).is_some(),
+            "blast escape is not fenced"
+        );
+    }
     fn world() -> Observation {
         let mut blocks = Vec::new();
         for x in -4..=4 {
