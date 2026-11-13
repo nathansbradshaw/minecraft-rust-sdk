@@ -27,13 +27,13 @@ pub(super) fn read(native: &Native, uuid: &str, input: &Value) -> Result<Observa
         )
     })?;
     if o.player["uuid"] != uuid
-        || !o.player["life_id"].as_str().is_some_and(|s| !s.is_empty())
-        || !o.world["sample_clock"]["epoch"]
+        || o.player["life_id"].as_str().is_none_or(|s| s.is_empty())
+        || o.world["sample_clock"]["epoch"]
             .as_str()
-            .is_some_and(|s| !s.is_empty())
-        || !o.world["sample_clock"]["nanos"]
+            .is_none_or(|s| s.is_empty())
+        || o.world["sample_clock"]["nanos"]
             .as_str()
-            .is_some_and(|s| s.parse::<u64>().is_ok())
+            .is_none_or(|s| s.parse::<u64>().is_err())
     {
         return Err(ApiError::new(
             ErrorCode::Conflict,
