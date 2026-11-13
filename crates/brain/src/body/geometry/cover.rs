@@ -12,7 +12,9 @@ fn avoids_contact(a: [f64; 3], b: [f64; 3], enemies: &[[f64; 3]]) -> bool {
             0.
         }
         .clamp(0., 1.);
-        (a[0] + t * dx - e[0]).hypot(a[2] + t * dz - e[2]) >= 4.5
+        // A leg starting outside the close-threat guard must not cross into
+        // its five-block envelope and invalidate its own remaining cover path.
+        (a[0] + t * dx - e[0]).hypot(a[2] + t * dz - e[2]) >= 5.
     })
 }
 
@@ -121,7 +123,7 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
                 && (p[0] - start[0]).hypot(p[2] - start[2]) > 0.1
                 && enemies
                     .iter()
-                    .all(|e| (p[0] - e[0]).hypot(p[2] - e[2]) >= 4.5)
+                    .all(|e| (p[0] - e[0]).hypot(p[2] - e[2]) >= 5.)
                 && clear(&cells, p, &obstacles)
                 && supported(&cells, p, &obstacles)
                 && (!guarding || shielded(p, &enemies, &screens))
@@ -225,6 +227,28 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn smoke03_cover_leg_cannot_enter_its_own_close_threat_preemption_zone() {
+        // Exact observed F03 control76 selection poses. This tests the policy
+        // segment only, not omitted foliage, enemy motion or native survival.
+        let start: [f64; 3] = [266.49504053400466, 63., -723.4962032967699];
+        let target = [265.5, 63., -723.5];
+        let enemy = [261.5198474797459, 63., -720.8619663234742];
+        assert!((start[0] - enemy[0]).hypot(start[2] - enemy[2]) > 5.);
+        let goal_distance = (target[0] - enemy[0]).hypot(target[2] - enemy[2]);
+        assert!(goal_distance > 4.5 && goal_distance < 5.);
+        assert!(!avoids_contact(start, target, &[enemy]));
+        // The earlier legitimate distant-cover approach remains admissible.
+        assert!(avoids_contact(
+            [262.50016228453086, 63., -720.499835857603],
+            [260.5, 63., -717.5],
+            &[[262.5, 64., -709.5]]
+        ));
+        assert!(
+            avoids_contact([-5., 1., 5.], [5., 1., 5.], &[[0., 1., 0.]]),
+            "the existing five-block boundary remains allowed"
+        );
+    }
     #[test]
     fn safe_endpoints_cannot_shortcut_through_an_archers_contact_range() {
         assert!(!avoids_contact(
