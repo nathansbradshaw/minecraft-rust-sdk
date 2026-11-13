@@ -1,9 +1,10 @@
 use crate::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1";
+pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1/provider-investigation-v1";
 mod active_source;
 mod context_attestation;
+pub(crate) mod provider_investigation;
 mod repair;
 /// Inspect a source-bound coding repair without inference, execution or writes.
 pub fn compiler_repair_preview(context: &Value) -> Value {
@@ -591,7 +592,7 @@ mod tests {
         assert!(error.to_string().contains("already active"));
         upstream.await.unwrap();
     }
-    async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {
+    pub(super) async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {
         use tokio::io::AsyncReadExt;
         let mut header = Vec::new();
         while !header.ends_with(b"\r\n\r\n") {

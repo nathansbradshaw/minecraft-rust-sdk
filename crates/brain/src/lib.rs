@@ -933,6 +933,180 @@ impl Brain {
             .event("explicit_reconciliation", serde_json::to_value(&receipt)?)?;
         Ok(serde_json::to_value(receipt)?)
     }
+    fn provider_scope(&self) -> Result<String> {
+        let source = if fs::canonicalize(&self.cfg.workspace)? == fs::canonicalize(&self.cfg.state)?
+        {
+            // The general source fingerprint cannot distinguish journal churn
+            // from editable files in this legacy alias layout. Never let it
+            // refund an episode or wake unchanged model-error polling.
+            "shared-state-root-no-source-reset-v1".to_owned()
+        } else {
+            progress::workspace_fingerprint_excluding_state(&self.cfg.workspace, &self.cfg.state)?
+        };
+        Ok(digest(json!({"goal":self.goal,"goal_revision":self.journal.get("goal_revision")?.unwrap_or_default(),
+            "source":source,
+            "worker":worker::revision(&self.cfg)?,"contract":model::REQUEST_CONTRACT}).to_string().as_bytes()))
+    }
+    fn allocated_reasoning_role(
+        &self,
+        preferred: bool,
+        at: i64,
+        scope: &str,
+    ) -> Result<Option<bool>> {
+        use model::provider_investigation::{Route, route};
+        Ok(match route(&self.journal, scope)? {
+            Route::Normal => self.journal.available_model(preferred, at)?,
+            Route::Healthy(role) => self
+                .journal
+                .available_model(role, at)?
+                .filter(|available| *available == role),
+            Route::Blocked => None,
+        })
+    }
+    async fn investigate_provider_failure(
+        &mut self,
+        model: &model::Model,
+        original_context: &Value,
+        original_sol: bool,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> Result<Option<(model::Choice, Value)>> {
+        use model::provider_investigation::{ProviderFailure, consume};
+        // Worker errors are opaque under the existing process protocol. Never
+        // infer authority to switch models by parsing their display strings.
+        if self.cfg.decision_worker.is_some() {
+            return Ok(None);
+        }
+        if fs::canonicalize(&self.cfg.workspace)? == fs::canonicalize(&self.cfg.state)? {
+            self.journal.event(
+                "provider_investigation_blocked",
+                json!({"reason":"separate state directory required for stable source binding",
+                "unchanged_failure_polling":false,"allowances_changed":false}),
+            )?;
+            return Ok(None);
+        }
+        let scope = self.provider_scope()?;
+        if model::provider_investigation::block_existing(&self.journal, &scope)? {
+            self.journal.event(
+                "provider_investigation_blocked",
+                json!({"reason":"episode already consumed; alternate error blocks further requests",
+                "error":error.to_string(),"failed_sol":original_sol,
+                "unchanged_failure_polling":false,"allowances_changed":false}),
+            )?;
+            return Ok(None);
+        }
+        let Some(failure) = ProviderFailure::from_error(error) else {
+            return Ok(None);
+        };
+        let alternate = !original_sol;
+        if self.journal.available_model(alternate, now())? != Some(alternate) {
+            self.journal.event(
+                "provider_investigation_blocked",
+                json!({"reason":"alternate allocation unavailable",
+                "alternate_sol":alternate,"allowances_changed":false}),
+            )?;
+            return Ok(None);
+        }
+        let goal_revision = self.journal.get("goal_revision")?.unwrap_or_default();
+        let worker_revision = worker::revision(&self.cfg)?;
+        let source =
+            progress::workspace_fingerprint_excluding_state(&self.cfg.workspace, &self.cfg.state)?;
+        // Exclude observation revisions/ticks, role changes and context bytes.
+        // Only a material goal, editable source or worker change permits a new episode.
+        let Some((alternate, investigation)) =
+            consume(&self.journal, scope.clone(), failure, original_sol)?
+        else {
+            self.journal.event(
+                "provider_investigation_blocked",
+                json!({"reason":"episode already consumed",
+                "unchanged_failure_polling":false,"allowances_changed":false}),
+            )?;
+            return Ok(None);
+        };
+        let mut context = original_context.clone();
+        context["provider_error_investigation"] = investigation;
+        context["observation"] = projection(&self.observed);
+        context["body"] = self
+            .body
+            .as_ref()
+            .map(|h| h.shared.view())
+            .unwrap_or(Value::Null);
+        context["decision_session"]["role"] = json!(if alternate { "sol" } else { "luna" });
+        context["decision_session"]["requested_model"] = json!(if alternate {
+            "gpt-6.1-sol"
+        } else {
+            "gpt-6-luna"
+        });
+        context["decision_session"]["mode"] = json!("provider_error_investigation");
+        context["decision_session"]["develop_available"] = json!(false);
+        if let Err(e) = fit_context(&mut context) {
+            self.journal.event(
+                "provider_investigation_failed",
+                json!({"error":e.to_string(),"boundary":"context",
+                "episode_exhausted":true,"allowances_changed":false}),
+            )?;
+            return Ok(None);
+        }
+        self.journal
+            .set("last_model_context", &serde_json::to_string(&context)?)?;
+        let goal = self.goal.clone();
+        let lanes = self.body.as_ref().map(|h| h.shared.model_lanes.clone());
+        let future = async {
+            let _permit = match lanes {
+                Some(lanes) => Some(lanes.acquire(alternate).await?),
+                None => None,
+            };
+            model.choose_for(&context, alternate, true).await
+        };
+        tokio::pin!(future);
+        let answer = loop {
+            tokio::select! {reply=&mut future=>break reply,_=tokio::time::sleep(Duration::from_secs(1))=>{
+                if let Err(e)=self.refresh().await {self.journal.event("observation_error",json!({"error":e.to_string()}))?;}
+            }}
+        };
+        if let Err(e) = &answer {
+            self.journal
+                .remember_daily_reset(alternate, e.as_ref(), now())?;
+        }
+        if self.goal != goal
+            || self.journal.get("goal_revision")?.unwrap_or_default() != goal_revision
+            || worker::revision(&self.cfg)? != worker_revision
+            || progress::workspace_fingerprint_excluding_state(
+                &self.cfg.workspace,
+                &self.cfg.state,
+            )? != source
+        {
+            self.journal.event(
+                "provider_investigation_superseded",
+                json!({"discarded_result":true,
+                "episode_exhausted":true}),
+            )?;
+            return Ok(None);
+        }
+        match answer {
+            Ok((choice, mut usage)) => {
+                model::provider_investigation::accepted(&self.journal, &scope)?;
+                if !usage.is_object() {
+                    usage = json!({"original_usage":usage});
+                }
+                usage["provider_investigation"] = json!({"alternate_sol":alternate,"episode_exhausted":true,
+                    "allowances_changed":false});
+                self.journal.event(
+                    "provider_investigation_result",
+                    json!({"accepted":true,"alternate_sol":alternate,
+                    "episode_exhausted":true,"allowances_changed":false}),
+                )?;
+                Ok(Some((choice, usage)))
+            }
+            Err(e) => {
+                self.journal.event(
+                    "provider_investigation_failed",
+                    json!({"error":e.to_string(),"boundary":"model",
+                    "episode_exhausted":true,"allowances_changed":false}),
+                )?;
+                Ok(None)
+            }
+        }
+    }
     pub async fn run(&mut self) -> Result<()> {
         let model = model::Model::new(&self.cfg.model_endpoint, &self.cfg.model_key)?;
         match worker::initialize(&self.cfg) {
@@ -1058,14 +1232,22 @@ impl Brain {
                 self.refresh().await?;
             }
             let preferred = self.journal.take_development_turn()?;
+            let mut provider_scope = self.provider_scope()?;
+            let mut scope_recheck = tokio::time::Instant::now() + Duration::from_secs(1);
             let develop = loop {
-                if let Some(model) = self.journal.available_model(preferred, now())? {
+                if let Some(model) =
+                    self.allocated_reasoning_role(preferred, now(), &provider_scope)?
+                {
                     break model;
                 }
                 // Both allocations are exhausted. Keep the physical and chat
                 // lanes responsive without resubmitting denied requests.
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 self.refresh().await?;
+                if tokio::time::Instant::now() >= scope_recheck {
+                    provider_scope = self.provider_scope()?;
+                    scope_recheck = tokio::time::Instant::now() + Duration::from_secs(1);
+                }
             };
             let pending = self.journal.get("pending_action")?.unwrap_or_default();
             let active_work = preferred || investigation_left > 0;
@@ -1158,7 +1340,11 @@ impl Brain {
             }
             self.journal
                 .set("last_model_context", &serde_json::to_string(&context)?)?;
-            self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"preferred_development":preferred,"quota_fallback":preferred != develop,"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
+            let provider_pinned = matches!(
+                model::provider_investigation::route(&self.journal, &provider_scope)?,
+                model::provider_investigation::Route::Healthy(_)
+            );
+            self.journal.event("model_role", json!({"model":if develop {"gpt-6.1-sol"} else {"gpt-6-luna"},"preferred_development":preferred,"quota_fallback":preferred != develop && !provider_pinned,"provider_recovery_pinned":provider_pinned,"development_turns_remaining":self.journal.get("development_turns_remaining")?,"provider_allowances_changed":false}))?;
             let requested_goal = self.goal.clone();
             let requested_revision = self.journal.get("goal_revision")?.unwrap_or_default();
             let worker_revision = worker::revision(&self.cfg)?;
@@ -1214,23 +1400,46 @@ impl Brain {
                         self.journal.event("model_allocation_unavailable",json!({"development":develop,"retry_at_utc":retry_at,"other_model_work_allowed":true,"allowances_changed":false}))?;
                         continue;
                     }
-                    // Preserve responsive gameplay/chat while the operator or a
-                    // new player goal supplies a changed condition. Repeating a
-                    // rejected inference request is not investigation.
-                    while self.goal == requested_goal
-                        && self.journal.get("goal_revision")?.unwrap_or_default()
-                            == requested_revision
-                        && worker::revision(&self.cfg)? == worker_revision
-                    {
-                        if retry_at.is_some_and(|at| now() >= at) {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        self.refresh().await?;
+                    if self.provider_scope()? != provider_scope {
+                        self.journal.event(
+                            "provider_error_superseded",
+                            json!({"material_scope_changed":true,
+                            "discarded_result":true,"unchanged_failure_polling":false}),
+                        )?;
+                        continue;
                     }
-                    continue;
+                    if let Some(recovered) = self
+                        .investigate_provider_failure(&model, &context, develop, e.as_ref())
+                        .await?
+                    {
+                        recovered
+                    } else {
+                        // Preserve responsive gameplay/chat while the operator or a
+                        // new player goal supplies a changed condition. Repeating a
+                        // rejected inference request is not investigation.
+                        while self.goal == requested_goal
+                            && self.journal.get("goal_revision")?.unwrap_or_default()
+                                == requested_revision
+                            && worker::revision(&self.cfg)? == worker_revision
+                        {
+                            if retry_at.is_some_and(|at| now() >= at) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            self.refresh().await?;
+                            if tokio::time::Instant::now() >= scope_recheck {
+                                if self.provider_scope()? != provider_scope {
+                                    break;
+                                }
+                                scope_recheck =
+                                    tokio::time::Instant::now() + Duration::from_secs(1);
+                            }
+                        }
+                        continue;
+                    }
                 }
             };
+            next = tokio::time::Instant::now() + Duration::from_secs(self.cfg.model_interval_secs);
             self.journal
                 .event("choice", json!({"choice":choice,"usage":usage,"turn":turn}))?;
             if !choice.notes.is_empty() {
