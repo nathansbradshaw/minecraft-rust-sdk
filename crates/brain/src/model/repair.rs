@@ -143,7 +143,7 @@ fn complete_gameplay_experiment(experiment: &Value) -> Option<Value> {
     full["trace_recovered_from_private_journal"] = json!(true);
     Some(full)
 }
-fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
+pub(super) fn run_source(root: &Path, experiment: &Value) -> Option<Value> {
     let bin = experiment["command"].as_str()?;
     if experiment["tool"] != "terminal"
         && (bin.is_empty()

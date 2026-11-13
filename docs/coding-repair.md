@@ -30,6 +30,14 @@ resolve within the bot workspace; source contents, file hash, workspace hash and
 goal revision are checked again before selecting the transition. Changed,
 partial, foreign or unavailable source leaves ordinary tools available.
 
+Active coding sessions can retain one complete `active_program_source` while
+later tools read SDK documentation. It reuses the same Cargo-entry and raw-output
+hash checks, requires the unchanged workspace and goal revision, and adds no
+model calls or development turns. The source is limited to 4 KiB and its complete
+serialized view to 6,000 bytes. Existing verified repair views take precedence;
+an optional source view that cannot fit the context budget is omitted. This does
+not classify successful no-op programs as failures or certify gameplay progress.
+
 The model receives the actual errors/outcomes and must author an exact source
 edit or report the specific missing fact/interface. Edits retain the normal
 compare-and-swap hash guard. Changing request IDs alone cannot fix invalid

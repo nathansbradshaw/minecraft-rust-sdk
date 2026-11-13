@@ -20,6 +20,12 @@ project_manifest is a bounded current Cargo.toml hint, including dependency
 locations when present. Its path and list entry paths are directly readable;
 inspect the actual manifest if the hint is incomplete. Local files are editable
 client context, not authoritative game observations.
+During development or investigation, active_program_source can carry the complete
+current Rust entry across SDK/reference reads. Its retained Cargo stdout hash,
+workspace hash and goal revision must still match. Use the supplied source and
+source_sha256 for an exact edit rather than rereading it solely because the
+latest tool result is API documentation. Changed or unavailable source keeps the
+ordinary read tools available. This field grants no additional model turns.
 menu.summary counts every slot in the current SDK snapshot, separately from
 player inventory. If its non-player slots are empty, paging the same menu adds no
 item evidence. inspected_containers retains prior SDK inspections by stable entity
