@@ -7,8 +7,9 @@ object on respawn. Minecraft 1.21.1 deliberately reuses both the connection and
 numeric `entity_id`; neither identifies a life. The character UUID, gateway
 controller session, credentials and authoritative journals remain unchanged.
 
-`world.sample_clock.epoch` combines the JVM and life epochs. Physics, movement
-previews, body perception and other cached observations cannot cross that lane.
+`world.sample_clock.epoch` combines the JVM and life epochs. Controller-owned
+motion state, movement-preview/perception caches and native-effect checks use
+this lane.
 Native effect and hearing inboxes start fresh. Delayed events from the replaced
 player object are rejected on the server thread. Conversation history remains
 connection-scoped.
@@ -66,13 +67,25 @@ Use only the matching installed integration and an exclusively owned controller.
    nonempty `life_id` and clock epoch. Numeric entity ID may remain identical.
    A natively observed respawn requires the dead-to-alive transition and changed
    life, not healing or another character's observation.
-5. Require that no pre-death owned control resumes, old effect/hearing rows are
-   absent, and old menu/target/preview bindings cannot authorize new work.
-   Obtain fresh observations and complete a new finite movement plus a useful
-   inventory-confirmed gameplay action using fresh IDs on that same controller.
+5. Require that no pre-death owned control resumes and effect/hearing inboxes
+   use new life epochs without retained pre-death events. Obtain fresh
+   observations, discard pre-death menu/target/preview data in the caller, and
+   complete a new finite movement plus a useful inventory-confirmed gameplay
+   action using fresh IDs on that same controller.
 6. Retain the death, recovery, gains/losses, interventions and inactive time in
    the evaluation. Recovery passes only recovery; it does not turn the death
    into a successful Survival trial or establish autonomous competence.
+
+These guarantees cover adapter-owned caches/effect verification and the checks
+provided by particular SDK helpers. `craft_once` binds its journal to the native
+life; navigation validates cached preview scenes against fresh state. Generic
+menu builders and raw actions do not carry a life or observation token.
+`ClickSlot` checks current menu/state numbers, which may be reused after respawn.
+`StartMove` revalidates its target against current native state without requiring
+a preview token. Callers must obtain fresh state after respawn: a newly submitted
+raw request cannot be recognized as old intent solely from its numeric fields.
+Repeating the same durable ID and payload retrieves its original history rather
+than authorizing replay; a new ID represents a new intention.
 
 ## Additional missed-death gate (unrun)
 
@@ -97,12 +110,16 @@ No observation-hold mechanism is supplied by these changes.
    A client polling gap alone does not prove the physical adapter missed death;
    if it saw either fallback signal, this gate remains unproved.
 4. Require changed native `life_id` and clock epoch with the same numeric entity
-   ID. The original control must become uncertain without replay. A cached
-   pre-death observation must fail to start new control. Reconcile the original
-   ID explicitly, obtain fresh state, and complete a new finite movement on the
-   same controller. Preserve old/new effect and hearing epochs and require no
+   ID. The original control must become uncertain without replay. Reconcile the
+   original ID explicitly, obtain fresh state, and complete a new finite movement
+   on the same controller. Preserve old/new effect and hearing epochs and require no
    retained pre-death events. Release and acknowledge the queued correction
    before attempting new movement; preserve that separate receipt/packet lane.
+
+Separately, the controlled transport regression supplies a captured pre-death
+observation directly to the internal physical controller and requires rejection.
+Public raw actions do not accept an observation object; this internal stale-sample
+check is source/transport evidence, not a separate native public-API gate.
 
 This gate is blocked until the matching integration is installed and the
 isolated observation-hold fixture is owned and available. The controlled
