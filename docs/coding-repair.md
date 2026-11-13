@@ -48,6 +48,15 @@ in `cargo_output_view`. Compiler errors still come from the complete raw stream.
 The saved stdout/stderr bytes and hashes are unchanged, including the artifact
 records used for entry recovery. Generic `terminal` output is unchanged.
 
+Accepted model usage includes a bounded `context_attestation` for the final
+serialized request context. It repeats `context_sha256` and records only source
+hash/byte/completeness checks plus the actual `sdk://reference` page hash and
+range. It emits no source, prompt or private path text. This can establish that
+complete source and a reference page coexisted in one accepted request; it does
+not establish model understanding, code execution or gameplay success.
+`last_model_context` is saved before model preparation and cannot alone prove
+that the optional active-source field reached that request.
+
 The model receives the actual errors/outcomes and must author an exact source
 edit or report the specific missing fact/interface. Edits retain the normal
 compare-and-swap hash guard. Changing request IDs alone cannot fix invalid
