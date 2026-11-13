@@ -98,11 +98,16 @@ public final class SdkService implements AutoCloseable {
         channels.sort(Comparator.comparing(row->row.get("protocol")+":"+row.get("id")));
         return Map.of("minecraft_version","1.21.1","platform","neoforge","channels",channels,"max_players",server.getMaxPlayers(),"online_mode",server.usesAuthentication(),"observation_capabilities",List.copyOf(observationProviders.keySet()),"native_observation_features",List.of("minecraft:survival_facts","minecraft:delivered_chat","minecraft:ranged_observation","minecraft:visible_item_use","minecraft:auditory_observation","minecraft:native_effect_clock","minecraft:session_material_preservation","minecraft:physics_facts","minecraft:fluid_facts","minecraft:native_action_effects","minecraft:life_identity"),"observation_query_schemas",Map.copyOf(observationSchemas),"entity_observation_radius",NativeObservation.ENTITY_RADIUS);
     }
-    private static void validateIdentity(UUID uuid,String name){if(uuid==null||name.length()>16||!name.matches("(\\.S_[0-9a-f]{12}|\\.AI_[A-Za-z0-9_]{1,12})"))throw new IllegalArgumentException("SDK identity required");}
+    private static void validateIdentity(UUID uuid,String name){if(uuid==null||!IdentityNames.valid(name))throw new IllegalArgumentException("SDK identity required");}
     private synchronized Object register(JsonObject request){
         exact(request,"player_uuid","player_name");UUID uuid=UUID.fromString(request.get("player_uuid").getAsString());String name=request.get("player_name").getAsString();validateIdentity(uuid,name);
-        String old=identities.get(uuid);if(old!=null){if(!old.equals(name))throw new IllegalArgumentException("Identity conflict");return Map.of("registered",true);}
-        if(identities.containsValue(name)||server.getPlayerList().isOp(new GameProfile(uuid,name)))throw new IllegalArgumentException("Identity unavailable");
+        String old=identities.get(uuid);
+        if(old!=null){
+            if(old.equals(name))return Map.of("registered",true);
+            boolean reserved=tickets.values().stream().anyMatch(t->t.uuid().equals(uuid)&&t.expires()>=System.nanoTime());
+            if(!IdentityNames.canUpgrade(old,name,server.getPlayerList().getPlayer(uuid)!=null,reserved))throw new IllegalArgumentException("Identity conflict");
+        }
+        if(identities.values().stream().anyMatch(n->n.equalsIgnoreCase(name))||server.getPlayerList().isOp(new GameProfile(uuid,name)))throw new IllegalArgumentException("Identity unavailable");
         identities.put(uuid,name);
         try{
             var object=new TreeMap<String,String>();identities.forEach((id,n)->object.put(id.toString(),n));
@@ -110,7 +115,7 @@ public final class SdkService implements AutoCloseable {
             Files.createFile(temp,PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
             try(var channel=java.nio.channels.FileChannel.open(temp,StandardOpenOption.WRITE)){channel.write(java.nio.ByteBuffer.wrap(JSON.toJson(object).getBytes(StandardCharsets.UTF_8)));channel.force(true);}
             Files.move(temp,registryPath,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
-        }catch(Exception failure){identities.remove(uuid);throw new IllegalStateException("Cannot persist SDK identity",failure);}
+        }catch(Exception failure){if(old==null)identities.remove(uuid);else identities.put(uuid,old);throw new IllegalStateException("Cannot persist SDK identity",failure);}
         return Map.of("registered",true);
     }
     private synchronized Object reserve(JsonObject request){

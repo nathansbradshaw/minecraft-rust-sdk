@@ -19,7 +19,16 @@ The Java module implements only local admission and own-player observations;
 normal player handlers perform mutations. Mod behavior remains server-owned.
 
 Registration labels cannot select player names or UUIDs. The gateway generates
-UUIDs and `.S_` names, which cannot be authenticated as ordinary Java usernames.
+UUIDs and stable readable `.S_` names such as `.S_MayaWoods`, which cannot be
+authenticated as ordinary Java usernames. Name collisions receive another
+available first/last-name combination, with a numeric suffix only after the
+unsuffixed combinations are occupied. Registration labels do not select names.
+On gateway startup, old hash-generated names are upgraded transactionally;
+UUIDs, credentials, labels and action history remain intact. Install the matching
+native module before the upgraded gateway: native registration permits only a
+one-time hash-to-readable rename for the same disconnected UUID with no pending
+admission ticket. Imported `.AI_` characters and existing readable names retain
+their names. Saved inventories and progress continue to belong to the same UUID.
 The native registry is instance-owned and persistent; registered identities are
 separate from connected player capacity. Existing identities can be reserved.
 Keys contain 256 bits of OS randomness; only domain-separated SHA-256 hashes

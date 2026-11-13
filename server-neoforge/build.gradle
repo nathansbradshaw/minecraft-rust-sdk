@@ -3,7 +3,7 @@ plugins {
     id 'net.neoforged.moddev' version '2.0.148'
 }
 group = 'dev.minecraftsdk'
-version = '0.1.0-alpha.15'
+version = '0.1.0-alpha.16'
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 repositories { mavenCentral() }
 neoForge {
@@ -29,3 +29,9 @@ tasks.register('nativeLifeTest',JavaExec) {
     mainClass='dev.minecraftsdk.LifeEpochsTest'
 }
 tasks.named('check') { dependsOn 'nativeLifeTest' }
+tasks.register('identityNamesTest',JavaExec) {
+    dependsOn nativeLifeTestClasses
+    classpath=sourceSets.nativeLifeTest.runtimeClasspath
+    mainClass='dev.minecraftsdk.IdentityNamesTest'
+}
+tasks.named('check') { dependsOn 'identityNamesTest' }

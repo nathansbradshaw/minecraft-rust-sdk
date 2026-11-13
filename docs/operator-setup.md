@@ -38,6 +38,15 @@ anything on your machine.
 
 The integration admits exact registered local player connections using one-use
 tickets. An ordinary unticketed Java login still requires normal authentication.
+
+For readable bot names, install native module alpha.16 before upgrading the
+gateway. Stop bot controllers at their settled boundary and back up the gateway
+journal and native `minecraft-sdk/identities.json` with the normal world backup.
+The gateway's next startup replaces its old `.S_` hash names with stable names
+such as `.S_MayaWoods`. On the next connection the native registry upgrades that
+same disconnected UUID once; credentials, player saves and action IDs remain
+intact. Imported `.AI_` names stay unchanged. The native module rejects renaming
+a connected character or one with an outstanding admission ticket.
 Players are non-operator Survival characters; normal server handlers enforce
 claim rules. Unsupported specialized mod operations require an operator-installed
 adapter, not a client-supplied plugin or raw packet.

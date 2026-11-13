@@ -9,6 +9,52 @@ fn internal(_: impl std::fmt::Display) -> ApiError {
 fn conflict(message: &str) -> ApiError {
     ApiError::new(ErrorCode::Conflict, message)
 }
+// Keep the SDK namespace while giving public messages a recognizable person name.
+// Identity and authorization still use the independent random UUID and key.
+fn available_player_name(db: &Connection, bot_id: &str) -> Result<String> {
+    const FIRST: [&str; 32] = [
+        "Maya", "Owen", "Nora", "Eli", "Clara", "Theo", "Iris", "Leo", "Hazel", "Finn", "Ada",
+        "Miles", "Ruby", "Jude", "Lena", "Oscar", "Alice", "Noah", "Eva", "Lucas", "Grace",
+        "Henry", "Zoe", "Felix", "Chloe", "Isaac", "Lucy", "Hugo", "Rose", "Jack", "Anna", "Simon",
+    ];
+    const LAST: [&str; 32] = [
+        "Reed", "Stone", "Woods", "Hayes", "Clark", "Lane", "Ellis", "Shaw", "West", "Hart",
+        "Ford", "Blake", "Wells", "Grant", "Cole", "Reese", "Green", "Young", "Frost", "Hill",
+        "Davis", "Gray", "Moore", "King", "Scott", "Smith", "Brown", "Price", "Cross", "Banks",
+        "Marsh", "Wade",
+    ];
+    let seed = Sha256::digest(bot_id.as_bytes());
+    let start = usize::from(u16::from_be_bytes([seed[0], seed[1]])) % 1024;
+    let occupied_count: i64 = db
+        .query_row(
+            "SELECT (SELECT count(*) FROM bots)+(SELECT count(*) FROM reserved)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(internal)?;
+    // At most N occupied names can block the first N+1 candidates. Bound work
+    // by the registry, rather than imposing a separate bot-count limit.
+    for attempt in 0..=usize::try_from(occupied_count).map_err(internal)? {
+        let index = (start + attempt) % 1024;
+        let suffix = if attempt < 1024 {
+            String::new()
+        } else {
+            (attempt / 1024).to_string()
+        };
+        let name = format!(".S_{}{}{suffix}", FIRST[index / 32], LAST[index % 32]);
+        if name.len() > 16 {
+            return Err(conflict("Generated player name exceeds protocol limit"));
+        }
+        let occupied: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bots WHERE name=?1 UNION ALL SELECT 1 FROM reserved WHERE name=?1)",
+            [&name], |r| r.get(0),
+        ).map_err(internal)?;
+        if !occupied {
+            return Ok(name);
+        }
+    }
+    Err(conflict("No generated player name available"))
+}
 fn independent_control(action: &Action) -> bool {
     matches!(
         action,
@@ -137,6 +183,26 @@ impl Store {
             instance_id,
             _lock: lock,
         };
+        // Upgrade only the exact old generated name for this ID. Imported and
+        // already readable names stay intact. The transaction changes no UUIDs,
+        // keys, labels or action receipts and is safe to repeat after a restart.
+        let tx = store.db.transaction().map_err(internal)?;
+        let old_ids: Vec<String> = {
+            let mut query = tx
+                .prepare("SELECT id FROM bots WHERE name='.S_' || substr(id,1,12) ORDER BY id")
+                .map_err(internal)?;
+            query
+                .query_map([], |r| r.get(0))
+                .map_err(internal)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(internal)?
+        };
+        for id in old_ids {
+            let name = available_player_name(&tx, &id)?;
+            tx.execute("UPDATE bots SET name=?1 WHERE id=?2", params![name, id])
+                .map_err(internal)?;
+        }
+        tx.commit().map_err(internal)?;
         // Previous process could have dispatched any prepared action. Never retry it.
         let pending: Vec<(String, String, String)> = {
             let mut q = store
@@ -222,7 +288,7 @@ impl Store {
         }
         let id = random_id()?;
         let key = random_id()?;
-        let name = format!(".S_{}", &id[..12]);
+        let name = available_player_name(&self.db, &id)?;
         let mut u = random_id()?;
         u.replace_range(12..13, "4");
         u.replace_range(16..17, "8");
@@ -947,6 +1013,122 @@ mod tests {
             .unwrap();
         let actor = s.authenticate(&key.bot_id, &key.key).unwrap();
         (dir, s, key, actor)
+    }
+    #[test]
+    fn readable_names_are_stable_unique_and_do_not_follow_registration_labels() {
+        let (dir, mut store, key, actor) = setup();
+        assert!(actor.name.starts_with(".S_"));
+        assert!(actor.name.as_bytes()[3].is_ascii_uppercase());
+        assert!(actor.name.len() <= 16);
+        assert_ne!(actor.name, ".S_builder");
+        let candidate = available_player_name(&store.db, "collision-fixture").unwrap();
+        store.reserve(&candidate.to_ascii_lowercase()).unwrap();
+        let alternative = available_player_name(&store.db, "collision-fixture").unwrap();
+        assert_ne!(candidate, alternative);
+        store
+            .db
+            .execute(
+                "UPDATE bots SET name=?1 WHERE id=?2",
+                params![alternative, key.bot_id],
+            )
+            .unwrap();
+        assert_ne!(
+            available_player_name(&store.db, "collision-fixture").unwrap(),
+            alternative
+        );
+        let second = store
+            .register(&Registration {
+                name: "MayaWoods".into(),
+            })
+            .unwrap();
+        let second_name = store
+            .authenticate(&second.bot_id, &second.key)
+            .unwrap()
+            .name;
+        drop(store);
+        let store = Store::open(&dir.path().join("journal.sqlite")).unwrap();
+        assert_eq!(
+            store.authenticate(&key.bot_id, &key.key).unwrap().name,
+            alternative
+        );
+        assert_eq!(
+            store
+                .authenticate(&second.bot_id, &second.key)
+                .unwrap()
+                .name,
+            second_name
+        );
+    }
+    #[test]
+    fn old_hash_names_upgrade_without_replacing_identity_keys_or_history() {
+        let (dir, mut store, key, actor) = setup();
+        let old_name = format!(".S_{}", &key.bot_id[..12]);
+        store
+            .db
+            .execute(
+                "UPDATE bots SET name=?1 WHERE id=?2",
+                params![old_name, key.bot_id],
+            )
+            .unwrap();
+        let legacy = store
+            .register(&Registration {
+                name: "legacy-fixture".into(),
+            })
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE bots SET name='.AI_Woods' WHERE id=?1",
+                [&legacy.bot_id],
+            )
+            .unwrap();
+        let request = ActionRequest {
+            action_id: "existing-history".into(),
+            action: Action::Respawn,
+        };
+        let (mut receipt, _) = store.prepare(&key.bot_id, &request, "fixture").unwrap();
+        receipt.outcome = Outcome::Observed;
+        store
+            .save_receipt(&key.bot_id, &request.action_id, &receipt)
+            .unwrap();
+        let history: String = store
+            .db
+            .query_row(
+                "SELECT receipt FROM actions WHERE bot=?1",
+                [&key.bot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&dir.path().join("journal.sqlite")).unwrap();
+        let upgraded = store.authenticate(&key.bot_id, &key.key).unwrap();
+        assert_eq!(upgraded.uuid, actor.uuid);
+        assert_eq!(upgraded.bot_id, actor.bot_id);
+        assert_ne!(upgraded.name, old_name);
+        assert!(upgraded.name.as_bytes()[3].is_ascii_uppercase());
+        assert_eq!(
+            store
+                .authenticate(&legacy.bot_id, &legacy.key)
+                .unwrap()
+                .name,
+            ".AI_Woods"
+        );
+        let after: String = store
+            .db
+            .query_row(
+                "SELECT receipt FROM actions WHERE bot=?1",
+                [&key.bot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, history);
+        assert!(!store.prepare(&key.bot_id, &request, "fixture").unwrap().1);
+        drop(store);
+        let store = Store::open(&dir.path().join("journal.sqlite")).unwrap();
+        assert_eq!(
+            store.authenticate(&key.bot_id, &key.key).unwrap().name,
+            upgraded.name
+        );
     }
     #[test]
     fn storage_budget_preserves_intent_when_receipt_cannot_fit() {
