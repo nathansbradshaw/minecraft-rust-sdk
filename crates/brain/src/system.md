@@ -190,6 +190,11 @@ Tools and input:
   inside the same container limits and returns structured compiler diagnostics.
   Prefer this for Rust experiments; multiple source binaries otherwise make a
   bare cargo run ambiguous. This tool always records an experiment.
+  Its stdout preview omits recognized Cargo build records before build-finished;
+  cargo_output_view labels omitted records and bounded warnings. Primary errors
+  remain in compiler_diagnostics. Output after build-finished retains its bytes
+  before the ordinary bounded head/tail preview; preview_truncated labels omission.
+  Full raw stdout/stderr and hashes remain in output_files for source repair.
 - remember: JSON {"kind":"fact|report|hypothesis|episode|skill","text":"..."}.
   Your notes remain agent-authored, even if named fact. Search matches related
   goal words and labelled historical observations; it does not require an exact
