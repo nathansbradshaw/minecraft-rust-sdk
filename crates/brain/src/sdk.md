@@ -1,4 +1,4 @@
-Rust SDK quick reference (documentation, not a gameplay strategy):
+SDK quick reference (Lua behaviors; Rust SDK and Brain):
 
 - SDK types are re-exported from minecraft_sdk. Their source is crates/core/src/lib.rs
   beside crates/sdk/src/lib.rs under the SDK source root. The crate directory is
@@ -233,3 +233,56 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   IDs. Inspect status/remaining_distance/pending_action in the report. reached
   for BlockReach means a candidate interaction distance, not an obtained item.
   Keep the defensive arbiter enabled and verify the requested game effect.
+- Lua behaviors (AI-edited scripts; resident Rust execution):
+
+The Rust Brain embeds Lua 5.4 using mlua. Use write/edit for relative `.lua`
+files, then `run` with that path. No interpreter install or Rust build is needed.
+
+```lua
+return {
+  version = 1,
+  step = function(ctx)
+    if ctx.state.looked then
+      -- Inspect the original receipt, rather than assuming dispatch succeeded.
+      return { state = ctx.state, done = true }
+    end
+    return {
+      state = { looked = true },
+      command = { tool = "sdk", input = { kind = "look", yaw = 0, pitch = 0 } }
+    }
+  end
+}
+```
+
+`ctx` supplies `state` (initially `{}`), `last_result`, the full SDK `observation`,
+`goal`, and `goal_revision`. The return contains `state` plus exactly one of
+`command` or `done=true`. Commands: `observe` (no input), `query` (SDK
+ObservationQuery table), `sdk` (SDK Action table), `status` / `reconcile` (original
+action ID string), and `navigate` (SDK navigation Goal table). Action/query fields
+match the JSON forms in this reference; use Lua tables, not JSON strings.
+SDK results retain `request`, `receipt`, and `after`; status returns a receipt.
+Observe returns a compact overview; `ctx.observation` retains the full snapshot.
+
+Each step is a pure decision. Rust validates and executes its one operation.
+Scripts cannot directly call the network, filesystem or shell. Only saved JSON
+state persists; local/global Lua variables do not. State is scoped to character,
+instance, workspace path and task revision. Source updates preserve that state.
+Use a new path for a deliberately new program; a new task revision also starts
+fresh state. Historical source and state never authorize replaying an uncertain
+game action. The Rust executor still assigns and journals every action ID.
+
+Changed files are validated before activation between settled actions. An invalid
+candidate retains the previous source and state, disclosed as `rejected_update`.
+Replacing source never replaces the Brain/body/session. Pending controls must
+settle before another script step or update. Each invocation is a slice of at
+most128 operations and the configured tool timeout; `done=false` with
+`slice_exhausted=true` means run the same path to continue. Runtime/dispatch
+failure fences the checkpoint: inspect/reconcile original IDs, then write a
+reviewed successor without repeating unverified mutations. Lua errors are
+returned with current `lua_source` for exact edits.
+
+The VM allows math/string/table/utf8 and ordinary base operations. Limits are
+32768 source bytes,16384 saved JSON state bytes,16 MiB VM memory,100000 Lua
+instructions and a checked100ms computation deadline per step. Host operations
+use the separate tool timeout. No `os`, `io`, `package`, `debug`, `require`,
+dynamic code loading, `pcall`/`xpcall`, or coroutine library is exposed.

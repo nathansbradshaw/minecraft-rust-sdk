@@ -386,8 +386,23 @@ mod tests {
             8,
             "duplicate cannot consume eight more alternative reads"
         );
-        j.activate_configured_goal("different question", false)
+        let previous_revision = j.get("goal_revision").unwrap().unwrap();
+        // Startup configuration cannot replace an already-active durable task.
+        j.activate_configured_goal("different default", false)
             .unwrap();
+        assert_eq!(
+            j.get("goal_revision").unwrap().as_deref(),
+            Some(previous_revision.as_str())
+        );
+        assert!(repeated(&read(&j, &o, A)));
+        // A genuinely accepted new task must invalidate the retained question,
+        // even with exactly the same native menu facts.
+        j.select_goal("different question", "test_goal_selected", json!({}), None)
+            .unwrap();
+        assert_ne!(
+            j.get("goal_revision").unwrap().as_deref(),
+            Some(previous_revision.as_str())
+        );
         assert!(!repeated(&read(&j, &o, A)));
     }
     #[test]

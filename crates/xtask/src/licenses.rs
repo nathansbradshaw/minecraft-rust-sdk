@@ -1,5 +1,23 @@
 //! Collect pinned dependency license declarations/texts for source/binary redistribution.
 use super::*;
+const MLUA_SYS_LICENSE_ORIGIN: &str =
+    "https://github.com/mlua-rs/mlua/blob/a186d461c7772aed4cb0a9fa1d1899121c6450e7/LICENSE";
+
+/// This exact published crate omits its repository's MIT text. Do not generalize
+/// the exception to another source, version, declaration or dependency.
+fn reviewed_license(
+    name: &str,
+    version: &str,
+    declaration: &str,
+    source: &str,
+) -> Option<&'static str> {
+    match (name, version, declaration, source) {
+        ("mlua-sys", "0.13.0", "MIT", "registry+https://github.com/rust-lang/crates.io-index") => {
+            Some(include_str!("../../../licenses/mlua-sys-0.13.0-MIT.txt"))
+        }
+        _ => None,
+    }
+}
 pub fn collect(output: &Path) -> Result<()> {
     let metadata = Command::new("cargo")
         .args([
@@ -44,7 +62,28 @@ pub fn collect(output: &Path) -> Result<()> {
         let destination = output.join(format!("{name}-{version}"));
         std::fs::create_dir_all(&destination)?;
         let mut files = Vec::new();
+        let mut reviewed_origin = None;
         copy_texts(root, root, &destination, &mut files, 0)?;
+        // lua-src's root LICENSE retains an older Lua copyright range. Include
+        // the exact notice carried by the Lua 5.4.9 engine we embed as well.
+        if (name, version, declaration, package["source"].as_str())
+            == (
+                "lua-src",
+                "551.0.2",
+                "MIT",
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+            )
+        {
+            let filename = "Lua-5.4.9-MIT.txt";
+            std::fs::write(
+                destination.join(filename),
+                include_str!("../../../licenses/Lua-5.4.9-MIT.txt"),
+            )?;
+            files.push(filename.to_owned());
+            reviewed_origin = Some(
+                "https://github.com/mlua-rs/lua-src-rs/blob/3c65a4674fd25a89fb924538ce7fe1c89c64a71b/lua-5.4.9/lua.h",
+            );
+        }
         if let Some(explicit) = package["license_file"].as_str() {
             let source = root.join(explicit);
             if source.is_file() {
@@ -56,10 +95,23 @@ pub fn collect(output: &Path) -> Result<()> {
                 }
             }
         }
+        if files.is_empty()
+            && let Some(text) = reviewed_license(
+                name,
+                version,
+                declaration,
+                package["source"].as_str().ok_or("Package source missing")?,
+            )
+        {
+            let filename = "LICENSE.upstream-reviewed.txt";
+            std::fs::write(destination.join(filename), text)?;
+            files.push(filename.to_owned());
+            reviewed_origin = Some(MLUA_SYS_LICENSE_ORIGIN);
+        }
         if files.is_empty() {
             return Err(format!("Review missing packaged license text for {name}").into());
         }
-        report.push(serde_json::json!({"name":name,"version":version,"license":declaration,"source":package["source"],"files":files}));
+        report.push(serde_json::json!({"name":name,"version":version,"license":declaration,"source":package["source"],"files":files,"reviewed_upstream_license":reviewed_origin}));
     }
     report.sort_by_key(|p| format!("{} {}", p["name"], p["version"]));
     std::fs::write(
@@ -72,6 +124,7 @@ pub fn collect(output: &Path) -> Result<()> {
     );
     Ok(())
 }
+
 fn copy_texts(
     root: &Path,
     current: &Path,
@@ -115,4 +168,26 @@ fn copy_texts(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn missing_packaged_text_exception_is_pinned_and_preserves_the_guard() {
+        let source = "registry+https://github.com/rust-lang/crates.io-index";
+        let text = reviewed_license("mlua-sys", "0.13.0", "MIT", source).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(text.as_bytes())),
+            "63b61a30d3e3abcfcb1bda4b99f4eea9fdb7d6ab05fbc513461fef6cf89baf29"
+        );
+        for (name, version, license, origin) in [
+            ("mlua-sys", "0.13.1", "MIT", source),
+            ("mlua-sys", "0.13.0", "Apache-2.0", source),
+            ("other-crate", "0.13.0", "MIT", source),
+            ("mlua-sys", "0.13.0", "MIT", "git+https://example.invalid/"),
+        ] {
+            assert!(reviewed_license(name, version, license, origin).is_none());
+        }
+    }
 }

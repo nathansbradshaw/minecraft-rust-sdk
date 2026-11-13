@@ -1,5 +1,14 @@
 # Repair after a run
 
+New behavior programs use Lua through the Rust Brain. Lua syntax/runtime errors
+and the current bounded `lua_source` view are returned by `run`, so the model can
+make an exact edit without a compiler round trip. Invalid reload candidates keep
+the last good program and saved state. Interrupted host operations retain their
+action IDs and fence the Lua checkpoint; an edit never authorizes replay.
+The source/goal/workspace-bound `active_program_source` view also supports Lua.
+The Cargo-specific repair transitions below remain available for legacy Rust
+programs; they are not required to execute Lua behaviors.
+
 Process success and gameplay success are separate. A Rust program can exit zero
 after a rejected move, expired interaction or delivery of historical receipts.
 The reference brain supplies an explicit repair transition when the recorded

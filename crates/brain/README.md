@@ -1,10 +1,70 @@
 # Experimental container-local coding brain
 
 This Rust harness observes through the public SDK and gives Luna/Sol a real tool
-loop: inspect files, generate Rust, compile/run, act, inspect outcomes and repair.
+loop: inspect files, edit Lua, run, act, inspect outcomes and repair.
 It runs only in a non-root container. The trusted inference service returns data
 and source; it never receives host tool execution permission. SDK gateway/server
 credentials and authoritative journals remain outside the container.
+
+## Lua behaviors and hot reload
+
+The SDK, Brain and responsive body remain Rust. AI-edited behaviors use Lua 5.4
+embedded through mlua; an external Lua interpreter is unnecessary.
+
+1. Write a workspace `.lua` file using the module contract below.
+2. Select the Brain's `run` tool with that relative file path.
+3. Edit the file to update behavior. The same invocation checks changes between
+   settled actions; the next invocation also picks up edits automatically.
+
+```lua
+return {
+  version = 1,
+  step = function(ctx)
+    if ctx.state.observed then return { state = ctx.state, done = true } end
+    return { state = { observed = true }, command = { tool = "observe" } }
+  end
+}
+```
+
+`ctx` contains `state`, `last_result`, full SDK `observation`, `goal` and
+`goal_revision`. Each pure step returns JSON-compatible `state` and either one
+`command` or `done=true`. Commands use `tool` and optional typed `input`: `observe`,
+`query`, `sdk`, `status`, `reconcile`, or `navigate`. See the Lua section in the
+built-in SDK reference for exact inputs. The example in
+[`examples/lua/behavior.lua`](../../examples/lua/behavior.lua) only observes.
+
+Rust validates actions, assigns durable IDs, honors body preemption and records
+receipts. Source is validated in a separate VM before activation; invalid updates
+retain the last good source and saved state. `lua_reloaded` records hashes and
+the resident PID; `lua_reload_rejected` and the tool's `rejected_update` disclose
+failure. Reload never changes the Brain PID, ownership, body or SDK session.
+Only explicit JSON state persists. Lua closures/globals are recreated per step.
+
+State is scoped to workspace/path, instance, actor and goal revision and persists
+across reloads and restarts. A slice runs at most128 commands within the configured
+tool timeout. Resume `slice_exhausted` with the same `run` path. Pending actions
+are inspected without replay before advancing. A failed/interrupted host command
+fences the checkpoint, including the dispatch/response crash gap. Inspect or
+reconcile existing IDs before writing a reviewed successor at a new path.
+An edit does not clear that fence or declare a gameplay effect.
+
+Per-step computation is bounded by100000 Lua instructions, a checked100ms
+deadline,16 MiB VM memory,32 KiB source and16 KiB saved state. Only basic
+math/string/table/utf8 libraries are exposed, without OS/filesystem/network,
+module loading, dynamic loaders or protected calls that could swallow budget
+errors. The existing container remains the boundary for the terminal capability.
+Legacy exact Cargo binary names remain accepted by `run` for existing programs.
+Lua source participates in content-addressed skill snapshots and restoration;
+old Rust manifests and history remain readable. No gameplay reliability is
+established by successful script execution alone.
+
+For a bounded model-free integration check, use
+`minecraft-sdk-brain lua-run PRIVATE_CONFIG.json RELATIVE.lua` inside the isolated
+container with exclusive controller ownership. It uses the normal Rust Brain,
+body and SDK session, emits the Lua result, then performs normal shutdown and
+disconnect. Edit source during that slice to exercise actual hot reload. Record
+the PID/session/actor and native effects separately; the CLI does not certify
+them or restart an autonomous fleet.
 
 Local schema/range validation runs before a pending intention is recorded. For
 pre-fix invalid intentions, reconciliation requires a fresh authenticated gateway
@@ -157,8 +217,8 @@ it leaves generated bot programs and dependency profiles unchanged. Body reactio
 records separate policy, dispatch and observation durations so a transport stall
 cannot be mistaken for a planning improvement.
 
-The workspace should contain an ordinary Rust Cargo project with the SDK and
-Tokio dependencies and an appropriate dependency cache/vendor configuration.
+The workspace can contain Lua behavior files without a Cargo project. Existing
+Rust programs can retain their SDK/Tokio dependencies and cache configuration.
 The supplied coding image includes Rust `rg` and sets `MC_SDK_SOURCE` to its
 readable SDK tree. An operator using an editable workspace copy should set this
 environment variable to that copy when launching the harness. This is a source
@@ -200,7 +260,7 @@ context pressure, saved stdout and the retrievable SDK manual are compacted
 before recalled outcomes are discarded; current observations and action/error
 bindings keep their existing protections.
 
-Rust experiments save content-addressed source before execution and associate
+Lua and Rust experiments save content-addressed source before execution and associate
 the version with the resulting client diagnostics. Identical files share storage.
 Successful older `write` events can recover historical file candidates; a write
 is not proof that its source compiled or achieved a goal. New versions retain the

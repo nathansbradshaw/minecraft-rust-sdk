@@ -1,5 +1,530 @@
 use super::*;
 
+fn admission_shared() -> Arc<Shared> {
+    Arc::new(Shared {
+        mutation: Arc::new(tokio::sync::Mutex::new(())),
+        model_lanes: crate::model::Lanes::default(),
+        feedback: Mutex::new(crate::feedback::Trace::default()),
+        program_generation: AtomicU64::new(0),
+        program_pending: Mutex::new(Default::default()),
+        scheduling_revision: AtomicU64::new(0),
+        emergency: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        latest: Mutex::new(None),
+        reason: Mutex::new(String::new()),
+        failed: tokio::sync::Notify::new(),
+    })
+}
+
+#[test]
+fn observation_admission_requires_read_started_after_contention_and_unchanged_generation() {
+    let shared = admission_shared();
+    let now = Instant::now();
+    let guard = shared.mutation.try_lock().unwrap();
+    let read_began_while_busy = shared.observation_admission();
+    drop(guard);
+    assert!(
+        shared
+            .try_observed_mutation(read_began_while_busy, now)
+            .is_none()
+    );
+    let fresh = shared.observation_admission();
+    assert!(shared.try_observed_mutation(fresh, now).is_some());
+    shared.program_dispatch("original-in-flight").unwrap();
+    assert!(shared.try_observed_mutation(fresh, now).is_none());
+    let unresolved_but_fresh = shared.observation_admission();
+    assert!(
+        shared
+            .try_observed_mutation(unresolved_but_fresh, now)
+            .is_some(),
+        "fresh independent defense may coexist with retained uncertainty"
+    );
+    assert!(
+        shared
+            .try_observed_mutation(unresolved_but_fresh, now - Duration::from_millis(251))
+            .is_none()
+    );
+    assert_eq!(
+        shared.pending_program().unwrap().as_deref(),
+        Some("original-in-flight")
+    );
+    assert!(
+        !shared
+            .program_generation
+            .load(Ordering::Acquire)
+            .is_multiple_of(2)
+    );
+}
+
+#[test]
+fn native_admission_rejects_cached_regression_wrong_actor_and_unknown_scope() {
+    let make = |life: &str, nanos: &str| Observation {
+        revision: nanos.into(),
+        menu: Value::Null,
+        player: json!({"uuid":"own","entity_id":1,"life_id":life,"dimension":"minecraft:overworld","position":[0.,1.,0.]}),
+        world: json!({"sample_clock":{"epoch":life,"nanos":nanos}}),
+    };
+    let mut state = NativeAdmission {
+        generation: 0,
+        required: false,
+        floor: None,
+        actor: Some("own".into()),
+        attempted: None,
+    };
+    let admission = ObservationAdmission {
+        generation: 2,
+        mutation_free: true,
+    };
+    state.begin(admission);
+    assert!(state.required);
+    assert!(state.accept_fresh(&make("life", "200"), admission));
+    assert!(!state.accepts_cached(&make("life", "199")));
+    assert!(!state.accepts_cached(&make("new-life", "201")));
+    assert!(state.accepts_cached(&make("life", "200")));
+    assert!(state.accepts_cached(&make("life", "201")));
+    let mut wrong = make("life", "201");
+    wrong.player["uuid"] = json!("other");
+    assert!(!state.accept_fresh(&wrong, admission));
+    assert!(!state.accept_fresh(&make("life", ""), admission));
+    assert!(!state.accept_fresh(&make("life", "199"), admission));
+    assert!(
+        state.accept_fresh(&make("new-life", "1"), admission),
+        "native authority can establish respawn"
+    );
+    assert!(!state.accepts_cached(&make("life", "999")));
+}
+
+#[test]
+fn default_body_requires_native_refresh_capability_before_startup() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = Profile {
+        endpoint: "https://example.invalid/".into(),
+        instance_id: "fixture".into(),
+        session: None,
+        credential: Credential {
+            bot_id: "own".into(),
+            player_uuid: "own".into(),
+            key: "fixture".into(),
+        },
+    };
+    let server = ServerInfo {
+        api_version: 1,
+        instance_id: "fixture".into(),
+        minecraft_version: "1.21.1".into(),
+        platform: "neoforge".into(),
+        adapter_version: "fixture".into(),
+        ready: true,
+        limits: json!({}),
+        capabilities: [
+            "minecraft:finite_locomotion",
+            "minecraft:survival_facts",
+            "minecraft:ranged_observation",
+            "minecraft:pending_actions",
+            "minecraft:session_material_preservation",
+            auditory::CAPABILITY,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    };
+    let initial = Observation {
+        revision: "fixture".into(),
+        player: Value::Null,
+        world: Value::Null,
+        menu: Value::Null,
+    };
+    let error = Handle::start_for_server(profile, Config::default(), root.path(), initial, &server)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains(menu::FRESH_OBSERVATION_CAPABILITY)
+    );
+    assert!(!root.path().join("actions.sock").exists());
+}
+
+#[tokio::test]
+async fn slow_terminal_status_keeps_reads_live_and_never_overwrites_unflushed_interaction() {
+    // A delayed RESPONSE on an independent connection, not serialized adapter
+    // execution: prove the local controller does not await it before movement
+    // decisions, nor replace the interaction before its receipt arrives.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = stop.clone();
+    let delivered = Arc::new(AtomicBool::new(false));
+    let upstream = tokio::spawn(async move {
+        let mut reads = 0;
+        let mut status = None;
+        loop {
+            let (mut socket, line, input) = admission_incoming(&listener).await;
+            if line.starts_with("GET /v1/bots/own/observations ") {
+                reads += 1;
+                admission_reply(&mut socket,"200 OK",serde_json::to_value(Observation {
+                    revision:reads.to_string(),menu:Value::Null,
+                    player:json!({"uuid":"own","entity_id":1,"dimension":"minecraft:overworld","health":20.,"food":20,"position":[0.5,1.,0.5],
+                        "attack_strength":1.,"interaction":{"action_id":"old-interaction","outcome":"observed","input_released":true}}),
+                    world:json!({"game_time":100+reads,"blocks":[],"entities":[{"entity_id":9,"visible":true,"hostile":true,"type":"minecraft:zombie","position":[2.,1.,0.5]}]}),
+                }).unwrap()).await;
+            } else if line.starts_with("GET /v1/bots/own/actions/old-interaction ") {
+                assert!(status.is_none(), "only one exact status read in flight");
+                let delivered = delivered.clone();
+                status = Some(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(320)).await;
+                    admission_reply(&mut socket,"200 OK",json!({"action_id":"old-interaction","outcome":"observed","adapter_version":"fixture","evidence":{},"error":null})).await;
+                    delivered.store(true, Ordering::Release);
+                }));
+            } else {
+                assert!(line.starts_with("POST /v1/bots/own/actions "), "{line}");
+                let request: ActionRequest = serde_json::from_value(input).unwrap();
+                assert!(matches!(request.action, Action::Attack { entity: 9 }));
+                assert!(
+                    delivered.load(Ordering::Acquire),
+                    "never overwrite terminal interaction before flush"
+                );
+                assert!(
+                    reads >= 5,
+                    "observations progress throughout slow status read"
+                );
+                admission_reply(&mut socket,"200 OK",json!({"action_id":request.action_id,"outcome":"running","adapter_version":"fixture","evidence":{},"error":null})).await;
+                server_stop.store(true, Ordering::Release);
+                break;
+            }
+        }
+        status.unwrap().await.unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        controller(
+            client,
+            Config {
+                period_ms: 50,
+                ..Config::default()
+            },
+            admission_shared(),
+            stop,
+            &journal,
+            3.5,
+            false,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    upstream.await.unwrap();
+}
+
+#[tokio::test]
+async fn withheld_post_response_keeps_observing_then_uses_only_the_fresh_control() {
+    for replaced in [false, true] {
+        withheld_post_scenario(replaced, false, false).await;
+    }
+}
+
+#[tokio::test]
+async fn lost_post_response_and_not_found_retain_original_pending_without_replay() {
+    withheld_post_scenario(true, true, false).await;
+}
+
+#[tokio::test]
+async fn unavailable_native_refresh_never_authorizes_cached_control_or_replays_foreground() {
+    withheld_post_scenario(false, false, true).await;
+}
+
+async fn admission_incoming(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, String, Value) {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(socket.read_u8().await.unwrap());
+        assert!(headers.len() < 8192);
+    }
+    let headers = std::str::from_utf8(&headers).unwrap();
+    let first = headers.lines().next().unwrap().to_owned();
+    let size = headers
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    assert!(size < 16384);
+    let mut body = vec![0; size];
+    socket.read_exact(&mut body).await.unwrap();
+    (
+        socket,
+        first,
+        if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        },
+    )
+}
+async fn admission_reply(socket: &mut tokio::net::TcpStream, status: &str, value: Value) {
+    let body = value.to_string();
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+}
+async fn withheld_post_scenario(replaced: bool, lost_reply: bool, fail_refresh: bool) {
+    // Transport fixture, not Survival: hold an actual initial SDK HTTP POST
+    // while accepting independent observation connections. This deliberately
+    // models a delayed RESPONSE, not a gateway/adapter execution stall.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let shared = admission_shared();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (mut caller, server) = tokio::net::UnixStream::pair().unwrap();
+    let request = LocalActionRequest {
+        version: LOCAL_CONTROL_VERSION,
+        request: ActionRequest {
+            action_id: "original-post".into(),
+            action: Action::UseItem { hand: Hand::Main },
+        },
+    };
+    let done = Arc::new(tokio::sync::Notify::new());
+    let (c, s, d) = (client.clone(), shared.clone(), done.clone());
+    let proxy_task = tokio::spawn(async move {
+        let result = proxy(server, c, s).await;
+        d.notify_one();
+        result
+    });
+    caller
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let (foreground, line, input) = admission_incoming(&listener).await;
+    assert!(line.starts_with("POST /v1/bots/own/actions "));
+    let submitted: ActionRequest = serde_json::from_value(input).unwrap();
+    assert_eq!(submitted.action_id, "original-post");
+    assert!(shared.mutation.try_lock().is_err());
+    assert_eq!(
+        shared.pending_program().unwrap().as_deref(),
+        Some("original-post")
+    );
+    let (upstream_shared, upstream_stop) = (shared.clone(), stop.clone());
+    let upstream = tokio::spawn(async move {
+        let mut foreground = Some(foreground);
+        let mut reads = 0;
+        let mut cancels = 0;
+        let mut released = false;
+        let mut native_attempt = None;
+        let mut native_ready = false;
+        loop {
+            let (mut socket, line, input) = admission_incoming(&listener).await;
+            let native_query = line.starts_with("POST /v1/bots/own/observations/query ");
+            if line.starts_with("GET /v1/bots/own/observations ") || native_query {
+                if !native_query {
+                    reads += 1;
+                }
+                if native_query {
+                    assert_eq!(input["capability"], menu::FRESH_OBSERVATION_CAPABILITY);
+                    assert!(reads >= 5);
+                    if let Some(at) = native_attempt {
+                        assert!(Instant::now().duration_since(at) >= Duration::from_millis(990));
+                    } else if fail_refresh {
+                        native_attempt = Some(Instant::now());
+                        admission_reply(
+                            &mut socket,
+                            "503 Service Unavailable",
+                            serde_json::to_value(ApiError::new(
+                                ErrorCode::NotReady,
+                                "Fresh native read unavailable",
+                            ))
+                            .unwrap(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    native_ready = true;
+                }
+                if reads == 4 && !native_query {
+                    assert!(
+                        upstream_shared.mutation.try_lock().is_err(),
+                        "POST is still genuinely in flight while fresh reads progress"
+                    );
+                    let mut held = foreground.take().unwrap();
+                    if !lost_reply {
+                        admission_reply(&mut held,"200 OK",json!({"action_id":"original-post",
+                            "outcome":"observed","adapter_version":"fixture","evidence":{},"error":null})).await;
+                    }
+                    drop(held);
+                    done.notified().await;
+                    assert!(upstream_shared.mutation.try_lock().is_ok());
+                }
+                // The fourth read began under the old lock and deliberately
+                // returns the OLD scene after the POST has finished. Only the
+                // Even a new cached GET can be stale after lock release. Only
+                // the typed native query supplies the current life/control.
+                let fresh = native_query || released;
+                let changed = fresh && replaced;
+                let control = if changed {
+                    json!({"action_id":"new-life-control","outcome":"observed","input_released":true})
+                } else {
+                    json!({"action_id":"current-move","outcome":if released{"cancelled"}else{"running"},
+                        "input_released":released,"target":[1.5,1.,0.5],"cancel_requested":released})
+                };
+                let snapshot = serde_json::to_value(Observation {
+                    revision:reads.to_string(),menu:Value::Null,
+                    player:json!({"uuid":"own","life_id":if changed{"new-life"}else{"old-life"},"entity_id":1,
+                        "dimension":"minecraft:overworld","health":20.,"food":20,"position":if changed{[30.,1.,30.]}else{[0.5,1.,0.5]},"control":control}),
+                    world:json!({"game_time":100+reads,"sample_clock":{"epoch":if changed{"new-life"}else{"old-life"},"nanos":(100+reads).to_string()},
+                        "blocks":[],"entities":if changed || released{json!([])}else{json!([{"entity_id":9,"visible":true,"hostile":true,"position":[2.5,1.,0.5]}])}}),
+                }).unwrap();
+                admission_reply(
+                    &mut socket,
+                    "200 OK",
+                    if native_query {
+                        json!({"format":"minecraft-fresh-observation-v1","observation":snapshot})
+                    } else {
+                        snapshot
+                    },
+                )
+                .await;
+                if (changed || released) && fresh {
+                    upstream_stop.store(true, Ordering::Release);
+                    if lost_reply {
+                        let (mut status, line, _) = admission_incoming(&listener).await;
+                        assert!(line.starts_with("GET /v1/bots/own/actions/original-post "));
+                        admission_reply(
+                            &mut status,
+                            "404 Not Found",
+                            serde_json::to_value(ApiError::new(
+                                ErrorCode::NotFound,
+                                "Unknown action ID",
+                            ))
+                            .unwrap(),
+                        )
+                        .await;
+                    }
+                    break;
+                }
+            } else {
+                assert!(line.starts_with("POST /v1/bots/own/actions "), "{line}");
+                let action: ActionRequest = serde_json::from_value(input).unwrap();
+                assert!(
+                    reads >= 5,
+                    "must fetch a fresh scene after foreground admission becomes available"
+                );
+                assert!(
+                    native_ready,
+                    "cached frames never replace a failed native query"
+                );
+                assert!(
+                    !replaced,
+                    "must not cancel an old life's control from the stale fourth response"
+                );
+                assert!(
+                    matches!(action.action,Action::CancelControl{ref action_id} if action_id=="current-move")
+                );
+                cancels += 1;
+                assert_eq!(cancels, 1);
+                assert_ne!(action.action_id, "original-post");
+                released = true;
+                admission_reply(
+                    &mut socket,
+                    "200 OK",
+                    json!({"action_id":action.action_id,"outcome":"running",
+                    "adapter_version":"fixture","evidence":{},"error":null}),
+                )
+                .await;
+            }
+        }
+        assert!(reads >= 5);
+        assert_eq!(cancels, usize::from(!replaced));
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller(
+            client.clone(),
+            Config {
+                enabled: true,
+                period_ms: 50,
+                decision_samples: 0,
+                experimental_ranged_boundary_turns: false,
+            },
+            shared.clone(),
+            stop,
+            &journal,
+            3.5,
+            false,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    proxy_task.await.unwrap().unwrap();
+    let mut bytes = Vec::new();
+    caller.read_to_end(&mut bytes).await.unwrap();
+    let response: LocalActionResponse = serde_json::from_slice(&bytes).unwrap();
+    if lost_reply {
+        assert!(matches!(response, LocalActionResponse::Error(_)));
+        assert_eq!(
+            client
+                .action_status("original-post")
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            shared.pending_program().unwrap().as_deref(),
+            Some("original-post")
+        );
+        assert!(
+            !shared
+                .program_generation
+                .load(Ordering::Acquire)
+                .is_multiple_of(2)
+        );
+    } else {
+        assert!(matches!(response,LocalActionResponse::Receipt(r) if r.outcome==Outcome::Observed));
+        assert!(shared.pending_program().unwrap().is_none());
+    }
+    upstream.await.unwrap();
+}
+
 #[test]
 fn visible_blast_invalidates_only_approaching_exposed_targets_without_audio() {
     let mut observation = Observation {

@@ -154,6 +154,32 @@ pub(super) fn run_source_bounded(
     if !(1..=8192).contains(&byte_limit) {
         return None;
     }
+    if experiment["tool"] == "run" && experiment["result"]["language"] == "lua" {
+        let relative = Path::new(experiment["command"].as_str()?);
+        if relative.is_absolute()
+            || relative.extension()? != "lua"
+            || !relative
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        let file = fs::canonicalize(root.join(relative)).ok()?;
+        file.strip_prefix(root).ok()?;
+        let metadata = fs::metadata(&file).ok()?;
+        if !metadata.is_file() || metadata.len() > byte_limit as u64 {
+            return None;
+        }
+        let bytes = fs::read(&file).ok()?;
+        if bytes.len() > byte_limit
+            || experiment["result"]["lua_source"]["source_sha256"] != crate::digest(&bytes)
+        {
+            return None;
+        }
+        return Some(
+            json!({"view":"file","path":file,"source_sha256":crate::digest(&bytes),"source_bytes":bytes.len(),"content_complete":true,"content":std::str::from_utf8(&bytes).ok()?,"authority":"Current Lua source recorded with this run; may have been rejected while last good source ran. No gameplay claim."}),
+        );
+    }
     let bin = experiment["command"].as_str()?;
     if experiment["tool"] != "terminal"
         && (bin.is_empty()

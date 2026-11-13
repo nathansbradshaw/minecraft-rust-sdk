@@ -27,7 +27,7 @@ fn valid_path(p: &str) -> bool {
     !p.as_os_str().is_empty()
         && !p.is_absolute()
         && p.components().all(|c| matches!(c, Component::Normal(_)))
-        && (p.extension().is_some_and(|e| e == "rs")
+        && (p.extension().is_some_and(|e| e == "rs" || e == "lua")
             || matches!(
                 p.file_name().and_then(|v| v.to_str()),
                 Some("Cargo.toml" | "Cargo.lock")
@@ -67,7 +67,7 @@ fn immutable(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn retain(root: &Path, files: BTreeMap<String, String>) -> Result<String> {
     let manifest = Manifest {
-        format: "rust-source-version-v1".into(),
+        format: "program-source-version-v2".into(),
         files,
     };
     let bytes = serde_json::to_vec(&manifest)?;
@@ -75,7 +75,7 @@ fn retain(root: &Path, files: BTreeMap<String, String>) -> Result<String> {
     immutable(&root.join("versions").join(format!("{id}.json")), &bytes)?;
     Ok(id)
 }
-/// Snapshot the editable Rust crate, excluding caches, state and symlinks.
+/// Snapshot editable Lua/Rust source, excluding caches, state and symlinks.
 /// Identical file bytes are shared across all versions; executables are rebuilt.
 pub fn snapshot(workspace: &Path, state: &Path) -> Result<Option<String>> {
     let workspace = workspace.canonicalize()?;
@@ -120,7 +120,7 @@ pub fn snapshot(workspace: &Path, state: &Path) -> Result<Option<String>> {
                 }
                 ensure(
                     files.len() < 128 && m.len() <= 65536,
-                    "Bounded Rust source file required",
+                    "Bounded program source file required",
                 )?;
                 let bytes = fs::read(&p)?;
                 ensure(
@@ -159,8 +159,10 @@ pub fn inspect(state: &Path, id: &str) -> Result<Value> {
     ensure(digest(&bytes) == id, "Version manifest hash mismatch")?;
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
     ensure(
-        manifest.format == "rust-source-version-v1"
-            && !manifest.files.is_empty()
+        matches!(
+            manifest.format.as_str(),
+            "rust-source-version-v1" | "program-source-version-v2"
+        ) && !manifest.files.is_empty()
             && manifest.files.len() <= 128,
         "Unsupported source manifest",
     )?;

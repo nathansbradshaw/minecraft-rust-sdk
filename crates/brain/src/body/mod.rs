@@ -77,7 +77,111 @@ impl std::fmt::Display for StaleObservation {
     }
 }
 impl std::error::Error for StaleObservation {}
+#[derive(Clone, Copy)]
+struct ObservationAdmission {
+    generation: u64,
+    mutation_free: bool,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct NativeBasis {
+    actor: String,
+    life: String,
+    dimension: String,
+    epoch: String,
+    nanos: u64,
+}
+impl NativeBasis {
+    fn read(o: &Observation) -> Option<Self> {
+        fn text(value: &Value) -> Option<String> {
+            value.as_str().filter(|s| !s.is_empty()).map(str::to_owned)
+        }
+        geometry::point(&o.player["position"])?;
+        o.player["entity_id"].as_i64()?;
+        Some(Self {
+            actor: text(&o.player["uuid"])?,
+            life: text(&o.player["life_id"])?,
+            dimension: text(&o.player["dimension"])?,
+            epoch: text(&o.world["sample_clock"]["epoch"])?,
+            nanos: o.world["sample_clock"]["nanos"].as_str()?.parse().ok()?,
+        })
+    }
+    fn permits_cached(&self, other: &Self) -> bool {
+        self.actor == other.actor
+            && self.life == other.life
+            && self.dimension == other.dimension
+            && self.epoch == other.epoch
+            && other.nanos >= self.nanos
+    }
+}
+// Only a typed native query can discharge a foreground-mutation fence. An
+// ordinary Observe response may still contain a pre-mutation cached snapshot.
+struct NativeAdmission {
+    generation: u64,
+    required: bool,
+    floor: Option<NativeBasis>,
+    actor: Option<String>,
+    attempted: Option<Instant>,
+}
+impl NativeAdmission {
+    fn begin(&mut self, admission: ObservationAdmission) {
+        self.required |= !admission.mutation_free || admission.generation != self.generation;
+    }
+    fn accepts_cached(&self, o: &Observation) -> bool {
+        self.floor.as_ref().is_none_or(|floor| {
+            NativeBasis::read(o).is_some_and(|other| floor.permits_cached(&other))
+        })
+    }
+    fn accept_fresh(&mut self, o: &Observation, admission: ObservationAdmission) -> bool {
+        let Some(basis) = NativeBasis::read(o) else {
+            return false;
+        };
+        if self
+            .actor
+            .as_ref()
+            .is_some_and(|actor| actor != &basis.actor)
+            || self.floor.as_ref().is_some_and(|floor| {
+                floor.life == basis.life && floor.epoch == basis.epoch && basis.nanos < floor.nanos
+            })
+        {
+            return false;
+        }
+        self.actor = Some(basis.actor.clone());
+        self.floor = Some(basis);
+        self.generation = admission.generation;
+        self.required = false;
+        true
+    }
+}
+struct InteractionRead {
+    id: String,
+    task: tokio::task::JoinHandle<Option<Receipt>>,
+}
+impl Drop for InteractionRead {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 impl Shared {
+    fn observation_admission(&self) -> ObservationAdmission {
+        ObservationAdmission {
+            generation: self.program_generation.load(Ordering::Acquire),
+            mutation_free: self.mutation.try_lock().is_ok(),
+        }
+    }
+    fn try_observed_mutation(
+        &self,
+        basis: ObservationAdmission,
+        observed_at: Instant,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.mutation.try_lock().ok()?;
+        // A read begun behind an in-flight dispatch cannot become admissible
+        // merely because that dispatch completed while its response arrived.
+        // Try a new observation cycle instead; never retire/replay its ID here.
+        (basis.mutation_free
+            && basis.generation == self.program_generation.load(Ordering::Acquire)
+            && observed_at.elapsed() < Duration::from_millis(250))
+        .then_some(guard)
+    }
     fn set_urgent(&self, urgent: bool) -> bool {
         let previous = self.emergency.swap(urgent, Ordering::AcqRel);
         if previous != urgent {
@@ -176,6 +280,7 @@ impl Handle {
             "minecraft:pending_actions",
             "minecraft:session_material_preservation",
             auditory::CAPABILITY,
+            menu::FRESH_OBSERVATION_CAPABILITY,
         ] {
             ensure(
                 server.capabilities.iter().any(|c| c == capability),
@@ -557,6 +662,19 @@ async fn controller(
     let mut previous_health = Value::Null;
     let mut body_sprint = false;
     let mut inspected_interaction = String::new();
+    let mut interaction_read: Option<InteractionRead> = None;
+    let mut interaction_attempt = Instant::now() - Duration::from_secs(1);
+    let mut native_admission = NativeAdmission {
+        generation: shared.program_generation.load(Ordering::Acquire),
+        required: false,
+        floor: None,
+        actor: shared.latest.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .and_then(|(_, o)| o.player["uuid"].as_str().map(str::to_owned))
+        }),
+        attempted: None,
+    };
     let mut cancelled_item_use = String::new();
     let mut progress = tactics::Progress::default();
     let mut projectiles = tactics::Projectiles::default();
@@ -589,7 +707,9 @@ async fn controller(
             break;
         }
         let started = Instant::now();
-        let observed_generation = shared.program_generation.load(Ordering::Acquire);
+        let mut admission = shared.observation_admission();
+        native_admission.begin(admission);
+        let observed_generation = admission.generation;
         let mut observed =
             match tokio::time::timeout(Duration::from_secs(2), client.observe()).await {
                 Ok(Ok(o)) => o,
@@ -616,7 +736,51 @@ async fn controller(
                 }
             };
         last_error.clear();
-        let observed_at = Instant::now();
+        let mut observed_at = Instant::now();
+        if native_admission.actor.is_none() {
+            native_admission.actor = observed.player["uuid"].as_str().map(str::to_owned);
+        }
+        if !native_admission.accepts_cached(&observed) {
+            native_admission.required = true;
+        }
+        if native_admission.required
+            && admission.mutation_free
+            && native_admission
+                .attempted
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            native_admission.attempted = Some(Instant::now());
+            let fresh =
+                tokio::time::timeout(Duration::from_millis(650), menu::observe_fresh(&client))
+                    .await;
+            let current = shared.observation_admission();
+            if let Ok(Ok(fresh)) = fresh
+                && current.mutation_free
+                && current.generation == admission.generation
+                && native_admission.accept_fresh(&fresh, admission)
+            {
+                observed = fresh;
+                observed_at = Instant::now();
+            } else {
+                j.event("body_native_admission_deferred", json!({"reason":"Fresh native basis unavailable after foreground mutation; cached state cannot authorize control","pending_ids_retained":true}))?;
+            }
+        }
+        // Keep cached reads available during contention, but never act on a
+        // cached pre-mutation frame or publish a frame behind a native floor.
+        admission.mutation_free &= !native_admission.required;
+        if !native_admission.accepts_cached(&observed) {
+            if shared
+                .latest
+                .lock()
+                .ok()
+                .and_then(|cache| cache.as_ref().map(|(at, _)| at.elapsed()))
+                .is_some_and(|age| age >= Duration::from_secs(3))
+            {
+                return Err("Body lost nonregressive native observations".into());
+            }
+            next_cycle(started, cfg.period_ms).await;
+            continue;
+        }
         let observation_ms = started.elapsed().as_millis();
         cycles += 1;
         if hearing_enabled {
@@ -800,17 +964,46 @@ async fn controller(
         // body interaction replaces the adapter's current job. Reads never
         // replay input and remain independent of slow model/tool execution.
         let interaction = &observed.player["interaction"];
-        if let Some(id) = interaction["action_id"].as_str()
+        if interaction_read.is_none()
+            && interaction_attempt.elapsed() >= Duration::from_secs(1)
+            && let Some(id) = interaction["action_id"].as_str()
             && interaction["outcome"] != "running"
             && id != inspected_interaction
-            && let Ok(Ok(receipt)) =
-                tokio::time::timeout(Duration::from_millis(400), client.action_status(id)).await
+        {
+            let id = id.to_owned();
+            let (read_client, read_id) = (client.clone(), id.clone());
+            interaction_attempt = Instant::now();
+            interaction_read = Some(InteractionRead {
+                id,
+                task: tokio::spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_millis(400),
+                        read_client.action_status(&read_id),
+                    )
+                    .await
+                    .ok()?
+                    .ok()
+                }),
+            });
+        }
+        let completed = if interaction_read
+            .as_ref()
+            .is_some_and(|read| read.task.is_finished())
+        {
+            let mut read = interaction_read.take().expect("finished status read");
+            let receipt = (&mut read.task).await.ok().flatten();
+            receipt.map(|receipt| (read.id.clone(), receipt))
+        } else {
+            None
+        };
+        if let Some((id, receipt)) = completed
+            && receipt.action_id == id
             && (receipt.outcome.terminal() || receipt.outcome == Outcome::Uncertain)
         {
-            inspected_interaction = id.into();
-            shared.resolve_program_receipt(id, &receipt)?;
+            inspected_interaction = id.clone();
+            shared.resolve_program_receipt(&id, &receipt)?;
             j.event("body_interaction_status",json!({"action_id":id,"outcome":receipt.outcome,"native_effect_verified":receipt.evidence["native_effect_verified"],"input_released":receipt.evidence["input_released"],"evidence_sha256":crate::digest(receipt.evidence.to_string().as_bytes()),"replayed":false}))?;
-            if owned_meal.as_ref().is_some_and(|(action, _)| action == id)
+            if owned_meal.as_ref().is_some_and(|(action, _)| action == &id)
                 && let Some((_, meal)) = owned_meal.take()
             {
                 j.event("body_meal_result", json!({
@@ -832,7 +1025,10 @@ async fn controller(
             }
         }
         if danger {
-            let _guard = shared.mutation.lock().await;
+            let Some(_guard) = shared.try_observed_mutation(admission, observed_at) else {
+                next_cycle(started, cfg.period_ms).await;
+                continue;
+            };
             let mut cancelling_control = false;
             if interaction["held_item_use"] == true
                 && interaction["outcome"] == "running"
@@ -1017,6 +1213,8 @@ async fn controller(
             // or wait for the route's expiry before attempting knockback.
             if !dead
                 && !cancelling_control
+                && (interaction["action_id"].is_null()
+                    || interaction["action_id"] == inspected_interaction)
                 && last_attack.elapsed() >= Duration::from_millis(650)
                 && let Some(entity) = tactics::defensive_target(&observed)
             {
@@ -1034,7 +1232,10 @@ async fn controller(
             // Release breathing-only input once, then wait for native release.
             // A three-second hold here lets the character sink before handoff.
             if active["cancel_requested"] != true && breathing_release_requested != owned_control {
-                let _guard = shared.mutation.lock().await;
+                let Some(_guard) = shared.try_observed_mutation(admission, observed_at) else {
+                    next_cycle(started, cfg.period_ms).await;
+                    continue;
+                };
                 breathing_release_requested = owned_control.clone();
                 let r = send(
                     &client,
@@ -1060,7 +1261,10 @@ async fn controller(
             )
         {
             if body_sprint {
-                let _guard = shared.mutation.lock().await;
+                let Some(_guard) = shared.try_observed_mutation(admission, observed_at) else {
+                    next_cycle(started, cfg.period_ms).await;
+                    continue;
+                };
                 send(&client, j, Action::Sprint { enabled: false }).await?;
                 body_sprint = false;
             }
@@ -1080,7 +1284,10 @@ async fn controller(
             && (interaction["action_id"].is_null()
                 || interaction["action_id"] == inspected_interaction)
         {
-            let _guard = shared.mutation.lock().await;
+            let Some(_guard) = shared.try_observed_mutation(admission, observed_at) else {
+                next_cycle(started, cfg.period_ms).await;
+                continue;
+            };
             if observed_generation.is_multiple_of(2)
                 && shared.program_generation.load(Ordering::Acquire) == observed_generation
                 && observed_at.elapsed() < Duration::from_millis(250)
@@ -1136,12 +1343,15 @@ async fn controller(
         if cycles.is_multiple_of(100) {
             j.event("body_heartbeat",json!({"cycles":cycles,"motion_predictions":motion_predictions,"revision":observed.revision,"observation_ms":observation_ms,"cycle_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;
         }
-        let elapsed = started.elapsed();
-        if elapsed < Duration::from_millis(cfg.period_ms) {
-            tokio::time::sleep(Duration::from_millis(cfg.period_ms) - elapsed).await;
-        }
+        next_cycle(started, cfg.period_ms).await;
     }
     shared.set_urgent(false);
     j.event("body_stopped", json!({"cycles":cycles}))?;
     Ok(())
+}
+async fn next_cycle(started: Instant, period_ms: u64) {
+    let period = Duration::from_millis(period_ms);
+    if let Some(remaining) = period.checked_sub(started.elapsed()) {
+        tokio::time::sleep(remaining).await;
+    }
 }

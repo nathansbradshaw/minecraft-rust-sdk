@@ -15,7 +15,9 @@ reqwest.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 libc = "0.2"
+mlua = { version = "0.12.2", features = ["lua54", "vendored", "serde", "send"] }
 
 [dev-dependencies]
+minecraft-sdk-xtask = { path = "../xtask" }
 tempfile.workspace = true
 axum.workspace = true
