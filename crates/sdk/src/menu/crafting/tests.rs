@@ -44,7 +44,7 @@ fn observation(step: u8) -> Observation {
     };
     Observation {
         revision: step.to_string(),
-        player: json!({"uuid":"own","inventory":[{"slot":9,"item":"fixture:input","count":input},{"slot":10,"item":if stored==0 {"minecraft:air"}else{"fixture:result"},"count":stored}]}),
+        player: json!({"uuid":"own","life_id":"fixture-life","inventory":[{"slot":9,"item":"fixture:input","count":input},{"slot":10,"item":if stored==0 {"minecraft:air"}else{"fixture:result"},"count":stored}]}),
         world: json!({}),
         menu: json!({"menu_id":17,"state_id":step,"type":"fixture:table",
         "carried":{"item":if cursor==0 {"minecraft:air"}else{"fixture:result"},"count":cursor},"slots":[
@@ -70,6 +70,8 @@ struct Fixture {
     uncertain: bool,
     running: bool,
     reused: bool,
+    respawn_after_prepare: bool,
+    missing_life: bool,
     posts: Vec<ActionRequest>,
     methods: Vec<String>,
     receipts: BTreeMap<String, Receipt>,
@@ -128,7 +130,14 @@ async fn peer(fixture: Fixture) -> Peer {
                 if path == "/v1/server" {
                     json!({"api_version":API_VERSION,"instance_id":"instance","minecraft_version":"fixture","platform":"fixture","adapter_version":"fixture","ready":true,"capabilities":[],"limits":{}})
                 } else if path.ends_with("/observations") {
-                    serde_json::to_value(observation(state.step)).unwrap()
+                    let mut o = observation(state.step);
+                    if state.respawn_after_prepare && state.step > 0 {
+                        o.player["life_id"] = json!("new-life");
+                    }
+                    if state.missing_life {
+                        o.player.as_object_mut().unwrap().remove("life_id");
+                    }
+                    serde_json::to_value(o).unwrap()
                 } else if method == "POST" && path.ends_with("/actions") {
                     let request: ActionRequest = serde_json::from_slice(&bytes).unwrap();
                     let prepare = matches!(&request.action, Action::Craft { .. });
@@ -242,8 +251,15 @@ async fn exactly_one_batch_stores_output_preserves_unused_input_and_never_repeat
 async fn resumed_take_is_status_only_then_stores_once_without_repeating_prepare_or_take() {
     let dir = Temp::new();
     {
-        let mut journal =
-            Journal::open(&dir.path(), "instance", "own", "fixture:recipe", "resume").unwrap();
+        let mut journal = Journal::open(
+            &dir.path(),
+            "instance",
+            "own",
+            "fixture-life",
+            "fixture:recipe",
+            "resume",
+        )
+        .unwrap();
         journal.state.output = Some(
             Output::bind(
                 "fixture:recipe",
@@ -360,8 +376,15 @@ fn stale_output_cursor_and_full_inventory_are_explicit_stops() {
     assert!(empty_grid(&observation(1)).is_err());
     assert!(empty_grid(&observation(2)).is_err());
     let dir = Temp::new();
-    let mut journal =
-        Journal::open(&dir.path(), "instance", "own", "fixture:recipe", "full").unwrap();
+    let mut journal = Journal::open(
+        &dir.path(),
+        "instance",
+        "own",
+        "fixture-life",
+        "fixture:recipe",
+        "full",
+    )
+    .unwrap();
     journal.state.phase = CraftPhase::Store;
     journal.state.output = Some(output);
     o = observation(2);
@@ -372,17 +395,72 @@ fn stale_output_cursor_and_full_inventory_are_explicit_stops() {
 #[test]
 fn journal_is_private_exclusive_scoped_and_preserves_pending_identity() {
     let dir = Temp::new();
-    let mut journal =
-        Journal::open(&dir.path(), "instance", "own", "fixture:recipe", "scope").unwrap();
-    assert!(Journal::open(&dir.path(), "instance", "own", "fixture:recipe", "scope").is_err());
+    let mut journal = Journal::open(
+        &dir.path(),
+        "instance",
+        "own",
+        "fixture-life",
+        "fixture:recipe",
+        "scope",
+    )
+    .unwrap();
+    assert!(
+        Journal::open(
+            &dir.path(),
+            "instance",
+            "own",
+            "fixture-life",
+            "fixture:recipe",
+            "scope"
+        )
+        .is_err()
+    );
     let request = build(&mut journal.state, &observation(0)).unwrap();
     journal.state.pending = Some(request);
     journal.save().unwrap();
     drop(journal);
-    assert!(Journal::open(&dir.path(), "other", "own", "fixture:recipe", "scope").is_err());
-    assert!(Journal::open(&dir.path(), "instance", "other", "fixture:recipe", "scope").is_err());
-    let restored =
-        Journal::open(&dir.path(), "instance", "own", "fixture:recipe", "scope").unwrap();
+    assert!(
+        Journal::open(
+            &dir.path(),
+            "other",
+            "own",
+            "fixture-life",
+            "fixture:recipe",
+            "scope"
+        )
+        .is_err()
+    );
+    assert!(
+        Journal::open(
+            &dir.path(),
+            "instance",
+            "other",
+            "fixture-life",
+            "fixture:recipe",
+            "scope"
+        )
+        .is_err()
+    );
+    assert!(
+        Journal::open(
+            &dir.path(),
+            "instance",
+            "own",
+            "new-life",
+            "fixture:recipe",
+            "scope"
+        )
+        .is_err()
+    );
+    let restored = Journal::open(
+        &dir.path(),
+        "instance",
+        "own",
+        "fixture-life",
+        "fixture:recipe",
+        "scope",
+    )
+    .unwrap();
     assert_eq!(restored.state.pending.unwrap().action_id, "scope-prepare");
     #[cfg(unix)]
     {
@@ -392,6 +470,58 @@ fn journal_is_private_exclusive_scoped_and_preserves_pending_identity() {
             0
         );
     }
+}
+
+#[tokio::test]
+async fn legacy_provider_is_rejected_without_creating_journal_or_mutating() {
+    let peer = peer(Fixture {
+        missing_life: true,
+        ..Fixture::default()
+    })
+    .await;
+    let dir = Temp::new();
+    let error = craft_once(
+        &peer.client,
+        "fixture:recipe",
+        "legacy",
+        &dir.path(),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert!(!dir.path().exists());
+    assert!(peer.state.lock().unwrap().posts.is_empty());
+    peer.stop().await;
+}
+
+#[tokio::test]
+async fn same_menu_and_matching_output_in_another_life_never_advances_or_resumes() {
+    let peer = peer(Fixture {
+        respawn_after_prepare: true,
+        ..Fixture::default()
+    })
+    .await;
+    let dir = Temp::new();
+    for _ in 0..2 {
+        assert!(
+            craft_once(
+                &peer.client,
+                "fixture:recipe",
+                "death",
+                &dir.path(),
+                Duration::from_secs(3)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(peer.state.lock().unwrap().posts.len(), 1);
+    }
+    let state: State = serde_json::from_slice(&fs::read(dir.path()).unwrap()).unwrap();
+    assert_eq!(state.phase, CraftPhase::Prepare);
+    assert_eq!(state.life_id, "fixture-life");
+    assert_eq!(state.pending.unwrap().action_id, "death-prepare");
+    peer.stop().await;
 }
 
 #[tokio::test]

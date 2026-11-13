@@ -68,6 +68,7 @@ struct State {
     version: u8,
     instance: String,
     actor: String,
+    life_id: String,
     recipe: String,
     prefix: String,
     phase: CraftPhase,
@@ -121,7 +122,18 @@ fn check_file(path: &Path) -> Result<()> {
     Ok(())
 }
 impl Journal {
-    fn open(path: &Path, instance: &str, actor: &str, recipe: &str, prefix: &str) -> Result<Self> {
+    fn open(
+        path: &Path,
+        instance: &str,
+        actor: &str,
+        life_id: &str,
+        recipe: &str,
+        prefix: &str,
+    ) -> Result<Self> {
+        require(
+            !life_id.is_empty(),
+            "Native per-life identity required for crafting",
+        )?;
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -150,12 +162,13 @@ impl Journal {
             let state: State =
                 serde_json::from_slice(&fs::read(path).map_err(local)?).map_err(local)?;
             require(
-                state.version == 1
+                state.version == 2
                     && state.instance == instance
                     && state.actor == actor
+                    && state.life_id == life_id
                     && state.recipe == recipe
                     && state.prefix == prefix,
-                "Craft journal belongs to another operation, instance or character",
+                "Craft journal belongs to another operation, instance, character or life",
             )?;
             if let Some(request) = &state.pending {
                 require(
@@ -166,9 +179,10 @@ impl Journal {
             state
         } else {
             State {
-                version: 1,
+                version: 2,
                 instance: instance.into(),
                 actor: actor.into(),
+                life_id: life_id.into(),
                 recipe: recipe.into(),
                 prefix: prefix.into(),
                 phase: CraftPhase::Prepare,
@@ -242,10 +256,10 @@ impl Journal {
 fn cursor_empty(o: &Observation) -> bool {
     o.menu["carried"]["item"] == "minecraft:air" && o.menu["carried"]["count"] == 0
 }
-fn actor(o: &Observation, expected: &str) -> Result<()> {
+fn actor(o: &Observation, expected: &str, life_id: &str) -> Result<()> {
     require(
-        o.player["uuid"] == expected,
-        "Observed craft character changed",
+        o.player["uuid"] == expected && o.player["life_id"] == life_id,
+        "Observed craft character or native life changed; inspect without replay",
     )
 }
 fn empty_grid(o: &Observation) -> Result<()> {
@@ -429,8 +443,11 @@ fn advance(state: &mut State, receipt: &Receipt, o: &Observation) -> Result<()> 
 ///
 /// No recipe IDs, server address or menu layout is built in. This requires a
 /// matching native recipe-preparation verifier and an initially empty grid and
-/// cursor. Dynamic/custom component semantics are not certified. This is not
-/// atomic: concurrent player/body changes can cause a conservative stop with
+/// cursor. Native `player.life_id` is required; the journal binds its initial
+/// life and refuses continuation after death/respawn even if menu IDs match.
+/// Pre-life-identity integrations and version 1 journals require operator
+/// inspection rather than silent migration. Dynamic/custom component semantics
+/// are not certified. This is not atomic: concurrent player/body changes can cause a conservative stop with
 /// materials still in the menu/cursor. A completed journal reports history rather
 /// than producing another batch. Use distinct prefixes/journals to compose N batches.
 pub async fn craft_once(
@@ -453,9 +470,12 @@ pub async fn craft_once(
         let info=client.discover().await?;
         if client.expected_instance.as_deref().is_some_and(|id|id!=info.instance_id) {return Err(error(ErrorCode::Conflict,"Gateway instance changed before crafting"));}
         let own=client.credential.as_ref().ok_or_else(||error(ErrorCode::Unauthorized,"Authenticated craft character required"))?.player_uuid.clone();
-        let mut journal=Journal::open(path,&info.instance_id,&own,recipe,prefix)?;
+        let initial=client.observe().await?;
+        let life_id=initial.player["life_id"].as_str().filter(|s|!s.is_empty()).ok_or_else(||error(ErrorCode::UnsupportedCapability,"Native per-life identity required for crafting"))?;
+        actor(&initial,&own,life_id)?;
+        let mut journal=Journal::open(path,&info.instance_id,&own,life_id,recipe,prefix)?;
         loop {
-            let observation=client.observe().await?;actor(&observation,&own)?;
+            let observation=client.observe().await?;actor(&observation,&own,&journal.state.life_id)?;
             if journal.state.phase==CraftPhase::Completed {
                 let current=journal.state.output.as_ref().map(|o|item_count(&observation,&o.item)).transpose()?;
                 return Ok(journal.report(CraftStatus::AlreadyCompleted,None,current,None));
@@ -482,7 +502,7 @@ pub async fn craft_once(
                 let status=match receipt.outcome {Outcome::Prepared|Outcome::Dispatched|Outcome::Running=>CraftStatus::Pending,Outcome::Uncertain|Outcome::Reconciled|Outcome::Observed=>CraftStatus::NeedsInspection,_=>CraftStatus::Stopped};
                 return Ok(journal.report(status,Some(&receipt),None,None));
             }
-            let after=client.observe().await?;actor(&after,&own)?;
+            let after=client.observe().await?;actor(&after,&own,&journal.state.life_id)?;
             advance(&mut journal.state,&receipt,&after)?;journal.save()?;
             if journal.state.phase==CraftPhase::Completed {
                 let current=journal.state.output.as_ref().map(|o|item_count(&after,&o.item)).transpose()?;

@@ -116,6 +116,9 @@ Rust SDK quick reference (documentation, not a gameplay strategy):
   native preparation metadata, not guessed output slots. It never uses make_all
   or QUICK_MOVE. Each intended batch needs its own durable prefix/journal; repeat
   the same journal after interruption to inspect the same requests without replay.
+  Native player.life_id is required and persisted; a life change stops the journal
+  even if menu IDs match. Old providers or version 1 journals require inspection,
+  never replacement action IDs. Use the matching life-identity module/adapter.
   LocalPreempted means no submission and permits a later retry. Pending/NotReady
   can still be running; Uncertain/Reconciled/NeedsInspection require original-ID
   inspection/reconciliation and fresh facts. Do not discard state to retry. A
