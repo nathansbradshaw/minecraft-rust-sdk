@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod probe_admission;
+mod shore_probe;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -39,16 +40,19 @@ async fn main() -> Result<()> {
     }
     if !((matches!(args.len(), 3 | 4)
         && matches!(args[1].as_str(), "blocked" | "compile" | "exposed"))
-        || (args.len() == 4 && args[1] == "navigate"))
+        || (args.len() == 4 && matches!(args[1].as_str(), "navigate" | "shore")))
     {
-        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
+        return Err("body-probe PRIVATE_CONFIG.json blocked|compile|exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe PRIVATE_CONFIG.json shore SECONDS PRIVATE_SPEC.json | body-probe inspect-observation PRIVATE_OBSERVATION.json".into());
     }
     let seconds: u64 = args[2].parse()?;
     if !(1..=600).contains(&seconds) {
         return Err("Diagnostic duration must be 1–600 seconds".into());
     }
     let mut cfg: Config = serde_json::from_slice(&private_read(Path::new(&args[0]), 16384)?)?;
-    let admission = if args.len() == 4 && args[1] != "navigate" {
+    let shore = (args[1] == "shore")
+        .then(|| shore_probe::Spec::read(Path::new(&args[3])))
+        .transpose()?;
+    let admission = if args.len() == 4 && !matches!(args[1].as_str(), "navigate" | "shore") {
         Some(probe_admission::Spec::read(Path::new(&args[3]))?)
     } else {
         None
@@ -75,7 +79,9 @@ async fn main() -> Result<()> {
             "scope":"Full SDK observation; body may already be acting. Optional stimulus admission is the earlier start-state witness.",
             "observation":initial_scene}))?;
         brain.journal.event("body_probe_started",json!({"mode":args[1],"seconds":seconds,"models_called":0,"body_enabled":brain.body.is_some(),"stimulus_admission":admission.is_some(),"interpretation":"Blocked mode injects a stalled reasoning future, not a provider request. Compile mode runs the real Rust compiler. Navigate mode uses an operator-declared traversal with real adapter interval priming. Exposed mode is a deliberate no-defense positive control, never an agent success."}))?;
-        if args[1]=="compile" {
+        if let Some(spec)=&shore {
+            shore_probe::run(&mut brain,spec,seconds).await?;
+        } else if args[1]=="compile" {
             let compiler_started=Instant::now();
             let result=tools::terminal(&mut brain,"cargo build --offline --message-format=json").await?;
             brain.journal.event("body_probe_compiler",json!({"result":result,"elapsed_ms":compiler_started.elapsed().as_millis(),"success_is_not_survival_proof":true}))?;
@@ -119,7 +125,7 @@ async fn main() -> Result<()> {
             // and local gameplay arbiter keep receiving real SDK observations.
             tokio::time::sleep(Duration::from_secs(seconds)).await;
         }
-        if started.elapsed()<Duration::from_secs(seconds) {tokio::time::sleep(Duration::from_secs(seconds)-started.elapsed()).await;}
+        if shore.is_none() && started.elapsed()<Duration::from_secs(seconds) {tokio::time::sleep(Duration::from_secs(seconds)-started.elapsed()).await;}
         let observed=brain.client.observe().await?;
         brain.journal.event("body_probe_finished",json!({"elapsed_ms":started.elapsed().as_millis(),"health":observed.player["health"],"food":observed.player["food"],"position":observed.player["position"],"revision":observed.revision,"body":brain.body.as_ref().map(|b|b.shared.view()),"models_called":0,"ordinary_respawn_is_not_survival_success":true}))?;
         brain.journal.event("body_probe_scene",json!({"phase":"before_body_stop",
@@ -127,12 +133,15 @@ async fn main() -> Result<()> {
             "observation":observed}))?;
         Ok::<_,Box<dyn std::error::Error+Send+Sync>>(())
     }.await;
-    if let Some(body) = brain.body.take() {
-        body.stop().await?;
-    }
+    let body_stopped = if let Some(body) = brain.body.take() {
+        body.stop().await
+    } else {
+        Ok(())
+    };
     let disconnected = brain.client.disconnect().await;
-    brain.journal.event("body_probe_exit",json!({"disconnected":disconnected.is_ok(),"error":run.as_ref().err().map(ToString::to_string)}))?;
+    brain.journal.event("body_probe_exit",json!({"disconnected":disconnected.is_ok(),"error":run.as_ref().err().map(ToString::to_string),"body_stop_error":body_stopped.as_ref().err().map(ToString::to_string),"disconnect_error":disconnected.as_ref().err().map(ToString::to_string)}))?;
     run?;
+    body_stopped?;
     disconnected?;
     Ok(())
 }
