@@ -71,6 +71,7 @@ fn allowed(path: &str) -> bool {
     }
     if path.starts_with("examples/") {
         return path.ends_with(".rs")
+            || path == "examples/lua/behavior.lua"
             || path == "examples/coding-bot/Cargo.toml"
             || path == "examples/coding-bot/Cargo.lock"
             || path == "examples/coding-bot/README.md";

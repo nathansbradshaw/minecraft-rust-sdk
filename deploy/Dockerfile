@@ -3,10 +3,10 @@ FROM rust:1.91.1-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY licenses ./licenses
 RUN cargo build --release --locked -j 1 -p minecraft-sdk-cli -p minecraft-sdk-runner
 RUN cargo run --release --locked -j 1 -p minecraft-sdk-xtask -- --licenses /build/dependency-licenses
 COPY LICENSE THIRD_PARTY_NOTICES.md ./
-COPY licenses ./licenses
 
 FROM debian:bookworm-slim AS proxy
 COPY --from=build /build/target/release/minecraft-sdk-runner /usr/local/bin/minecraft-sdk-runner

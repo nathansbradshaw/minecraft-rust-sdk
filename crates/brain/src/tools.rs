@@ -353,6 +353,18 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
         ),
         "terminal" => terminal(brain, &choice.input).await,
         "run" => {
+            if choice.input.ends_with(".lua") {
+                let mut result = match crate::lua::execute(brain, &choice.input).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        json!({"language":"lua","success":false,"exit_code":1,"error":error.to_string(),"pending_action":brain.journal.get("pending_action")?,"replay_permitted":false})
+                    }
+                };
+                result["experiment"] = json!(true);
+                result["lua_source"] = crate::workspace::read(&brain.cfg.workspace, &choice.input)
+                    .unwrap_or(Value::Null);
+                return Ok(result);
+            }
             let command = run_command(&choice.input)?;
             let mut result = terminal_with_view(brain, &command, true).await?;
             result["command"] = json!(command);

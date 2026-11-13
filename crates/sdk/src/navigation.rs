@@ -75,7 +75,8 @@ impl Goal {
             }
         }
     }
-    fn validate(&self) -> Result<()> {
+    /// Validate a caller-supplied goal before activating a client program.
+    pub fn validate(&self) -> Result<()> {
         let (r, valid) = match self {
             Self::Position {
                 target, distance, ..

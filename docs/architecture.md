@@ -255,6 +255,15 @@ respawn. This initial policy is experimental: eating, combat effectiveness,
 fluids, complex navigation and general Survival strength require further native
 evidence. Health, shelter and threats do not gate model reasoning or conversation.
 
+AI-edited behavior programs are Lua 5.4 modules embedded through mlua in that
+Rust Brain. A pure `step(context)` returns saved JSON state and one typed SDK
+operation. Rust retains execution, receipts, recovery and body arbitration.
+Changed source is validated before activation at a settled action boundary;
+invalid candidates retain the last good module. Lua state is durable and scoped
+to character, instance, workspace path and task revision. The Brain, body and
+native session stay resident across these updates. Pending actions prevent
+activation, and interrupted host commands remain fenced against replay.
+
 Bounded diagnosis includes the latest failed direct SDK intention and its outcome
 or error code, independently of an older generated-program experiment. Selecting
 a different held inventory slot changes relevant gameplay facts. Fresh receipt
