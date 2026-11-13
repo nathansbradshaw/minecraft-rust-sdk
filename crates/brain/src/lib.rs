@@ -831,13 +831,27 @@ impl Brain {
             action_id: id.clone(),
             action: action.clone(),
         };
-        let mut receipt = self.client.act(&request).await?;
+        if let Some(shared) = &safety {
+            shared.program_dispatch(&request.action_id)?;
+        }
+        let receipt = self.client.act(&request).await;
+        if let (Some(shared), Ok(receipt)) = (&safety, &receipt) {
+            shared.resolve_program_receipt(&request.action_id, receipt)?;
+        }
         drop(_guard);
+        let mut receipt = receipt?;
+        ensure(
+            receipt.action_id == request.action_id,
+            "Dispatch receipt action ID mismatch",
+        )?;
         if !movement && receipt.outcome == Outcome::Running {
             receipt = self
                 .client
                 .wait_for_action(&receipt.action_id, Duration::from_secs(10))
                 .await?;
+        }
+        if let Some(shared) = &safety {
+            shared.resolve_program_receipt(&request.action_id, &receipt)?;
         }
         self.journal.resolve_pending(&receipt)?;
         self.journal
@@ -857,6 +871,9 @@ impl Brain {
     pub async fn inspect(&mut self, id: &str) -> Result<minecraft_sdk::Receipt> {
         let receipt = self.client.action_status(id).await?;
         ensure(receipt.action_id == id, "Status receipt action ID mismatch")?;
+        if let Some(body) = &self.body {
+            body.shared.resolve_program_receipt(id, &receipt)?;
+        }
         self.journal.resolve_pending(&receipt)?;
         self.journal.remember_container_receipt(
             &self.server.instance_id,
@@ -892,6 +909,9 @@ impl Brain {
             receipt.action_id == id,
             "Reconciliation receipt action ID mismatch",
         )?;
+        if let Some(body) = &self.body {
+            body.shared.resolve_program_receipt(id, &receipt)?;
+        }
         self.journal.resolve_pending(&receipt)?;
         self.journal
             .event("explicit_reconciliation", serde_json::to_value(&receipt)?)?;
