@@ -38,6 +38,7 @@ fn allowed(path: &str) -> bool {
     if [
         "Cargo.toml",
         "Cargo.lock",
+        "AGENTS.md",
         "LICENSE",
         "README.md",
         "THIRD_PARTY_NOTICES.md",
