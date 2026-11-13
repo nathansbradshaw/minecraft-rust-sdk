@@ -52,7 +52,7 @@ mod tests {
     fn scene(id: &str, active: bool) -> Observation {
         Observation {
             revision: "native".into(),
-            player: json!({"mining":{"active":active,"block":[1,64,2]}}),
+            player: json!({"uuid":"miner","life_id":"life-1","mining":{"active":active,"block":[1,64,2]}}),
             world: json!({"blocks":[{"position":[1,64,2],"block":id,"state":id}]}),
             menu: Value::Null,
         }

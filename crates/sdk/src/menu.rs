@@ -1,5 +1,42 @@
-//! Build typed intentions from observed menu state. No dispatch or replay.
+//! Typed menu builders and optional journaled recipe-output composition.
 use crate::*;
+mod crafting;
+pub use crafting::{CraftPhase, CraftReport, CraftStatus, craft_once};
+
+pub const FRESH_OBSERVATION_CAPABILITY: &str = "minecraft:fresh_observation";
+
+/// Explicit foreground snapshot, independent of the adapter's cached body read.
+/// Makes one query with no polling, retry or cached fallback. The advertised
+/// adapter bounds its single native read; full terrain/entity work is included.
+/// A fresh revision can still become stale before a subsequent mutation.
+pub async fn observe_fresh(client: &Client) -> Result<Observation> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Snapshot {
+        format: String,
+        observation: Observation,
+    }
+    let value = client
+        .read_observation(&ObservationQuery {
+            capability: FRESH_OBSERVATION_CAPABILITY.into(),
+            input: serde_json::json!({}),
+        })
+        .await?;
+    let snapshot: Snapshot = serde_json::from_value(value).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidRequest,
+            "Fresh observation response does not match its versioned contract",
+        )
+    })?;
+    if snapshot.format != "minecraft-fresh-observation-v1" {
+        return Err(ApiError::new(
+            ErrorCode::UnsupportedCapability,
+            "Unsupported fresh observation format",
+        ));
+    }
+    Ok(snapshot.observation)
+}
+
 fn unavailable(message: &str) -> ApiError {
     ApiError::new(ErrorCode::NotReady, message)
 }

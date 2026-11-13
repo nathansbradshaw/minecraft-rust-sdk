@@ -66,6 +66,11 @@ Movement submission continues while sampling. Terminal publication waits for
 the bounded worker, preserving its evidence in the authoritative receipt.
 First movement and final target verification remain separate facts.
 
+With `minecraft:life_identity`, the clock epoch also contains the current native
+player life. It changes on respawn even when the numeric entity ID and connection
+are reused. See [ordinary respawn recovery](respawn-recovery.md) for compatibility,
+life fencing and the separate live acceptance procedure.
+
 ```text
 mc-sdk-evidence reaction-latency PRIVATE_TRACE.jsonl NATIVE_REPORT.json NEW_SUMMARY.json
 ```

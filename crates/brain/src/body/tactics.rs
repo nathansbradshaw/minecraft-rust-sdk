@@ -1,6 +1,6 @@
 //! Client policy: fresh native evidence drives defense and local replanning.
 use super::geometry::point;
-use minecraft_sdk::{Action, Hand, Observation};
+use minecraft_sdk::{Action, Hand, Observation, click_mode};
 use std::collections::BTreeMap;
 
 // Replaceable client policy. Native nutrition alone doesn't establish that
@@ -30,10 +30,99 @@ pub(super) struct Meal {
     ticks: u16,
     nutrition: u64,
     saturation: f64,
+    preparation: Option<MealSwap>,
+}
+#[derive(Clone, Debug)]
+struct MealSwap {
+    menu_id: i32,
+    state_id: i32,
+    source: i16,
+    hotbar: u8,
+}
+impl PartialEq for MealSwap {
+    fn eq(&self, other: &Self) -> bool {
+        // A menu revision alone is not a new meal/preparation opportunity.
+        // The fresh revision is still sent to native click admission.
+        self.menu_id == other.menu_id && self.source == other.source && self.hotbar == other.hotbar
+    }
+}
+fn meal_swap(
+    o: &Observation,
+    source: u8,
+    item: &str,
+    stock: u64,
+    selected: u8,
+) -> Option<MealSwap> {
+    if o.menu["type"] != "minecraft:inventory"
+        || o.menu["carried"]["item"] != "minecraft:air"
+        || o.menu["carried"]["count"] != 0
+    {
+        return None;
+    }
+    let state_id = i32::try_from(o.menu["state_id"].as_i64()?)
+        .ok()
+        .filter(|n| *n >= 0)?;
+    let rows = o.menu["slots"].as_array()?;
+    if rows.len() > 512 {
+        return None;
+    }
+    let bound = |inventory_slot: u8, expected: &str, count: u64| {
+        let mut matches = rows.iter().filter(|row| {
+            row["player_inventory"] == true
+                && row["inventory_slot"].as_u64() == Some(u64::from(inventory_slot))
+        });
+        let row = matches.next()?;
+        if matches.next().is_some()
+            || row["item"] != expected
+            || row["count"] != count
+            || row["may_pickup"] != true
+        {
+            return None;
+        }
+        let slot = i16::try_from(row["slot"].as_i64()?).ok().filter(|slot| {
+            *slot >= 0 && usize::try_from(*slot).is_ok_and(|slot| slot < rows.len())
+        })?;
+        Some((row, slot))
+    };
+    let (_, source_slot) = bound(source, item, stock)?;
+    let inventory = o.player["inventory"].as_array()?;
+    let hotbar = inventory
+        .iter()
+        .filter_map(|row| {
+            let slot = u8::try_from(row["slot"].as_u64()?).ok()?;
+            if slot > 8
+                || row["item"] != "minecraft:air"
+                || row["count"] != 0
+                || inventory
+                    .iter()
+                    .filter(|row| row["slot"].as_u64() == Some(u64::from(slot)))
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            let (native, _) = bound(slot, "minecraft:air", 0)?;
+            (native["may_place_carried"] == true).then_some(slot)
+        })
+        .min_by_key(|slot| (*slot != selected, *slot))?;
+    Some(MealSwap {
+        menu_id: 0,
+        state_id,
+        source: source_slot,
+        hotbar,
+    })
 }
 impl Meal {
     pub fn action(&self) -> Action {
-        if self.slot <= 8 && self.slot != self.selected {
+        if let Some(swap) = &self.preparation {
+            Action::ClickSlot {
+                menu_id: swap.menu_id,
+                state_id: swap.state_id,
+                slot: swap.source,
+                button: swap.hotbar,
+                mode: click_mode::SWAP,
+            }
+        } else if self.slot <= 8 && self.slot != self.selected {
             Action::SelectSlot { slot: self.slot }
         } else {
             Action::StartUseItem {
@@ -63,7 +152,9 @@ pub(super) fn meal(o: &Observation) -> Option<Meal> {
     {
         return None;
     }
-    let selected = u8::try_from(player["selected"].as_u64()?).ok()?;
+    let selected = u8::try_from(player["selected"].as_u64()?)
+        .ok()
+        .filter(|slot| *slot <= 8)?;
     player["inventory"]
         .as_array()?
         .iter()
@@ -75,15 +166,23 @@ pub(super) fn meal(o: &Observation) -> Option<Meal> {
             let food = &row["food"];
             let nutrition = food["nutrition"].as_u64()?;
             let saturation = food["saturation"].as_f64()?;
-            ((slot <= 8 || slot == 40)
-                && stock > 0
-                && (1..=64).contains(&ticks)
-                && nutrition > 0
-                && row["use_animation"] == "EAT"
-                && row["on_cooldown"] == false
-                && food["can_eat"] == true
-                && MEALS.contains(&item))
-            .then(|| Meal {
+            if !(slot <= 35 || slot == 40)
+                || stock == 0
+                || !(1..=64).contains(&ticks)
+                || nutrition == 0
+                || row["use_animation"] != "EAT"
+                || row["on_cooldown"] != false
+                || food["can_eat"] != true
+                || !MEALS.contains(&item)
+            {
+                return None;
+            }
+            let preparation = if (9..=35).contains(&slot) {
+                Some(meal_swap(o, slot, item, stock, selected)?)
+            } else {
+                None
+            };
+            Some(Meal {
                 slot,
                 item: item.to_owned(),
                 stock,
@@ -92,6 +191,7 @@ pub(super) fn meal(o: &Observation) -> Option<Meal> {
                 ticks,
                 nutrition,
                 saturation,
+                preparation,
             })
         })
         .max_by(|a, b| {
@@ -308,7 +408,146 @@ pub(super) fn defensive_target(o: &Observation) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    fn stored_meal() -> Observation {
+        let mut o = fixture();
+        o.player["food"] = json!(12);
+        o.player["max_health"] = json!(20.);
+        o.player["using_item"] = json!(false);
+        o.player["on_ground"] = json!(true);
+        o.player["sprinting"] = json!(false);
+        o.player["control"] = Value::Null;
+        o.player["selected"] = json!(0);
+        o.player["inventory"] = json!([
+            {"slot":0,"item":"minecraft:wooden_pickaxe","count":1},
+            {"slot":1,"item":"minecraft:air","count":0},
+            {"slot":9,"item":"minecraft:bread","count":2,"use_duration_ticks":32,
+                "use_animation":"EAT","on_cooldown":false,
+                "food":{"can_eat":true,"nutrition":5,"saturation":6.0}}
+        ]);
+        // Runtime menu binding, deliberately independent of hotbar slot number.
+        o.menu = json!({"menu_id":0,"state_id":7,"type":"minecraft:inventory",
+        "carried":{"item":"minecraft:air","count":0},"slots":[
+            {"slot":0,"player_inventory":false,"inventory_slot":0,"item":"minecraft:air","count":0},
+            {"slot":1,"player_inventory":true,"inventory_slot":9,"item":"minecraft:bread","count":2,"may_pickup":true},
+            {"slot":2,"player_inventory":true,"inventory_slot":1,"item":"minecraft:air","count":0,"may_pickup":true,"may_place_carried":true}
+        ]});
+        o
+    }
+    #[test]
+    fn safe_stored_food_moves_only_to_a_confirmed_empty_hotbar_then_selects_and_uses() {
+        let mut o = stored_meal();
+        let prepared = meal(&o).expect("known bread can be prepared");
+        assert!(matches!(
+            prepared.action(),
+            Action::ClickSlot {
+                menu_id: 0,
+                state_id: 7,
+                slot: 1,
+                button: 1,
+                mode: click_mode::SWAP
+            }
+        ));
+        // A fresh native snapshot of the swap drives the next step. The held
+        // pickaxe in slot0 was never a swap destination or cursor material.
+        let mut bread = o.player["inventory"][2].clone();
+        bread["slot"] = json!(1);
+        o.player["inventory"][1] = bread;
+        o.player["inventory"][2] = json!({"slot":9,"item":"minecraft:air","count":0});
+        o.menu["state_id"] = json!(8);
+        o.menu["slots"][1]["item"] = json!("minecraft:air");
+        o.menu["slots"][1]["count"] = json!(0);
+        o.menu["slots"][2]["item"] = json!("minecraft:bread");
+        o.menu["slots"][2]["count"] = json!(2);
+        assert_ne!(meal(&o).unwrap(), prepared);
+        assert!(matches!(
+            meal(&o).unwrap().action(),
+            Action::SelectSlot { slot: 1 }
+        ));
+        assert_eq!(o.player["inventory"][0]["item"], "minecraft:wooden_pickaxe");
+        o.player["selected"] = json!(1);
+        assert!(matches!(
+            meal(&o).unwrap().action(),
+            Action::StartUseItem {
+                hand: Hand::Main,
+                max_ticks: 40
+            }
+        ));
+    }
+    #[test]
+    fn stored_meal_refuses_unknown_space_cursor_or_conflicting_native_bindings() {
+        for kind in [
+            "occupied",
+            "missing_inventory",
+            "missing_native",
+            "cursor",
+            "source_mismatch",
+            "locked",
+            "duplicate_source",
+            "duplicate_inventory",
+            "foreign_menu",
+            "unknown_state",
+        ] {
+            let mut o = stored_meal();
+            match kind {
+                "occupied" => {
+                    o.player["inventory"][1]["item"] = json!("minecraft:stone");
+                    o.player["inventory"][1]["count"] = json!(64);
+                }
+                "missing_inventory" => {
+                    o.player["inventory"].as_array_mut().unwrap().remove(1);
+                }
+                "missing_native" => {
+                    o.menu["slots"].as_array_mut().unwrap().pop();
+                }
+                "cursor" => {
+                    o.menu["carried"] = json!({"item":"minecraft:wooden_pickaxe","count":1});
+                }
+                "source_mismatch" => {
+                    o.menu["slots"][1]["count"] = json!(1);
+                }
+                "locked" => {
+                    o.menu["slots"][2]["may_place_carried"] = json!(false);
+                }
+                "duplicate_source" => {
+                    let row = o.menu["slots"][1].clone();
+                    o.menu["slots"].as_array_mut().unwrap().push(row);
+                }
+                "duplicate_inventory" => {
+                    let row = o.player["inventory"][1].clone();
+                    o.player["inventory"].as_array_mut().unwrap().push(row);
+                }
+                "foreign_menu" => {
+                    o.menu["type"] = json!("fixture:machine");
+                }
+                _ => {
+                    o.menu["state_id"] = Value::Null;
+                }
+            }
+            assert!(meal(&o).is_none(), "{kind}");
+        }
+    }
+    #[test]
+    fn menu_revision_churn_does_not_retry_an_unchanged_stored_meal() {
+        let mut o = stored_meal();
+        let first = meal(&o).unwrap();
+        o.menu["state_id"] = json!(8);
+        let current = meal(&o).unwrap();
+        assert_eq!(
+            first, current,
+            "native revision churn is not new food/space evidence"
+        );
+        assert!(matches!(
+            current.action(),
+            Action::ClickSlot { state_id: 8, .. }
+        ));
+        o.player["inventory"][2]["item"] = json!("minecraft:rotten_flesh");
+        o.menu["slots"][1]["item"] = json!("minecraft:rotten_flesh");
+        assert!(
+            meal(&o).is_none(),
+            "observed nutrition cannot promote risky food into the safe list"
+        );
+    }
     #[test]
     fn hungry_body_uses_observed_prepared_food_and_respects_hand_and_control_state() {
         let mut o = fixture();

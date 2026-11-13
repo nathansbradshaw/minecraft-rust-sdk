@@ -5,6 +5,7 @@ pub mod geometry;
 mod hearing;
 mod motion;
 mod perception;
+mod program;
 mod recovery;
 mod tactics;
 #[cfg(test)]
@@ -60,6 +61,7 @@ pub struct Shared {
     // Bumped under mutation ownership before submitting an SDK program's
     // action. A food choice cannot act on a hand snapshot older than that.
     program_generation: AtomicU64,
+    program_pending: Mutex<std::collections::BTreeSet<String>>,
     scheduling_revision: AtomicU64,
     emergency: AtomicBool,
     running: AtomicBool,
@@ -231,6 +233,7 @@ impl Handle {
         let shared = Arc::new(Shared {
             feedback: Mutex::new(crate::feedback::Trace::default()),
             program_generation: AtomicU64::new(0),
+            program_pending: Mutex::new(Default::default()),
             scheduling_revision: AtomicU64::new(0),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
             model_lanes: crate::model::Lanes::default(),
@@ -395,9 +398,11 @@ async fn proxy(
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
                 return Err("Local action caller disconnected".into());
             }
-            shared.program_generation.fetch_add(1, Ordering::AcqRel);
+            shared.program_dispatch(&request.request.action_id)?;
             let mut result = client.act(&request.request).await;
-            shared.program_generation.fetch_add(1, Ordering::Release);
+            if let Ok(receipt) = &result {
+                shared.resolve_program_receipt(&request.request.action_id, receipt)?;
+            }
             drop(guard);
             if let Ok(receipt) = &result
                 && receipt.outcome == Outcome::Running
@@ -415,6 +420,9 @@ async fn proxy(
                 result = client
                     .wait_for_action(&request.request.action_id, Duration::from_secs(10))
                     .await;
+            }
+            if let Ok(receipt) = &result {
+                shared.resolve_program_receipt(&request.request.action_id, receipt)?;
             }
             match result {
                 Ok(r) => LocalActionResponse::Receipt(r),
@@ -760,6 +768,7 @@ async fn controller(
             && (receipt.outcome.terminal() || receipt.outcome == Outcome::Uncertain)
         {
             inspected_interaction = id.into();
+            shared.resolve_program_receipt(id, &receipt)?;
             j.event("body_interaction_status",json!({"action_id":id,"outcome":receipt.outcome,"native_effect_verified":receipt.evidence["native_effect_verified"],"input_released":receipt.evidence["input_released"],"evidence_sha256":crate::digest(receipt.evidence.to_string().as_bytes()),"replayed":false}))?;
             if owned_meal.as_ref().is_some_and(|(action, _)| action == id)
                 && let Some((_, meal)) = owned_meal.take()
@@ -1072,7 +1081,20 @@ async fn controller(
                 .find(|item| item.receipt.outcome == Outcome::Uncertain)
         {
             let result = client.reconcile(&item.receipt.action_id).await;
+            if let Ok(receipt) = &result {
+                shared.resolve_program_receipt(&item.receipt.action_id, receipt)?;
+            }
             j.event("body_reconciliation",json!({"action_id":item.receipt.action_id,"outcome":result.as_ref().ok().map(|r|&r.outcome),"error":result.as_ref().err().map(ToString::to_string)}))?;
+        }
+        // SDK program status reads bypass the local proxy. Inspect one exact
+        // tracked ID so completed finite controls cannot leave food fenced.
+        if !shared.urgent()
+            && cycles.is_multiple_of(10)
+            && let Some(id) = shared.pending_program()?
+            && let Ok(Ok(receipt)) =
+                tokio::time::timeout(Duration::from_millis(400), client.action_status(&id)).await
+        {
+            shared.resolve_program_receipt(&id, &receipt)?;
         }
         if cycles.is_multiple_of(100) {
             j.event("body_heartbeat",json!({"cycles":cycles,"motion_predictions":motion_predictions,"revision":observed.revision,"observation_ms":observation_ms,"cycle_ms":started.elapsed().as_millis(),"emergency":shared.urgent()}))?;

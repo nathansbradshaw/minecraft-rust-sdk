@@ -137,6 +137,12 @@ before dispatch. Its start verifier also requires a non-air target and a newly
 observed mining transition or block change. A native active flag on air cannot
 establish block mining. Finish/cancel retain their existing interruption and
 release semantics. Core registry identifiers remain deployment independent.
+From alpha.15, the Rust adapter and NeoForge module must both support
+`minecraft:life_identity`. Observations bind the native player object through
+`player.life_id` and the sample-clock epoch, including when ordinary respawn
+reuses the numeric entity ID. See [respawn recovery](respawn-recovery.md) for
+the matching installation pair and native verification gate.
+
 `start_move_through` takes `target` and positive `max_ticks`. It holds ordinary
 movement input until crossing the waypoint plane within a 0.35-block lateral
 corridor and 0.05-block vertical tolerance, then releases input. Fresh native

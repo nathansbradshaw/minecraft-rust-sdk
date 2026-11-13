@@ -118,8 +118,10 @@ fn same_lane(before: &Observation, after: &Observation) -> bool {
     later
         && before.player["uuid"].is_string()
         && before.player["uuid"] == after.player["uuid"]
-        // Character UUID survives respawn; its player entity does not. Losing
-        // inventory on death is not evidence that an old item use succeeded.
+        // Minecraft 1.21.1 reuses the connection AND numeric entity ID on
+        // respawn. Only a native per-player-object life token fences the loss
+        // of inventory from an old item-use intention.
+        && same_life(before, after)
         && before.player["entity_id"].as_i64().is_some()
         && before.player["entity_id"] == after.player["entity_id"]
         && before.player["dimension"].is_string()
@@ -153,6 +155,14 @@ fn proof(
             if after.player["using_item"] != false { return None; }
             if let Some(event)=new_event(action,before,after) { return Some(event.clone()); }
             if main_hand_changed(action,before,after) {return None;}
+            // Death drops inventory before respawn replaces the native player
+            // object. Same-life stack loss alone cannot establish item use.
+            // A genuine attributed Finish above remains historical evidence;
+            // it does not establish survival or nutrition recovery.
+            if !before.player["health"].as_f64().zip(after.player["health"].as_f64())
+                .is_some_and(|(b,a)|b.is_finite()&&b>0.&&a.is_finite()&&a>0.) {
+                return None;
+            }
             let b=held_stack(before,hand)?;let a=held_stack(after,hand)?;
             let decreased=b["count"].as_u64()?.checked_sub(a["count"].as_u64()?).is_some_and(|n|n>0);
             if b["count"].as_u64()? > 0 && (b["item"]!=a["item"] || decreased) {
@@ -571,7 +581,7 @@ mod tests {
     fn observation() -> Observation {
         Observation {
             revision: "1".into(),
-            player: json!({"uuid":"own","entity_id":17,"dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
+            player: json!({"uuid":"own","life_id":"life-1","entity_id":17,"dimension":"minecraft:overworld","health":20.,"selected":0,"using_item":false,"inventory":[{"slot":0,"item":"minecraft:apple","count":2}],"native_action_effects":{"format":"native-action-effects-v1","epoch":"events","last_sequence":1,"events":[]}}),
             world: json!({"game_time":1,"sample_clock":{"epoch":"clock","nanos":"1"},"entities":[{"entity_id":7,"uuid":"target","health":20.}]}),
             menu: json!({"menu_id":0}),
         }
@@ -591,15 +601,68 @@ mod tests {
             proof(&action, &before, &after, None).is_some(),
             "ordinary same-life held-stack change remains observable"
         );
-        after.player["entity_id"] = json!(18);
+        // Ordinary respawn retains entity ID 17, the UUID, connection and
+        // connection-scoped event history; do not invent a new numeric ID.
+        after.player["life_id"] = json!("life-2");
         assert!(
             proof(&action, &before, &after, None).is_none(),
             "death inventory loss cannot certify an old item-use intention"
         );
-        after.player["entity_id"] = Value::Null;
+        after.player["life_id"] = Value::Null;
         assert!(
             proof(&action, &before, &after, None).is_none(),
             "unknown life binding is not same-life evidence"
+        );
+    }
+    #[test]
+    fn same_life_death_inventory_loss_is_not_unattributed_item_use() {
+        let before = observation();
+        let mut after = before.clone();
+        after.world["sample_clock"]["nanos"] = json!("2");
+        after.player["inventory"][0] = json!({"slot":0,"item":"minecraft:air","count":0});
+        let action = Action::StartUseItem {
+            hand: Hand::Main,
+            max_ticks: 40,
+        };
+        assert!(proof(&action, &before, &after, None).is_some());
+        for health in [
+            json!(0.),
+            json!(-1.),
+            Value::Null,
+            json!(f64::NAN),
+            json!(f64::INFINITY),
+        ] {
+            let mut dead = after.clone();
+            dead.player["health"] = health.clone();
+            assert!(
+                proof(&action, &before, &dead, None).is_none(),
+                "accepted after health {health}"
+            );
+            let mut invalid_before = before.clone();
+            invalid_before.player["health"] = health.clone();
+            assert!(
+                proof(&action, &invalid_before, &after, None).is_none(),
+                "accepted before health {health}"
+            );
+        }
+        after.player.as_object_mut().unwrap().remove("health");
+        assert!(proof(&action, &before, &after, None).is_none());
+        let mut missing_before = before.clone();
+        missing_before
+            .player
+            .as_object_mut()
+            .unwrap()
+            .remove("health");
+        after.player["health"] = json!(20.);
+        assert!(proof(&action, &missing_before, &after, None).is_none());
+        // Native completion establishes the historical effect even if the
+        // next observation also records a subsequent death. It cannot count
+        // as staying alive or recovering hunger.
+        after.player["health"] = json!(0.);
+        after.player["native_action_effects"]["events"] = json!([{"sequence":2,"actor_uuid":"own","dimension":"minecraft:overworld","kind":"item_use_finished","item":"minecraft:apple","hand":"MAIN_HAND"}]);
+        assert_eq!(
+            proof(&action, &before, &after, None).unwrap()["kind"],
+            "item_use_finished"
         );
     }
     #[test]
@@ -793,6 +856,28 @@ mod tests {
                 .connection()
                 .shutdown(std::net::Shutdown::Both);
         }
+    }
+    #[test]
+    fn death_drops_before_respawn_fail_the_pending_food_use() {
+        let lab = Lab::new();
+        let (job, worker, _) = lab.start(
+            Action::StartUseItem {
+                hand: Hand::Main,
+                max_ticks: 40,
+            },
+            40,
+        );
+        {
+            let mut after = lab.observed.lock().unwrap();
+            after.player["health"] = json!(0.);
+            after.player["inventory"][0] = json!({"slot":0,"item":"minecraft:air","count":0});
+        }
+        worker.join().unwrap();
+        let receipt = job.status("interaction-one").unwrap();
+        assert_eq!(receipt.outcome, Outcome::Failed);
+        assert_eq!(receipt.evidence["reason"], "character_died");
+        assert_eq!(receipt.evidence["native_effect_verified"], false);
+        assert_eq!(receipt.evidence["after"]["player"]["life_id"], "life-1");
     }
     #[test]
     fn a_delayed_menu_effect_stays_running_then_preserves_the_terminal_receipt_until_inspected() {
