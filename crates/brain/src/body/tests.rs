@@ -24,6 +24,7 @@ async fn recovered_breathing_releases_owned_input_once_and_yields_after_native_r
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -132,6 +133,7 @@ async fn recovered_breathing_releases_owned_input_once_and_yields_after_native_r
     });
     let dir = tempfile::tempdir().unwrap();
     let j = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    let handoff_state = shared.clone();
     tokio::time::timeout(
         Duration::from_secs(5),
         controller(
@@ -158,6 +160,11 @@ async fn recovered_breathing_releases_owned_input_once_and_yields_after_native_r
     assert!(
         yielded.load(Ordering::Acquire),
         "yield only after fresh native release, without3second relatch"
+    );
+    assert_eq!(
+        handoff_state.view()["scheduling_revision"],
+        2,
+        "Only emergency entry and confirmed release advance scheduling; observations and final stop do not"
     );
 }
 
@@ -279,6 +286,7 @@ async fn stalled_native_query_does_not_stop_observation_or_close_threat_defense(
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -319,6 +327,7 @@ async fn planning_refresh_waits_for_a_fresh_retry_without_admitting_stale_state(
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(Some((
@@ -489,6 +498,7 @@ async fn controller_projectile_scenario(replace_projectile: bool) {
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -543,6 +553,7 @@ async fn delayed_interactions_return_final_feedback_without_leasing_the_survival
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -669,6 +680,7 @@ async fn real_local_proxy_returns_the_receipt_and_retains_only_compact_diagnosti
         model_lanes: crate::model::Lanes::default(),
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         emergency: AtomicBool::new(false),
         running: AtomicBool::new(true),
         latest: Mutex::new(None),
@@ -730,6 +742,7 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
     let shared = Arc::new(Shared {
         feedback: Mutex::new(crate::feedback::Trace::default()),
         program_generation: AtomicU64::new(0),
+        scheduling_revision: AtomicU64::new(0),
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         model_lanes: crate::model::Lanes::default(),
         emergency: AtomicBool::new(true),

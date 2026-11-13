@@ -60,6 +60,7 @@ pub struct Shared {
     // Bumped under mutation ownership before submitting an SDK program's
     // action. A food choice cannot act on a hand snapshot older than that.
     program_generation: AtomicU64,
+    scheduling_revision: AtomicU64,
     emergency: AtomicBool,
     running: AtomicBool,
     latest: Mutex<Option<(Instant, Arc<Observation>)>>,
@@ -75,11 +76,18 @@ impl std::fmt::Display for StaleObservation {
 }
 impl std::error::Error for StaleObservation {}
 impl Shared {
+    fn set_urgent(&self, urgent: bool) -> bool {
+        let previous = self.emergency.swap(urgent, Ordering::AcqRel);
+        if previous != urgent {
+            self.scheduling_revision.fetch_add(1, Ordering::Release);
+        }
+        previous
+    }
     pub fn urgent(&self) -> bool {
         self.emergency.load(Ordering::Acquire)
     }
     pub fn view(&self) -> Value {
-        json!({"emergency":self.urgent(),"running":self.running.load(Ordering::Acquire),"reason":self.reason.lock().ok().map(|s|s.clone()),"observation_age_ms":self.latest.lock().ok().and_then(|v|v.as_ref().map(|(at,_)|at.elapsed().as_millis()))})
+        json!({"emergency":self.urgent(),"scheduling_revision":self.scheduling_revision.load(Ordering::Acquire),"running":self.running.load(Ordering::Acquire),"reason":self.reason.lock().ok().map(|s|s.clone()),"observation_age_ms":self.latest.lock().ok().and_then(|v|v.as_ref().map(|(at,_)|at.elapsed().as_millis()))})
     }
     pub fn observe(&self) -> Result<Observation> {
         ensure(
@@ -223,6 +231,7 @@ impl Handle {
         let shared = Arc::new(Shared {
             feedback: Mutex::new(crate::feedback::Trace::default()),
             program_generation: AtomicU64::new(0),
+            scheduling_revision: AtomicU64::new(0),
             mutation: Arc::new(tokio::sync::Mutex::new(())),
             model_lanes: crate::model::Lanes::default(),
             emergency: AtomicBool::new(false),
@@ -704,7 +713,7 @@ async fn controller(
         let policy_ms = observed_at.elapsed().as_millis();
         if danger {
             safe_since = Instant::now();
-            if !shared.emergency.swap(true, Ordering::AcqRel) {
+            if !shared.set_urgent(true) {
                 j.event("body_emergency",json!({"revision":observed.revision,"health":observed.player["health"],"position":p,"nearest_hostile_distance":nearby.map(|(_,d)|d)}))?;
             }
         }
@@ -976,7 +985,7 @@ async fn controller(
                 send(&client, j, Action::Sprint { enabled: false }).await?;
                 body_sprint = false;
             }
-            shared.emergency.store(false, Ordering::Release);
+            shared.set_urgent(false);
             owned_water_control = false;
             owned_water_shore = false;
             *shared.reason.lock().map_err(|_| "Body state unavailable")? =
@@ -1040,7 +1049,7 @@ async fn controller(
             tokio::time::sleep(Duration::from_millis(cfg.period_ms) - elapsed).await;
         }
     }
-    shared.emergency.store(false, Ordering::Release);
+    shared.set_urgent(false);
     j.event("body_stopped", json!({"cycles":cycles}))?;
     Ok(())
 }
