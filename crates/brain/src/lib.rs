@@ -416,6 +416,7 @@ impl Journal {
     fn activity(&self, choice: &model::Choice, result: &Value) -> Result<()> {
         if !["sdk", "write", "edit", "terminal", "run", "navigate"].contains(&choice.tool.as_str())
             || tool_failed(result)
+            || navigation::scheduling_preempted(result)
         {
             return Ok(());
         }
@@ -441,6 +442,9 @@ impl Journal {
         source: &str,
         goal_revision: &str,
     ) -> Result<bool> {
+        if choice.tool == "navigate" && navigation::scheduling_preempted(result) {
+            return Ok(false);
+        }
         let navigation = choice.tool == "navigate" && result["navigation"].is_object();
         if !navigation
             && (!["terminal", "run"].contains(&choice.tool.as_str())
@@ -1036,6 +1040,15 @@ impl Brain {
                 .unwrap_or(json!([]));
             let mut context = json!({"server":self.server,"goal":self.goal,"player_request":self.journal.get("player_request")?,"turn":turn,"workspace":self.cfg.workspace,"sdk_reference":include_str!("sdk.md"),"working_notes":self.journal.get("working_notes")?,"inspection_calls_without_execution":self.journal.get("inspection_streak")?,"development_request":self.journal.get("development_request")?,"observation":projection(&self.observed),"observation_view":{"format":"sdk-shaped-compact-v1","complete":false,"blocks":"nearest observed non-air subset; omitted cells are unknown","entities":"hostiles and loot prioritized; omitted entities are unknown","inventory":"occupied slots only, original slot numbers","menus":"Use observe with view menu for paged current slot contents; view entities with match_id filters loot without another program."},"body":self.body.as_ref().map(|h|h.shared.view()),"pending_action":pending,"last_tool_result":self.journal.last_result()?,"recent":self.journal.recent()?,"completed_tool_activity":activity,"memory":self.journal.recall(&self.goal)?});
             context["investigation"] = investigation;
+            context["navigation_resume"] = navigation::resume_context(
+                &self.journal,
+                &self.observed,
+                &self
+                    .body
+                    .as_ref()
+                    .map(|h| h.shared.view())
+                    .unwrap_or(Value::Null),
+            )?;
             context["goal_revision"] =
                 json!(self.journal.get("goal_revision")?.unwrap_or_default());
             context["coding_checkpoint"] = self.journal.navigation_coding_checkpoint(
@@ -1170,6 +1183,9 @@ impl Brain {
             if !choice.notes.is_empty() {
                 self.journal.set("working_notes", &choice.notes)?;
             }
+            if navigation::defer_if_paused(self, &choice).await? {
+                continue;
+            }
             if !active_work
                 && (choice.tool == "develop"
                     || choice.tool == "write"
@@ -1224,6 +1240,7 @@ impl Brain {
             )?;
             let goal_changed = self.goal != requested_goal
                 || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision;
+            let paused = result.as_ref().is_ok_and(navigation::scheduling_preempted);
             let mut executed = result
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
@@ -1270,12 +1287,19 @@ impl Brain {
                 }
                 self.journal.set("investigation_remaining", "0")?;
                 self.journal.set("needs_investigation", "false")?;
-            } else if investigation_left > 0 {
+            } else if investigation_left > 0 && !paused {
                 self.journal
                     .investigation_spent(&investigation_subject, false)?;
             }
-            let inspected =
-                progress::next_inspection_count(inspected, inspected_goal == self.goal, executed);
+            let inspected = if paused && !executed {
+                if inspected_goal == self.goal {
+                    inspected
+                } else {
+                    0
+                }
+            } else {
+                progress::next_inspection_count(inspected, inspected_goal == self.goal, executed)
+            };
             self.journal
                 .set("inspection_streak", &inspected.to_string())?;
             self.journal.set("inspection_goal", &self.goal)?;
@@ -1637,6 +1661,9 @@ fn shrink_value(value: &mut Value) {
     }
 }
 fn tool_failed(v: &Value) -> bool {
+    if navigation::scheduling_preempted(v) {
+        return false;
+    }
     (v["success"] == false && !navigation::resumable_slice(v))
         || v["local_action_feedback"]
             .get("error")
