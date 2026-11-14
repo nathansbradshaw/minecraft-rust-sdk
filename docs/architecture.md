@@ -330,6 +330,12 @@ or stale page, or exhausted budget. The existing single changed-threat hint
 refresh cannot refund these read budgets. Observations and independent defense
 continue, but an empty bounded search does not establish a safe escape or
 guarantee protection while another read is pending.
+Each existing query-result event includes bounded response-readiness metadata,
+raw versus usable option counts, pinned request binding, transport elapsed time,
+remaining policy state and its final stop/continue reason. Unknown or malformed
+ignored fields stay unknown in diagnostics rather than changing validation.
+Reported `busy=true` aggregates correction or running-control gates; it cannot
+identify which gate held the query. No raw response or terrain is added.
 
 Predictions are fenced by actor life, dimension, native clock, pose and terrain.
 One already-selected cover path may finish a remaining finite leg when first

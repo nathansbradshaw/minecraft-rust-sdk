@@ -208,6 +208,22 @@ fn unsupported_runtime_socket_stops_before_actor_connection() {
             .any(|args| args.first().is_some_and(|a| a == "connect"))
     );
     assert!(!s.case.join("stage-intent.json").exists());
+    let failure = json(
+        &s.case
+            .join("stage-preflight-runtime-filesystem.failure-step.json"),
+        16384,
+    )
+    .unwrap();
+    assert_eq!(failure["step"], "stage-preflight-runtime-filesystem");
+    assert_eq!(failure["exit_code"], 1);
+    assert_eq!(failure["timed_out"], false);
+    assert_eq!(failure["output_limit_exceeded"], false);
+    assert_eq!(failure["callback_error"], false);
+    assert!(
+        !serde_json::to_string(&failure)
+            .unwrap()
+            .contains("Invalid argument")
+    );
 }
 #[test]
 fn acquisition_preflight_checks_only_its_private_brain_config_without_connecting() {
@@ -987,4 +1003,151 @@ fn damaged_internal_profile_or_missing_model_key_cannot_block_host_cleanup() {
     assert_eq!(status["api_acknowledged"], true);
     assert_eq!(status["session_sync_cleared"], false);
     assert_eq!(status["native_absence_verified"], false);
+}
+
+#[test]
+fn failed_process_step_is_closed_metadata_and_preserves_original_output() {
+    let s = setup();
+    let mut failed = output("private child payload".into(), false);
+    failed.stderr = b"private stderr payload".to_vec();
+    failed.timed_out = true;
+    failed.output_limit_exceeded = true;
+    failed.callback_error = Some("private callback payload".into());
+    let mut fake = Fake {
+        replies: VecDeque::from([failed]),
+        calls: vec![],
+    };
+    let out = process::execute(
+        &mut fake,
+        &s.f,
+        &s.f.docker,
+        vec!["private argv payload".into()],
+        30,
+        &s.case,
+        "stage-preflight-runtime-filesystem",
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert!(!out.success);
+    assert_eq!(out.stdout, b"private child payload");
+    assert_eq!(
+        out.callback_error.as_deref(),
+        Some("private callback payload")
+    );
+    let path = s
+        .case
+        .join("stage-preflight-runtime-filesystem.failure-step.json");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        json(&path, 16384).unwrap(),
+        json!({
+            "format":"minecraft-bench-process-failure-v1",
+            "step":"stage-preflight-runtime-filesystem", "runner_error":false,
+            "exit_code":1, "signal":null, "interrupted":false, "timed_out":true,
+            "output_limit_exceeded":true, "callback_error":true,
+            "stdout_file":"stage-preflight-runtime-filesystem.stdout",
+            "stderr_file":"stage-preflight-runtime-filesystem.stderr",
+            "status_file":"stage-preflight-runtime-filesystem.status.json"
+        })
+    );
+    for extension in ["stdout", "stderr", "status.json"] {
+        assert!(
+            s.case
+                .join(format!("stage-preflight-runtime-filesystem.{extension}"))
+                .is_file()
+        );
+    }
+}
+
+#[test]
+fn runner_error_step_preserves_error_without_claiming_retained_output() {
+    struct FailedRunner;
+    impl Runner for FailedRunner {
+        fn run(
+            &mut self,
+            _: &Path,
+            _: &[String],
+            _: u64,
+            _: &Secrets,
+            _: &mut dyn FnMut(&Value) -> Result<()>,
+        ) -> Result<process::Output> {
+            Err("private runner error payload".into())
+        }
+    }
+    let s = setup();
+    let error = process::call(
+        &mut FailedRunner,
+        &s.f,
+        &s.f.docker,
+        vec![],
+        &s.case,
+        "stage-preflight-container",
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.to_string(), "private runner error payload");
+    assert_eq!(
+        json(
+            &s.case.join("stage-preflight-container.failure-step.json"),
+            16384
+        )
+        .unwrap(),
+        json!({
+            "format":"minecraft-bench-process-failure-v1",
+            "step":"stage-preflight-container", "runner_error":true,
+            "exit_code":null, "signal":null, "interrupted":null, "timed_out":null,
+            "output_limit_exceeded":null, "callback_error":null,
+            "stdout_file":null, "stderr_file":null, "status_file":null
+        })
+    );
+}
+
+#[test]
+fn successful_process_with_invalid_json_is_not_a_failed_process_step() {
+    let s = setup();
+    let mut fake = Fake {
+        replies: VecDeque::from([output("not JSON".into(), true)]),
+        calls: vec![],
+    };
+    assert!(
+        process::call(
+            &mut fake,
+            &s.f,
+            &s.f.docker,
+            vec![],
+            &s.case,
+            "successful-child"
+        )
+        .is_err()
+    );
+    assert!(!s.case.join("successful-child.failure-step.json").exists());
+    assert!(s.case.join("successful-child.status.json").exists());
+}
+
+#[test]
+fn failure_step_write_cannot_replace_existing_evidence_or_process_result() {
+    let s = setup();
+    let marker = s.case.join("failed-child.failure-step.json");
+    write(&marker, b"original failure evidence");
+    let mut fake = Fake {
+        replies: VecDeque::from([output("retained failure".into(), false)]),
+        calls: vec![],
+    };
+    let out = process::execute(
+        &mut fake,
+        &s.f,
+        &s.f.docker,
+        vec![],
+        30,
+        &s.case,
+        "failed-child",
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert!(!out.success);
+    assert_eq!(read(&marker, 16384).unwrap(), b"original failure evidence");
+    assert_eq!(out.stdout, b"retained failure");
 }

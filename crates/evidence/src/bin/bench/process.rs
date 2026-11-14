@@ -246,7 +246,13 @@ pub fn execute(
         None
     });
     let started = utc_ms()?;
-    let mut out = runner.run(&tool.path, &args, seconds, &secrets, on_line)?;
+    let mut out = match runner.run(&tool.path, &args, seconds, &secrets, on_line) {
+        Ok(out) => out,
+        Err(error) => {
+            failure_step(case, label, None);
+            return Err(error);
+        }
+    };
     // connect can atomically create a new session: include both generations before ANY persistence.
     match f.secrets() {
         Ok(new) => secrets.0.extend(new.0),
@@ -276,7 +282,36 @@ pub fn execute(
         &case.join(format!("{label}.status.json")),
         &json!({"started_utc_ms":started,"finished_utc_ms":utc_ms()?,"success":out.success,"exit_code":out.exit_code,"signal":out.signal,"interrupted":out.interrupted,"timed_out":out.timed_out,"callback_error":out.callback_error,"output_limit_exceeded":out.output_limit_exceeded,"stdout_sha256":sha256(&out.stdout),"stderr_sha256":sha256(&out.stderr),"argv_retained":false}),
     )?;
+    if !out.success {
+        failure_step(case, label, Some(&out));
+    }
     Ok(out)
+}
+// Labels come from operator code, never child output or an error payload. Only
+// a failed process boundary is named; later validation failures remain unknown.
+fn failure_step(case: &Path, label: &str, out: Option<&Output>) {
+    let name = format!("{label}.failure-step.json");
+    let record = json!({
+        "format":"minecraft-bench-process-failure-v1",
+        "step":label,
+        "runner_error":out.is_none(),
+        "exit_code":out.and_then(|o|o.exit_code),
+        "signal":out.and_then(|o|o.signal),
+        "interrupted":out.map(|o|o.interrupted),
+        "timed_out":out.map(|o|o.timed_out),
+        "output_limit_exceeded":out.map(|o|o.output_limit_exceeded),
+        "callback_error":out.map(|o|o.callback_error.is_some()),
+        "stdout_file":out.map(|_|format!("{label}.stdout")),
+        "stderr_file":out.map(|_|format!("{label}.stderr")),
+        "status_file":out.map(|_|format!("{label}.status.json"))
+    });
+    // Diagnostic persistence must never replace the original result or prevent
+    // cleanup. Existing evidence is not overwritten; report a failed write.
+    let written = save(&case.join(&name), &record).is_ok();
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "mc-sdk-bench process boundary failed: step={label} metadata={name} written={written}"
+    );
 }
 pub fn call(
     runner: &mut dyn Runner,
