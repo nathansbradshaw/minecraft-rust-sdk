@@ -122,7 +122,7 @@ pub(super) fn setup() -> Setup {
 pub(super) fn observation(f: &Fixture) -> Value {
     json!({"revision":"test","player":{"uuid":f.player_uuid,"life_id":"eac7697a-2c77-4ae2-a7f9-a9ed7aac21b5","dimension":"minecraft:overworld","health":20.0,"food":20,"position":f.expected_player_position,"inventory":[]},"world":{},"menu":{"menu_id":0,"slots":[],"carried":{"item":"minecraft:air","count":0}}})
 }
-fn mounts(f: &Fixture) -> Value {
+pub(super) fn mounts(f: &Fixture) -> Value {
     json!({"id":f.container_id,"started_at":f.container_started_at,"running":true,"readonly_rootfs":true,"privileged":false,"user":"1000:1000","memory":536870912,"nano_cpus":1000000000u64,"pids":256,"cap_drop":["ALL"],"cap_add":[],"security":["no-new-privileges:true"],"network":"existing-private-network","pid_mode":"","ipc_mode":"private","devices":[],"env_names":["PATH","HOME"],"mounts":[{"Type":"bind","Source":f.secret_dir,"Destination":f.container_secret_dir,"RW":false},{"Type":"tmpfs","Source":"","Destination":"/workspace","RW":true}]})
 }
 fn preflight_replies(f: &Fixture) -> VecDeque<process::Output> {

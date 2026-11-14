@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[path = "runtime_check/dependencies.rs"]
+mod dependency_witness;
 #[cfg(target_os = "linux")]
 #[path = "runtime_check/process.rs"]
 mod process_witness;
@@ -87,6 +89,19 @@ fn check(state: &Path) -> io::Result<()> {
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "dependency-witness" {
+        match dependency_witness::inspect(Path::new(&args[1])) {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"format":"minecraft-runtime-dependency-witness-v1","complete":false,"error":error.to_string()})
+                );
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.len() == 2 && args[0] == "process-witness" {
         #[cfg(target_os = "linux")]
         let result = process_witness::inspect(Path::new(&args[1]));
