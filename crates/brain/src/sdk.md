@@ -252,9 +252,17 @@ SDK quick reference (Lua behaviors; Rust SDK and Brain):
 - Put its journal under MC_SDK_STATE, using a distinct file per goal. Reuse that
   journal to resume; pending IDs are inspected rather than replayed. Options
   controls operation deadline, actions, nodes and caller-supplied forbidden block
-  IDs. Inspect status/remaining_distance/pending_action in the report. reached
-  for BlockReach means a candidate interaction distance, not an obtained item.
-  Keep the defensive arbiter enabled and verify the requested game effect.
+  IDs. Inspect status/remaining_distance/pending_action in the report. BlockReach
+  adds the supplied eye_height to the observed feet position and measures the
+  shortest distance to the target block's axis-aligned unit box, not its center.
+  remaining_distance is the amount this eye-to-box distance exceeds the requested
+  distance, or zero. A separate center-distance guard is a different condition
+  and can reject a pose that satisfies the requested BlockReach goal.
+  reached confirms only this geometric condition at the observed pose. It does
+  not certify line of sight, native interaction/claim permission, block removal,
+  pickup or retained inventory. Check dig start/finish receipts separately, then
+  verify block changes and retained inventory; an observed start is not a mined
+  block. Keep the defensive arbiter enabled and verify the requested game effect.
 - Lua behaviors (AI-edited scripts; resident Rust execution):
 
 The Rust Brain embeds Lua 5.4 using mlua. Use write/edit for relative `.lua`

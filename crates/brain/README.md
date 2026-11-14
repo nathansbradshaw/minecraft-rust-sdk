@@ -45,6 +45,10 @@ verification/release flags instead of dropping the receipt. `feedback_view`
 marks omitted evidence with its original hash; `after` may be a focused historical
 view. Current full state remains in `ctx.observation`, and full receipts remain
 in the Brain journal. Omission does not establish a gameplay effect.
+Large navigation results also retain the helper's actual `note`, distance,
+progress counters and original `navigation_slice` goal/completion/resume fields.
+Those are historical helper classifications: an inspected waypoint receipt does
+not change them or prove resource collection. Unknown fields remain unknown.
 
 State is scoped to workspace/path, instance, actor and goal revision and persists
 across reloads and restarts. A slice runs at most128 commands within the configured
