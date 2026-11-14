@@ -152,6 +152,15 @@ Tools and input:
   and journals its action ID. Fields are those of the SDK Action enum; no actor ID.
 - navigate: a typed SDK navigation goal as JSON. For distant observed targets,
   prefer this over a single start_move or manually paging movement_options.
+  an acquisition route can explicitly use {"goal":{...the normal position or
+  block_reach goal...},"until_inventory":{"item":"runtime:item","minimum":1}}.
+  Use the actual runtime item ID and desired retained count for that subgoal.
+  This opt-in stops resuming an obsolete drop position after a fresh same-life
+  inventory check and original held-input settlement. inventory_satisfied is
+  separate from positional arrival and parent-goal completion; inventory_missing
+  means the approach did not satisfy collection. Cursor/menu items do not count.
+  Bare goals keep their ordinary position semantics; unrelated pickups do not
+  stop movement. Inspect/reconcile preserved IDs instead of replaying them.
   Position goal: {"kind":"position","dimension":"runtime:dimension","target":[x,y,z],"distance":0.5}.
   Interaction pose: {"kind":"block_reach","dimension":"runtime:dimension","block":[x,y,z],"distance":4.0,"eye_height":1.62}.
   Use actual dimension/coordinates; upright Java players normally use eye_height
@@ -159,7 +168,8 @@ Tools and input:
   seconds per call with a persistent goal journal. Inspect current position,
   navigation.report and navigation_slice. A budget_exhausted slice with
   can_resume=true is incomplete
-  work, not a tool error. Resume its supplied goal to keep the graph and inspect
+  work, not a tool error. If that route still serves its task, resume its supplied
+  goal to keep the graph and inspect
   pending IDs; a different target starts a different graph. Look for actual
   movement or new read work. Repeated unchanged slices need investigation, not
   endless retries. You may choose another task when observations justify it.
