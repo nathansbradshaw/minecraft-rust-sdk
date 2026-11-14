@@ -155,8 +155,31 @@ struct Page {
     retry_after_ms: Option<u64>,
 }
 
+struct QueryReply {
+    result: std::result::Result<Value, String>,
+    elapsed_ms: u128,
+}
+
+/// Diagnostics only: never deserialize ignored fields into the accepted Page.
+fn response_readiness(value: &Value) -> Value {
+    let origin = value.get("origin");
+    let busy = value.get("busy");
+    let retry = value.get("retry_after_ms");
+    let retry_ms = retry.and_then(Value::as_u64);
+    json!({
+        "origin_present":origin.map(|v|!v.is_null()),
+        "origin_field":match origin {None=>"absent",Some(Value::Null)=>"null",Some(Value::Object(_))=>"object",_=>"invalid"},
+        "busy":busy.and_then(Value::as_bool),
+        "busy_field":match busy {None=>"absent",Some(Value::Bool(_))=>"boolean",_=>"invalid"},
+        "retry_after_ms":retry_ms,
+        "retry_after_ms_clamped":retry_ms.map(|ms|ms.clamp(25,5000)),
+        "retry_field":match retry {None=>"absent",Some(Value::Null)=>"null",_ if retry_ms.is_some()=>"u64",_=>"invalid"},
+        "raw_options_count":value["options"].as_array().map(Vec::len)
+    })
+}
+
 pub(super) struct Discovery {
-    task: Option<JoinHandle<std::result::Result<Value, String>>>,
+    task: Option<JoinHandle<QueryReply>>,
     basis: String,
     offset: usize,
     scene: Option<String>,
@@ -279,29 +302,34 @@ impl Discovery {
         self.update_basis(o, first_prefix_only, axis);
         if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
             let task = self.task.take().unwrap();
-            let result = match task.await {
-                Ok(Ok(value)) => {
+            // A changed basis aborts the task before this point. These are the
+            // exact pinned request facts, before accept advances the cursor.
+            let (request_offset, request_target) = (self.offset, self.preference);
+            let (reply, elapsed_ms) = match task.await {
+                Ok(reply) => (reply.result, Some(reply.elapsed_ms)),
+                Err(error) => (Err(error.to_string()), None),
+            };
+            let readiness = reply.as_ref().ok().map(response_readiness);
+            let pending_response = readiness
+                .as_ref()
+                .is_some_and(|r| r["origin_field"] == "null" || r["origin_field"] == "absent");
+            let result = match reply {
+                Ok(value) => {
                     if first_prefix_only {
                         self.accept_prefix(value, o, axis)
                     } else {
                         self.accept(value, o, axis)
                     }
                 }
-                Ok(Err(error)) => Err(error.into()),
-                Err(error) => Err(error.to_string().into()),
+                Err(error) => Err(error.into()),
             };
-            if let Err(error) = result {
+            let error = result.err().map(|e| e.to_string());
+            if error.is_some() {
                 self.done = true;
                 self.routes.clear();
-                j.event("body_native_escape_query_failed",json!({"error":error.to_string(),
-                    "offset":self.offset,"retry":"Only after a meaningful scene/pose change; no gameplay mutation submitted"}))?;
-            } else {
-                j.event("body_native_escape_options",json!({"scene":self.scene,
-                    "next_offset":self.offset,"complete":self.done,"options":self.routes.len(),
-                    "origin":o.player["position"],"revision":o.revision,
-                    "ready_pages":self.ready_pages,"ready_page_limit":MAX_PREFIX_READY_PAGES,
-                    "scope":"Adapter predictions; native action admission and observed effect still required"}))?;
             }
+            let native_complete = self.done;
+            let mut empty_continuation = false;
             if first_prefix_only {
                 // Busy is readiness, not an empty completed prefix. Honor its
                 // existing bounded retry hint once. A ready EMPTY prefix with
@@ -310,17 +338,63 @@ impl Discovery {
                     self.done |=
                         !self.routes.is_empty() || self.ready_pages >= MAX_PREFIX_READY_PAGES;
                     if !self.done {
-                        j.event("body_native_escape_empty_prefix_continues",json!({
-                            "next_offset":self.offset,"ready_pages":self.ready_pages,
-                            "ready_page_limit":MAX_PREFIX_READY_PAGES,"scene":self.scene,
-                            "origin":self.page_origin,"target":self.preference,
-                            "scope":"Bounded read-only continuation; no heuristic mutation or safety claim"}))?;
+                        empty_continuation = true;
                     }
                 } else if self.done || self.prefix_busy_retries >= 1 {
                     self.done = true;
                 } else {
                     self.prefix_busy_retries += 1;
                 }
+            }
+            let reason = if error.is_some() {
+                "query_failed"
+            } else if self.done {
+                if native_complete {
+                    "native_complete"
+                } else if !self.routes.is_empty() {
+                    "usable_routes"
+                } else if self.ready_pages >= MAX_PREFIX_READY_PAGES {
+                    "ready_page_budget_exhausted"
+                } else {
+                    "readiness_retry_budget_exhausted"
+                }
+            } else if empty_continuation {
+                "empty_ready_prefix_continue"
+            } else if self.received.is_none() {
+                if pending_response {
+                    "readiness_retry_scheduled"
+                } else {
+                    "scene_restart_scheduled"
+                }
+            } else {
+                "paging_continue"
+            };
+            let evidence = json!({"request_offset":request_offset,"request_limit":8,"request_target":request_target,
+                "request_basis_sha256":self.basis,"transport_elapsed_ms":elapsed_ms,"response":readiness,
+                "usable_routes_count":self.routes.len(),"first_prefix_only":first_prefix_only,
+                "ready_pages":self.ready_pages,"ready_page_limit":first_prefix_only.then_some(MAX_PREFIX_READY_PAGES),
+                "readiness_retry_reservations":self.prefix_busy_retries,"readiness_retry_limit":first_prefix_only.then_some(1),
+                "retry_hint_applied":error.is_none()&&self.received.is_none()&&pending_response,
+                "search_done":self.done,"policy_reason":reason,
+                "scope":"Read-only query evidence; busy aggregates correction/control gates, not their individual cause or a safety claim"});
+            if let Some(error) = error {
+                j.event("body_native_escape_query_failed",json!({"error":error,
+                    "offset":self.offset,"retry":"Only after a meaningful scene/pose change; no gameplay mutation submitted",
+                    "query_evidence":evidence}))?;
+            } else {
+                j.event("body_native_escape_options",json!({"scene":self.scene,
+                    "next_offset":self.offset,"complete":native_complete,"options":self.routes.len(),
+                    "origin":o.player["position"],"revision":o.revision,
+                    "ready_pages":self.ready_pages,"ready_page_limit":MAX_PREFIX_READY_PAGES,
+                    "query_evidence":evidence,
+                    "scope":"Adapter predictions; native action admission and observed effect still required"}))?;
+            }
+            if empty_continuation {
+                j.event("body_native_escape_empty_prefix_continues",json!({
+                    "next_offset":self.offset,"ready_pages":self.ready_pages,
+                    "ready_page_limit":MAX_PREFIX_READY_PAGES,"scene":self.scene,
+                    "origin":self.page_origin,"target":self.preference,
+                    "scope":"Bounded read-only continuation; no heuristic mutation or safety claim"}))?;
             }
         }
         if self
@@ -343,7 +417,8 @@ impl Discovery {
                 "reason":if first_prefix_only{"Native held-input movement rejected; inspect one current prefix"}else{"No two-block defensive displacement over80advancing native ticks"},
                 "execution":"Read-only background query; body observations and urgent defense continue"}))?;
             self.task = Some(tokio::spawn(async move {
-                match tokio::time::timeout(
+                let started = Instant::now();
+                let result = match tokio::time::timeout(
                     Duration::from_millis(750),
                     client.read_observation(&ObservationQuery {
                         capability: "minecraft:movement_options".into(),
@@ -357,6 +432,10 @@ impl Discovery {
                     Err(_) => {
                         Err("Native escape query exceeded750ms; no mutation submitted".into())
                     }
+                };
+                QueryReply {
+                    result,
+                    elapsed_ms: started.elapsed().as_millis(),
                 }
             }));
         }
@@ -821,6 +900,183 @@ mod tests {
         p["complete"] = json!(false);
         p["next_offset"] = json!(offset + 2);
         p
+    }
+    #[test]
+    fn readiness_metadata_never_promotes_ignored_busy_fields_or_logs_raw_values() {
+        let o = observation();
+        let mut p = page();
+        p["busy"] = json!({"private_extra":"must-not-be-recorded"});
+        p["private_extra"] = json!("must-not-be-recorded");
+        let metadata = response_readiness(&p);
+        assert_eq!(metadata["busy"], Value::Null);
+        assert_eq!(metadata["busy_field"], "invalid");
+        assert_eq!(metadata["raw_options_count"], 1);
+        assert!(!metadata.to_string().contains("must-not-be-recorded"));
+        let mut d = Discovery::default();
+        d.accept_prefix(p.clone(), &o, 3.5).unwrap();
+        assert_eq!(
+            d.routes.len(),
+            1,
+            "previously ignored busy field stays ignored"
+        );
+        p["retry_after_ms"] = json!(-1);
+        let metadata = response_readiness(&p);
+        assert_eq!(metadata["retry_field"], "invalid");
+        assert_eq!(metadata["retry_after_ms_clamped"], Value::Null);
+        assert!(
+            Discovery::default().accept_prefix(p, &o, 3.5).is_err(),
+            "negative hint still fails existing Page validation"
+        );
+        assert_eq!(
+            response_readiness(&json!({"retry_after_ms":1}))["retry_after_ms_clamped"],
+            25
+        );
+        assert_eq!(
+            response_readiness(&json!({"retry_after_ms":9000}))["retry_after_ms_clamped"],
+            5000
+        );
+    }
+    #[tokio::test]
+    async fn readiness_result_evidence_distinguishes_filtered_ready_busy_and_throttle_after_policy()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(
+            Client::with_profile(&minecraft_sdk::Profile {
+                endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+                instance_id: "fixture".into(),
+                credential: minecraft_sdk::Credential {
+                    bot_id: "own".into(),
+                    player_uuid: "own".into(),
+                    key: "fixture".into(),
+                },
+                session: None,
+            })
+            .unwrap()
+            .without_local_arbiter(),
+        );
+        let mut server = tokio::spawn(async move {
+            for (index, offset) in [0, 2, 2].into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    assert!(bytes.len() < 8192);
+                }
+                let header = String::from_utf8(bytes).unwrap();
+                assert!(
+                    header.starts_with("POST /v1/bots/own/observations/query "),
+                    "no gameplay mutation"
+                );
+                let size = header
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                assert!(size < 8192);
+                let mut bytes = vec![0; size];
+                socket.read_exact(&mut bytes).await.unwrap();
+                let query: ObservationQuery = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(query.input, json!({"offset":offset,"limit":8}));
+                let mut value = if index == 0 {
+                    let mut p = empty_page(0);
+                    p["options"] = page()["options"].clone();
+                    p["options"][0]["touched_blocks"] = json!(["minecraft:lava"]);
+                    p
+                } else {
+                    json!({"format":"minecraft-movement-options-v1","origin":null,"scene":"",
+                        "options":[],"complete":false,"next_offset":null,
+                        "retry_after_ms":if index==1{250}else{100},"busy":index==1})
+                };
+                value["private_extra"] = json!("must-not-be-recorded");
+                let body = value.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "unchanged three-query limit; no fourth query or mutation"
+            );
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+        let mut d = Discovery::default();
+        let o = observation();
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                assert!(
+                    d.tick(client.clone(), &o, true, true, 3.5, &j)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                if d.done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            d.tick(client, &o, true, true, 3.5, &j).await.unwrap();
+        })
+        .await;
+        let joined = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+        if joined.is_err() {
+            server.abort();
+        }
+        joined
+            .expect("bounded diagnostics transport fixture")
+            .unwrap();
+        result.unwrap();
+        let mut q = j
+            .db
+            .prepare("SELECT data FROM events WHERE kind='body_native_escape_options' ORDER BY id")
+            .unwrap();
+        let results: Vec<Value> = q
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            results.len(),
+            3,
+            "one enriched result per completed response"
+        );
+        for (index, r) in results.iter().enumerate() {
+            let e = &r["query_evidence"];
+            assert_eq!(e["request_offset"], [0, 2, 2][index]);
+            assert_eq!(e["request_limit"], 8);
+            assert_eq!(e["request_target"], Value::Null);
+            assert_eq!(e["request_basis_sha256"].as_str().unwrap().len(), 64);
+            assert!(e["transport_elapsed_ms"].as_u64().is_some());
+            assert_eq!(e["ready_pages"], 1);
+            assert_eq!(e["usable_routes_count"], 0);
+            assert_eq!(e["search_done"], index == 2);
+            assert_eq!(e["readiness_retry_reservations"], usize::from(index > 0));
+            assert!(!r.to_string().contains("must-not-be-recorded"));
+        }
+        let first = &results[0]["query_evidence"];
+        assert_eq!(first["response"]["raw_options_count"], 1);
+        assert_eq!(first["response"]["origin_present"], true);
+        assert_eq!(first["response"]["busy_field"], "absent");
+        assert_eq!(first["policy_reason"], "empty_ready_prefix_continue");
+        for (index, busy, hint, reason) in [
+            (1, true, 250, "readiness_retry_scheduled"),
+            (2, false, 100, "readiness_retry_budget_exhausted"),
+        ] {
+            let e = &results[index]["query_evidence"];
+            assert_eq!(e["response"]["busy"], busy);
+            assert_eq!(e["response"]["retry_after_ms"], hint);
+            assert_eq!(e["response"]["origin_present"], false);
+            assert_eq!(e["retry_hint_applied"], true);
+            assert_eq!(e["policy_reason"], reason);
+        }
+        assert_eq!(
+            results[2]["complete"], false,
+            "legacy native completion stays separate from final search_done"
+        );
     }
     #[test]
     fn empty_prefix_requires_exact_cursor_scene_origin_and_finite_read_budget() {
