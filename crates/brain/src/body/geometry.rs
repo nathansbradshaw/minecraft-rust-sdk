@@ -728,6 +728,25 @@ pub(super) fn evade_policy(
     admitted: &[Admitted],
     boundary_enabled: bool,
 ) -> Option<Escape> {
+    evade_policy_priority::<true>(
+        o,
+        blocked,
+        stationary,
+        recent_retreat,
+        waypoint_axis,
+        admitted,
+        boundary_enabled,
+    )
+}
+fn evade_policy_priority<const OUTBOUND: bool>(
+    o: &Observation,
+    blocked: &[[i32; 3]],
+    stationary: &[String],
+    recent_retreat: &[[f64; 3]],
+    waypoint_axis: f64,
+    admitted: &[Admitted],
+    boundary_enabled: bool,
+) -> Option<Escape> {
     if water_danger(o) {
         return water_escape(o, blocked);
     }
@@ -869,6 +888,30 @@ pub(super) fn evade_policy(
     } else {
         None
     };
+    // Experiment: when no immediate hazard or cover plan owns this choice,
+    // ordinary visible-ranged retreat favors separation over an unprompted
+    // sideways weave. Actual projectile evasion and boundary turns retain
+    // their existing lateral reward, as do mixed/close/unknown motion cases.
+    let outbound = OUTBOUND
+        && !burning
+        && !projectile_danger
+        && !blast_escape
+        && !contact_exposed
+        && !seek_refuge
+        && boundary_turn.is_none()
+        && recalled_cover_origins.is_empty()
+        && o.player["on_ground"] == true
+        && o.player["in_water"] == false
+        && o.player["eyes_in_water"] == false
+        && o.player["in_lava"] == false
+        && threats
+            .iter()
+            .all(|(_, ranged, aerial)| *ranged && !*aerial)
+        && o.world["entities"].as_array().is_some_and(|entities| {
+            entities
+                .iter()
+                .any(|e| e["visible"] == true && e["hostile"] == true && e["ranged_attack"] == true)
+        });
     let score = |p: [f64; 3]| -> f64 {
         let mut distance = threats
             .iter()
@@ -998,7 +1041,12 @@ pub(super) fn evade_policy(
         } else {
             0.
         };
-        distance * 2. + cover + sidestep * 8. + ranged_lateral * 2. + blast_safety * 48.0 + refuge
+        distance * 2.
+            + cover
+            + sidestep * 8.
+            + if outbound { 0. } else { ranged_lateral * 2. }
+            + blast_safety * 48.0
+            + refuge
             - turn_cost
     };
     let current = score(start) - if burning { 10. } else { 0. };
@@ -1157,7 +1205,7 @@ pub(super) fn evade_policy(
     if best.is_none() && boundary_turn.is_some() {
         // A circulation preference must not fence the only admitted way back.
         // One fallback pass retains history and the original hazard scoring.
-        return evade_policy(
+        return evade_policy_priority::<OUTBOUND>(
             o,
             blocked,
             stationary,
@@ -1167,12 +1215,164 @@ pub(super) fn evade_policy(
             false,
         );
     }
+    #[cfg(test)]
+    tests::LAST_SCORE.with(|last| last.set(best.as_ref().map(|_| best_score)));
     best
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    thread_local! {
+        pub(super) static LAST_SCORE: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[test]
+    fn outbound_ranged_retreat_preserves_urgent_and_cover_choices() {
+        let mut o = world();
+        o.player = json!({"position":[0.5,1.,0.5],"on_ground":true,"health":20.,
+            "in_water":false,"eyes_in_water":false,"in_lava":false});
+        o.world["entities"] = json!([{"visible":true,"hostile":true,"ranged_attack":true,
+            "position":[8.5,1.,0.5]}]);
+        let select = |o: &Observation, outbound| {
+            if outbound {
+                evade_policy_priority::<true>(o, &[], &[], &[], 3.5, &[], false)
+            } else {
+                evade_policy_priority::<false>(o, &[], &[], &[], 3.5, &[], false)
+            }
+        };
+        let old = select(&o, false).unwrap();
+        let new = select(&o, true).unwrap();
+        let distance = |r: &Escape| (r.target.x - 8.5).hypot(r.target.z - 0.5);
+        assert!(distance(&new) > distance(&old));
+        assert!(!new.jump);
+        let signature = |r: Option<Escape>| {
+            r.map(
+                |r| json!({"target":r.target,"jump":r.jump,"reason":r.reason,"path":r.cover_path}),
+            )
+        };
+        for mode in [
+            "projectile",
+            "fire",
+            "mixed",
+            "close",
+            "airborne",
+            "water",
+            "unknown",
+            "recalled_with_far_visible",
+        ] {
+            let mut hazard = o.clone();
+            match mode {
+                "projectile" => hazard.world["entities"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                    "visible":true,"projectile":true,"type":"minecraft:arrow",
+                    "position":[4.5,1.9,0.5],"velocity":[-1.,0.,0.]})),
+                "fire" => hazard.player["fire_ticks"] = json!(20),
+                "mixed" => hazard.world["entities"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                    "visible":true,"hostile":true,"position":[3.5,1.,0.5]})),
+                "close" => hazard.world["entities"][0]["position"] = json!([4.5, 1., 0.5]),
+                "airborne" => hazard.player["on_ground"] = json!(false),
+                "water" => hazard.player["in_water"] = json!(true),
+                "recalled_with_far_visible" => {
+                    hazard.world["entities"][0]["visible"] = json!(false);
+                    hazard.world["entities"][0]["client_memory"] = json!({
+                        "kind":"last_visible_ranged_threat","age_ticks":10,"expires_after_ticks":160});
+                    hazard.world["entities"].as_array_mut().unwrap().push(json!({
+                        "visible":true,"hostile":true,"ranged_attack":true,"position":[80.5,1.,0.5]}));
+                }
+                _ => hazard.player["in_water"] = Value::Null,
+            }
+            assert_eq!(
+                signature(select(&hazard, true)),
+                signature(select(&hazard, false)),
+                "{mode}"
+            );
+        }
+        let cover = ranged_corner().0;
+        assert_eq!(
+            signature(select(&cover, true)),
+            signature(select(&cover, false))
+        );
+    }
+
+    #[test]
+    #[ignore = "operator-provided captured observation; no public private-world fixture"]
+    fn captured_outbound_retreat_has_a_geometrically_feasible_radial_gain() {
+        let path = std::env::var_os("MINECRAFT_OUTBOUND_REPLAY").expect("captured Snapshot path");
+        let bytes = crate::private_read(
+            std::path::Path::new(&path),
+            super::super::decision::MAX_BYTES as u64,
+        )
+        .unwrap();
+        let frame: Value = serde_json::from_slice(&bytes).unwrap();
+        let o: Observation = serde_json::from_value(frame["observation"].clone()).unwrap();
+        let blocked: Vec<[i32; 3]> = serde_json::from_value(frame["blocked"].clone()).unwrap();
+        let stationary: Vec<String> = serde_json::from_value(frame["stationary"].clone()).unwrap();
+        let recent: Vec<[f64; 3]> =
+            serde_json::from_value(frame["recent_retreat"].clone()).unwrap();
+        let admitted: Vec<Admitted> = serde_json::from_value(frame["admitted"].clone()).unwrap();
+        let axis = frame["waypoint_axis"].as_f64().unwrap();
+        let old = evade_policy_priority::<false>(
+            &o,
+            &blocked,
+            &stationary,
+            &recent,
+            axis,
+            &admitted,
+            false,
+        )
+        .unwrap();
+        let old_score = LAST_SCORE.with(|last| last.get());
+        let new = evade_policy_priority::<true>(
+            &o,
+            &blocked,
+            &stationary,
+            &recent,
+            axis,
+            &admitted,
+            false,
+        )
+        .unwrap();
+        let new_score = LAST_SCORE.with(|last| last.get());
+        assert_eq!(
+            json!(old.target),
+            frame["selected"]["target"],
+            "exact old production replay"
+        );
+        assert_eq!(old.reason, frame["selected"]["reason"]);
+        let start = point(&o.player["position"]).unwrap();
+        let enemies: Vec<_> = o.world["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["visible"] == true && e["hostile"] == true && e["ranged_attack"] == true)
+            .map(|e| point(&e["position"]).unwrap())
+            .collect();
+        let separation = |p: [f64; 3]| {
+            enemies
+                .iter()
+                .map(|e| (p[0] - e[0]).hypot(p[2] - e[2]))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let old_distance = separation([old.target.x, old.target.y, old.target.z]);
+        let new_distance = separation([new.target.x, new.target.y, new.target.z]);
+        assert!(
+            new_distance > old_distance,
+            "candidate must change a feasible route with radial gain"
+        );
+        println!(
+            "{}",
+            json!({"source_fixture_sha256":crate::digest(&bytes),"revision":o.revision,
+            "start":start,"old":{"target":old.target,"score":old_score,"separation":old_distance},
+            "new":{"target":new.target,"score":new_score,"separation":new_distance},
+            "scope":"Same observed geometry/constraints; not native admission, future enemy motion or Survival evidence"})
+        );
+    }
     fn guarded_floor() -> Observation {
         let mut o = world();
         o.player = json!({"position":[0.5,1.,0.5],"on_ground":true});
