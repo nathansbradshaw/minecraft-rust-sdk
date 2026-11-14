@@ -94,6 +94,9 @@ fn allowed(path: &str) -> bool {
         "server-neoforge/gradlew",
         "server-neoforge/gradle/wrapper/gradle-wrapper.properties",
         "server-neoforge/gradle/wrapper/gradle-wrapper.jar",
+        "server-neoforge/tools/README.md",
+        "server-neoforge/tools/observer-update.mf",
+        "server-neoforge/tools/dev/minecraftsdk/tools/NativeObservationLiveUpdate.java",
     ]
     .contains(&path)
 }
@@ -226,6 +229,24 @@ mod tests {
             "server-neoforge/build/minecraft.jar",
             ".git/objects/private",
             "deploy/ssh.key",
+        ] {
+            assert!(!allowed(p), "{p}");
+        }
+    }
+    #[test]
+    fn operator_observer_paths_are_exact_not_an_unrestricted_tools_tree() {
+        for p in [
+            "server-neoforge/tools/README.md",
+            "server-neoforge/tools/observer-update.mf",
+            "server-neoforge/tools/dev/minecraftsdk/tools/NativeObservationLiveUpdate.java",
+        ] {
+            assert!(allowed(p), "{p}");
+        }
+        for p in [
+            "server-neoforge/tools/other.java",
+            "server-neoforge/tools/observer-update.jar",
+            "server-neoforge/tools/plan.properties",
+            "server-neoforge/tools/dev/minecraftsdk/tools/ArbitraryUpdate.java",
         ] {
             assert!(!allowed(p), "{p}");
         }

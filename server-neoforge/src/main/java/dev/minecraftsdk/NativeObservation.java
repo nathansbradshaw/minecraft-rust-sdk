@@ -86,6 +86,9 @@ final class NativeObservation {
             .sorted(Comparator.<net.minecraft.world.entity.Entity>comparingInt(e->e instanceof Enemy||e.getType().getCategory()==MobCategory.MONSTER||e instanceof Projectile&&e.getDeltaMovement().lengthSqr()>0.0001?0:1)
             .thenComparingDouble(e->e.distanceToSqr(player))).limit(128).toList();
         for(var entity:visible){var row=new LinkedHashMap<String,Object>();row.put("entity_id",entity.getId());row.put("uuid",entity.getUUID().toString());row.put("type",BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());row.put("position",List.of(entity.getX(),entity.getY(),entity.getZ()));row.put("visible",true);
+            // World-space runtime geometry for this already-visible entity;
+            // never infer a species size or expose an unseen entity here.
+            var bounds=entity.getBoundingBox();row.put("bounds",List.of(bounds.minX,bounds.minY,bounds.minZ,bounds.maxX,bounds.maxY,bounds.maxZ));
             var velocity=entity.getDeltaMovement();row.put("velocity",List.of(velocity.x,velocity.y,velocity.z));
             row.put("hostile",entity instanceof Enemy||entity.getType().getCategory()==MobCategory.MONSTER);row.put("player",entity instanceof net.minecraft.world.entity.player.Player);
             if(entity instanceof LivingEntity living){row.put("health",living.getHealth());row.put("hurt_time",living.hurtTime);row.put("main_hand",equipment(living.getMainHandItem()));row.put("off_hand",equipment(living.getOffhandItem()));row.put("ranged_attack",entity instanceof RangedAttackMob||RANGED_ANIMATIONS.contains(living.getMainHandItem().getUseAnimation().name())||RANGED_ANIMATIONS.contains(living.getOffhandItem().getUseAnimation().name()));}
@@ -98,6 +101,9 @@ final class NativeObservation {
         }
         var own=new LinkedHashMap<String,Object>();own.put("uuid",player.getUUID().toString());own.put("name",player.getGameProfile().getName());own.put("entity_id",player.getId());own.put("dimension",world.dimension().location().toString());own.put("position",List.of(player.getX(),player.getY(),player.getZ()));own.put("yaw",player.getYRot());own.put("pitch",player.getXRot());own.put("on_ground",player.onGround());own.put("sprinting",player.isSprinting());own.put("sneaking",player.isShiftKeyDown());own.put("health",player.getHealth());own.put("food",player.getFoodData().getFoodLevel());own.put("inventory",inventory);own.put("selected",player.getInventory().selected);
         own.put("life_id",life);own.put("native_action_effects",NativeEffects.snapshot(player));
+        // Runtime eye/reach include the current pose and installed attributes.
+        // These observations do not grant interaction authority or bypass LOS.
+        var eye=player.getEyePosition();own.put("eye_position",List.of(eye.x,eye.y,eye.z));own.put("entity_interaction_range",player.entityInteractionRange());
         own.put("saturation",player.getFoodData().getSaturationLevel());own.put("air",player.getAirSupply());own.put("max_air",player.getMaxAirSupply());own.put("fire_ticks",player.getRemainingFireTicks());
         own.put("in_water",player.isInWater());own.put("eyes_in_water",player.isEyeInFluid(FluidTags.WATER));own.put("in_lava",player.isInLava());own.put("fall_distance",player.fallDistance);own.put("using_item",player.isUsingItem());
         own.put("use_item",stack(player.getUseItem(),player));own.put("remaining_use_ticks",player.getUseItemRemainingTicks());own.put("attack_strength",player.getAttackStrengthScale(0.5f));

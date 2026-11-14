@@ -379,6 +379,26 @@ impl Progress {
 
 /// An attack is optional knockback while escaping, never a reason to pursue a
 /// hostile. Server reach, sight, cooldown and claim checks remain authoritative.
+fn runtime_attack_reach(o: &Observation, entity: &serde_json::Value) -> Option<bool> {
+    let eye = o.player["eye_position"]
+        .as_array()
+        .filter(|a| a.len() == 3)?;
+    let eye = [eye[0].as_f64()?, eye[1].as_f64()?, eye[2].as_f64()?];
+    let range = o.player["entity_interaction_range"].as_f64()?;
+    if !eye.iter().all(|n| n.is_finite()) || !range.is_finite() || range < 0. {
+        return None;
+    }
+    let values = entity["bounds"].as_array().filter(|a| a.len() == 6)?;
+    let mut bounds = [0.; 6];
+    for (bound, value) in bounds.iter_mut().zip(values) {
+        *bound = value.as_f64().filter(|n| n.is_finite())?;
+    }
+    if (0..3).any(|i| bounds[i] > bounds[i + 3]) {
+        return None;
+    }
+    let gap: [f64; 3] = std::array::from_fn(|i| eye[i] - eye[i].clamp(bounds[i], bounds[i + 3]));
+    Some(gap[0].hypot(gap[1]).hypot(gap[2]) <= range)
+}
 pub(super) fn defensive_target(o: &Observation) -> Option<i32> {
     if o.player["health"].as_f64()? <= 0.
         || o.player["attack_strength"].as_f64()? < 0.9
@@ -399,7 +419,12 @@ pub(super) fn defensive_target(o: &Observation) -> Option<i32> {
         .filter_map(|e| {
             let q = point(&e["position"])?;
             let distance = (0..3).map(|i| (p[i] - q[i]).powi(2)).sum::<f64>();
-            (distance <= 9.).then_some((distance, i32::try_from(e["entity_id"].as_i64()?).ok()?))
+            // New facts affect eligibility only. Missing/malformed facts keep
+            // the exact old feet-centre fallback and target ordering. A valid
+            // runtime denial never falls back to the broader legacy rule.
+            runtime_attack_reach(o, e)
+                .unwrap_or(distance <= 9.)
+                .then_some((distance, i32::try_from(e["entity_id"].as_i64()?).ok()?))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, id)| id)
@@ -717,6 +742,109 @@ mod tests {
         o.world["entities"][0]["visible"] = json!(true);
         o.world["entities"][0]["position"] = json!([4., 64., 0.]);
         assert_eq!(defensive_target(&o), None);
+    }
+
+    #[test]
+    fn native_eye_and_wide_entity_bounds_allow_reach_without_pursuit_or_visibility_grants() {
+        let mut o = fixture();
+        // Synthetic wide entity: feet distance3.191, nearest eye/bounds gap2.289.
+        // The box/range are supplied facts, never inferred from a species name.
+        o.player["position"] = json!([0., 0., 0.]);
+        o.player["eye_position"] = json!([0., 1.62, 0.]);
+        o.player["entity_interaction_range"] = json!(3.);
+        o.world["entities"][0]["position"] = json!([0.496, 1., 2.989]);
+        o.world["entities"][0]["bounds"] = json!([-0.204, 1., 2.289, 1.196, 1.9, 3.689]);
+        assert_eq!(defensive_target(&o), Some(9));
+        let mut legacy = o.clone();
+        legacy.player["eye_position"] = Value::Null;
+        assert_eq!(defensive_target(&legacy), None);
+        for guard in ["hidden", "friendly", "weak", "using", "interaction"] {
+            let mut refused = o.clone();
+            match guard {
+                "hidden" => refused.world["entities"][0]["visible"] = json!(false),
+                "friendly" => refused.world["entities"][0]["hostile"] = json!(false),
+                "weak" => refused.player["attack_strength"] = json!(0.5),
+                "using" => refused.player["using_item"] = json!(true),
+                _ => refused.player["interaction"] = json!({"outcome":"running"}),
+            }
+            assert_eq!(defensive_target(&refused), None, "{guard}");
+        }
+    }
+    #[test]
+    fn actual_runtime_range_and_eye_pose_can_deny_a_legacy_reachable_target() {
+        let mut o = fixture();
+        o.player["eye_position"] = json!([0., 65.62, 0.]);
+        o.player["entity_interaction_range"] = json!(1.);
+        o.world["entities"][0]["bounds"] = json!([1.5, 64., -0.2, 2.5, 66., 0.2]);
+        assert_eq!(defensive_target(&o), None, "valid denial must not fallback");
+        o.player["entity_interaction_range"] = json!(2.9);
+        o.world["entities"][0]["position"] = json!([3., 66., 0.]);
+        o.world["entities"][0]["bounds"] = json!([2.8, 66., -0.2, 3.2, 66.4, 0.2]);
+        assert_eq!(defensive_target(&o), Some(9));
+        o.player["eye_position"] = json!([0., 65., 0.]);
+        assert_eq!(
+            defensive_target(&o),
+            None,
+            "use runtime crouched eye, no fixed offset"
+        );
+        o.player["entity_interaction_range"] = json!(0.);
+        assert_eq!(defensive_target(&o), None, "zero is a valid runtime range");
+    }
+    #[test]
+    fn unknown_or_malformed_runtime_geometry_preserves_exact_legacy_fallback() {
+        let mut o = fixture();
+        o.player["eye_position"] = json!([0., 65.62, 0.]);
+        o.player["entity_interaction_range"] = json!(1.);
+        o.world["entities"][0]["bounds"] = json!([1.5, 64., -0.2, 2.5, 66., 0.2]);
+        assert_eq!(defensive_target(&o), None);
+        for (field, value) in [
+            ("eye_position", Value::Null),
+            ("eye_position", json!([0., 65.])),
+            ("eye_position", json!([0., 65., 0., 1.])),
+            ("eye_position", json!([0., "NaN", 0.])),
+            ("entity_interaction_range", Value::Null),
+            ("entity_interaction_range", json!(-1.)),
+            ("entity_interaction_range", json!("Infinity")),
+            ("bounds", Value::Null),
+            ("bounds", json!([1.5, 64., -0.2, 2.5, 66.])),
+            ("bounds", json!([1.5, 64., -0.2, 2.5, 66., 0.2, 3.])),
+            ("bounds", json!([2.5, 64., -0.2, 1.5, 66., 0.2])),
+            ("bounds", json!([1.5, 64., "NaN", 2.5, 66., 0.2])),
+        ] {
+            let mut absent = o.clone();
+            if field == "bounds" {
+                absent.world["entities"][0][field] = value;
+            } else {
+                absent.player[field] = value;
+            }
+            assert_eq!(defensive_target(&absent), Some(9), "{field}");
+            absent.world["entities"][0]["position"] = json!([4., 64., 0.]);
+            assert_eq!(
+                defensive_target(&absent),
+                None,
+                "legacy far target: {field}"
+            );
+        }
+        let mut ranked = fixture();
+        ranked.world["entities"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+            "entity_id":10,"hostile":true,"visible":true,"position":[2.5,64.,0.],
+            "bounds":[0.5,64.,-0.2,3.,66.,0.2]}),
+        );
+        assert_eq!(
+            defensive_target(&ranked),
+            Some(9),
+            "legacy feet-distance ordering"
+        );
+        ranked.player["eye_position"] = json!([0., 65.62, 0.]);
+        ranked.player["entity_interaction_range"] = json!(3.);
+        ranked.world["entities"][1]["bounds"] = json!([1.5, 64., -0.2, 2.5, 66., 0.2]);
+        assert_eq!(
+            defensive_target(&ranked),
+            Some(9),
+            "new facts change eligibility, not target ranking"
+        );
     }
     #[test]
     fn lag_and_new_life_are_not_stuck_routes_but_advancing_ticks_are() {

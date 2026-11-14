@@ -1,0 +1,5 @@
+Manifest-Version: 1.0
+Main-Class: dev.minecraftsdk.tools.NativeObservationLiveUpdate
+Agent-Class: dev.minecraftsdk.tools.NativeObservationLiveUpdate
+Can-Redefine-Classes: true
+
