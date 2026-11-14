@@ -945,14 +945,14 @@ fn launch_inner(
         && closure::gateway_absent(f, case).unwrap_or(false);
     let closed = acknowledged || gateway_absent;
     let session_cleared = native_actor_absent && closed && sync_session(f, true).is_ok();
-    save(
+    let _ = save(
         &case.join("disconnect-closure.json"),
         &json!({"api_acknowledged":acknowledged,
         "native_actor_absent":native_actor_absent,"owned_remote_handler_gone":remote_closed,
         "gateway_session_absent":gateway_absent,"already_disconnected_observed":gateway_absent,
         "session_sync_cleared":session_cleared,"disconnect_replayed":false,
         "scope":"Separate scoped gateway/native closure snapshots; no continuous admission fence or survival claim"}),
-    )?;
+    );
     if let Some(position) = last_npc {
         let _ = save(
             &case.join("last-known-npc.json"),
