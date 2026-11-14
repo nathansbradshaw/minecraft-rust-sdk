@@ -17,8 +17,23 @@ pub(super) struct Handoff {
     pending: Option<Pending>,
     spent: Option<String>,
     invalidated: Option<(String, &'static str)>,
+    phase: Option<&'static str>,
+    transition: Option<serde_json::Value>,
 }
 impl Handoff {
+    fn phase(&mut self, o: &Observation, phase: &'static str, visible: bool) {
+        if self.phase != Some(phase) {
+            self.phase = Some(phase);
+            self.transition = Some(serde_json::json!({"phase":phase,
+                "original_action_id":self.pending.as_ref().map(|p|&p.original),
+                "revision":o.revision,"position":o.player["position"],
+                "shooter_visible":visible,"control_outcome":o.player["control"]["outcome"],
+                "input_released":o.player["control"]["input_released"]}));
+        }
+    }
+    pub fn take_transition(&mut self) -> Option<serde_json::Value> {
+        self.transition.take()
+    }
     fn discard(&mut self, reason: &'static str) {
         if let Some(p) = self.pending.take() {
             self.invalidated = Some((p.original, reason));
@@ -83,6 +98,7 @@ impl Handoff {
             occluded: false,
             ready: false,
         });
+        self.phase = None;
     }
     pub fn propose(
         &mut self,
@@ -120,7 +136,9 @@ impl Handoff {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|e| e["uuid"].as_str() == Some(&p.shooter))
+            .filter(|e| e["uuid"].as_str() == Some(&p.shooter))
+            .filter(|e| e["visible"] == true || remembered(e))
+            .max_by_key(|e| e["visible"] == true)
         else {
             self.discard("Original threat visibility facts unavailable");
             return None;
@@ -144,33 +162,26 @@ impl Handoff {
             self.discard("A different current threat requires fresh defensive behavior");
             return None;
         }
-        if shooter["visible"] == false
-            && shooter["client_memory"]["kind"] == "last_visible_ranged_threat"
-            && shooter["client_memory"]["expires_after_ticks"] == 160
-            && shooter["client_memory"]["age_ticks"]
-                .as_u64()
-                .is_some_and(|age| age <= 160)
-        {
-            p.occluded = true;
-        } else if shooter["visible"] != true || p.occluded {
-            self.discard(
-                "Occlusion lease missing/expired or shooter reacquired; use fresh behavior",
-            );
-            return None;
-        }
         // Never advance running, failed, cancelled, uncertain or reconciled work.
+        // Visibility fluctuations while the old input is unfinished do not
+        // start or poison the later, terminal-only occlusion opportunity.
         if control["outcome"] == "running"
             || (control["outcome"] == "observed" && control["input_released"] == false)
         {
             p.basis = now;
+            self.phase(
+                o,
+                if control["outcome"] == "running" {
+                    "running"
+                } else {
+                    "terminal_unreleased"
+                },
+                shooter["visible"] == true,
+            );
             return None;
         }
         if control["outcome"] != "observed" || control["input_released"] != true {
             self.discard("Original leg lacks conclusive Observed and released evidence");
-            return None;
-        }
-        if !p.occluded {
-            self.discard("Completed leg remains visible; select a fresh cover plan");
             return None;
         }
         let position = geometry::point(&o.player["position"])?;
@@ -183,6 +194,17 @@ impl Handoff {
             self.discard("No advancing terminal sample at the original endpoint");
             return None;
         }
+        if shooter["visible"] == true {
+            let reason = if p.occluded {
+                "Shooter reacquired after terminal occlusion; select fresh behavior"
+            } else {
+                "Completed leg remains visible; select a fresh cover plan"
+            };
+            self.phase(o, "released_visible", true);
+            self.discard(reason);
+            return None;
+        }
+        p.occluded = true;
         let route = geometry::continue_cover(o, &p.remaining, blocked, axis);
         if route.is_none() {
             self.discard(
@@ -191,6 +213,7 @@ impl Handoff {
             return None;
         }
         p.ready = true;
+        self.phase(o, "released_occluded_candidate", false);
         route
     }
     /// Consume before creating the next action ID. A lost response never rearms it.
@@ -202,6 +225,14 @@ impl Handoff {
         self.spent = Some(p.original.clone());
         Some(p.original)
     }
+}
+fn remembered(e: &serde_json::Value) -> bool {
+    e["visible"] == false
+        && e["client_memory"]["kind"] == "last_visible_ranged_threat"
+        && e["client_memory"]["expires_after_ticks"] == 160
+        && e["client_memory"]["age_ticks"]
+            .as_u64()
+            .is_some_and(|age| age <= 160)
 }
 
 #[cfg(test)]
@@ -323,6 +354,40 @@ mod tests {
         );
     }
     #[test]
+    fn raw_hidden_rows_cannot_shadow_perceived_memory_or_bypass_running_hazards() {
+        let (prior, route, mut current) = scene();
+        let mut raw = current.world["entities"][0].clone();
+        raw.as_object_mut().unwrap().remove("client_memory");
+        raw["position"] = json!([999., 1., 999.]);
+        current.world["entities"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, raw);
+        let mut h = Handoff::default();
+        h.record(&prior, &route, "original-leg");
+        assert!(
+            h.propose(&current, "original-leg", false, &[], 3.5)
+                .is_some()
+        );
+        for unknown in [false, true] {
+            h.record(&prior, &route, "original-leg");
+            let mut running = current.clone();
+            running.player["control"]["outcome"] = json!("running");
+            running.player["control"]["input_released"] = Value::Null;
+            if unknown {
+                running.world["entities"] = json!([]);
+            }
+            assert!(
+                h.propose(&running, "original-leg", !unknown, &[], 3.5)
+                    .is_none()
+            );
+            assert!(
+                h.pending.is_none(),
+                "hazard or missing perceived facts invalidates even while running"
+            );
+        }
+    }
+    #[test]
     fn current_facts_and_original_terminal_outcome_fence_every_continuation() {
         for change in [
             "actor",
@@ -408,8 +473,8 @@ mod tests {
                 .is_none()
         );
         assert!(
-            h.pending.is_none(),
-            "reacquisition requires new current planning"
+            h.pending.is_some(),
+            "running visibility changes cannot start or expire a terminal lease"
         );
     }
     #[test]

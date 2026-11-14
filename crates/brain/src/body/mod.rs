@@ -702,6 +702,7 @@ async fn controller(
     let mut native_escape = recovery::Discovery::default();
     let mut native_required = recovery::Required::default();
     let mut cover_handoff = cover_handoff::Handoff::default();
+    let mut handoff_trace_remaining = cfg.decision_samples;
     let mut last_meal = None;
     let mut owned_meal: Option<(String, tactics::Meal)> = None;
     loop {
@@ -930,10 +931,20 @@ async fn controller(
             finite_waypoint_axis,
         );
         if let Some((original, reason)) = cover_handoff.take_invalidation() {
-            j.event("body_cover_handoff_invalidated", json!({"original_action_id":original,"reason":reason,"revision":observed.revision,"replayed":false}))?;
+            j.event("body_cover_handoff_invalidated", json!({"original_action_id":original,"reason":reason,"revision":observed.revision,"position":p,"control":active,"incoming_projectile":incoming,"water_emergency":water_emergency,"burning":burning,"heard_blast":heard_danger,"urgent":urgent,"replayed":false}))?;
+        }
+        if let Some(mut transition) = cover_handoff.take_transition()
+            && handoff_trace_remaining > 0
+        {
+            handoff_trace_remaining -= 1;
+            transition["current_hazards"] = json!({"incoming_projectile":incoming,"water_emergency":water_emergency,"burning":burning,"heard_blast":heard_danger,"urgent":urgent});
+            j.event("body_cover_handoff_phase", transition)?;
         }
         let continuing_cover = continuation.is_some();
-        let escape = if active["outcome"] != "running" && !awaiting_native {
+        let owned_input_releasing = active["action_id"].as_str() == Some(owned_control.as_str())
+            && active["input_released"] == false;
+        let escape = if active["outcome"] != "running" && !owned_input_releasing && !awaiting_native
+        {
             continuation.or_else(|| {
                 let defensive = geometry::evade_policy(
                     &policy_observed,
