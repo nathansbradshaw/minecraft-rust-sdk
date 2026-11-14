@@ -7,12 +7,14 @@ pub mod body;
 mod completion;
 pub mod containers;
 pub mod conversation;
+pub mod crafting;
 #[cfg(test)]
 mod development_replay;
 mod diagnostics;
 mod discovery;
 pub mod feedback;
 mod gameplay_failure;
+mod goal_plan;
 mod handoff;
 pub mod lua;
 pub mod memory;
@@ -419,9 +421,19 @@ impl Journal {
         Ok(json!(out))
     }
     fn activity(&self, choice: &model::Choice, result: &Value) -> Result<()> {
-        if !["sdk", "write", "edit", "terminal", "run", "navigate"].contains(&choice.tool.as_str())
+        if ![
+            "sdk",
+            "write",
+            "edit",
+            "terminal",
+            "run",
+            "navigate",
+            "craft_once",
+        ]
+        .contains(&choice.tool.as_str())
             || tool_failed(result)
             || navigation::scheduling_preempted(result)
+            || crafting::scheduling_preempted(result)
         {
             return Ok(());
         }
@@ -447,11 +459,13 @@ impl Journal {
         source: &str,
         goal_revision: &str,
     ) -> Result<bool> {
-        if choice.tool == "navigate" && navigation::scheduling_preempted(result) {
+        if navigation::scheduling_preempted(result) || crafting::scheduling_preempted(result) {
             return Ok(false);
         }
         let navigation = choice.tool == "navigate" && result["navigation"].is_object();
+        let crafting = choice.tool == "craft_once" && result["crafting"].is_object();
         if !navigation
+            && !crafting
             && (!["terminal", "run"].contains(&choice.tool.as_str())
                 || (choice.tool != "run"
                     && !choice.experiment
@@ -1331,6 +1345,7 @@ impl Brain {
             context["deployment_instructions"] = json!(self.cfg.instructions);
             context["project_manifest"] = workspace::manifest_hint(&self.cfg.workspace);
             context["completion_requirements"] = completion::view(&self.cfg, &self.goal);
+            goal_plan::supply(&self.journal, &mut context);
             context["decision_worker"] = json!({"enabled":self.cfg.decision_worker.is_some(),"protocol":1,"activate":"replace_worker with a compiled Rust executable path; current decision/tool settles first; body and native connection stay resident"});
             context["inspected_containers"] = self
                 .journal
@@ -1535,7 +1550,9 @@ impl Brain {
             }
             let goal_changed = self.goal != requested_goal
                 || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision;
-            let paused = result.as_ref().is_ok_and(navigation::scheduling_preempted);
+            let paused = result.as_ref().is_ok_and(|value| {
+                navigation::scheduling_preempted(value) || crafting::scheduling_preempted(value)
+            });
             let mut executed = result
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
@@ -1716,7 +1733,7 @@ pub fn projection(o: &Observation) -> Value {
     let auditory = minecraft_sdk::auditory::frame(o).ok().map(|frame| json!({
         "epoch":frame.epoch,"sample_game_time":frame.sample_game_time,"dropped":frame.dropped,
         "recent_emissions":frame.events.iter().rev().take(8).collect::<Vec<_>>(),"scope":frame.scope}));
-    json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"world":{"blocks":blocks,"entities":entities,"auditory":auditory,"client_hearing":o.world["client_hearing"],"chat":o.world["chat"].as_array().map(|c|c.iter().skip(c.len().saturating_sub(24)).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"]},"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"],"summary":containers::menu_summary(&o.menu),"non_player_stacks":views::menu_stacks(&o.menu)}})
+    json!({"revision":o.revision,"player":{"uuid":player["uuid"],"entity_id":player["entity_id"],"life_id":player["life_id"],"dimension":player["dimension"],"position":player["position"],"yaw":player["yaw"],"pitch":player["pitch"],"on_ground":player["on_ground"],"health":player["health"],"food":player["food"],"inventory":inventory,"selected":player["selected"]},"world":{"blocks":blocks,"entities":entities,"auditory":auditory,"client_hearing":o.world["client_hearing"],"chat":o.world["chat"].as_array().map(|c|c.iter().skip(c.len().saturating_sub(24)).collect::<Vec<_>>()),"game_time":o.world["game_time"],"day_time":o.world["day_time"]},"menu":{"menu_id":o.menu["menu_id"],"state_id":o.menu["state_id"],"type":o.menu["type"],"carried":o.menu["carried"],"summary":containers::menu_summary(&o.menu),"non_player_stacks":views::menu_stacks(&o.menu)}})
 }
 /// Compact large strings/arrays without losing the structure of errors or player
 /// facts. Array tails contain newer journal feedback and are retained first.
@@ -1885,6 +1902,9 @@ fn fit_context(context: &mut Value) -> Result<()> {
             "view":"bounded_historical_searches","original_bytes":bytes,
             "retained_in":"client search cache and original tool history"});
     }
+    // A saved plan is optional model intent. Preserve it whole when possible,
+    // but never let it prevent delivery of an otherwise usable native frame.
+    goal_plan::fit_optional(context)?;
     ensure(
         serde_json::to_vec(context)?.len() <= 32768,
         "Context budget exceeded",
@@ -1912,6 +1932,7 @@ pub fn replay_context(journal: &Journal, context: &mut Value) -> Result<Value> {
             .unwrap_or(Value::Null);
     }
     context["working_notes"] = json!(journal.get("working_notes")?);
+    goal_plan::supply(journal, context);
     context["compiler_feedback"] =
         journal.compiler_feedback(&journal.get("goal_revision")?.unwrap_or_default())?;
     let sizes = |v: &Value| -> Value {
@@ -1981,7 +2002,7 @@ fn shrink_value(value: &mut Value) {
     }
 }
 fn tool_failed(v: &Value) -> bool {
-    if navigation::scheduling_preempted(v) {
+    if navigation::scheduling_preempted(v) || crafting::scheduling_preempted(v) {
         return false;
     }
     (v["success"] == false && !navigation::resumable_slice(v))

@@ -17,11 +17,20 @@ does not erase them. They do not add server permissions or host capabilities.
 player_request retains the triggering chat as a player report. Preserve its
 explicit task constraints, including a request to write/run code, when acting on
 the shorter goal summary. Factual notes are labelled working memory, not proof.
-Current compact observations retain the SDK's player/world/menu structure and
-field names. They omit data for context size; omitted terrain is unknown. Read a
-fresh full SDK observation when code needs additional facts. Historical compact
-journal entries may use an older view; current API documentation and runtime
-observations define the fields that new Rust programs should consume.
+Current compact observations retain the SDK's player/world/menu structure with
+bounded summaries; omitted terrain is unknown. The compact model/observe sound
+summary is observation.world.auditory.recent_emissions. Lua receives the full
+SDK snapshot: use ctx.observation.world.auditory.events, not recent_emissions.
+Unavailable auditory data is unknown, not silence. Preserve epoch,
+latest_sequence, each event's sequence, sample_game_time, retention_ticks and
+dropped loss metadata. A sound origin is an emission fact, not a hidden entity's
+current position. See sdk://reference for the full example.
+observation.player.life_id identifies a native life when available. A changed
+life_id means a new life even if UUID, entity_id or health are unchanged; missing
+life_id is unknown. Scope life-dependent plans and cue cursors accordingly.
+Current health alone does not prove survival of the original life. Historical
+compact journal entries may use an older view; use the current SDK contract for
+raw fields in generated Lua.
 project_manifest is a bounded current Cargo.toml hint, including dependency
 locations when present. Its path and list entry paths are directly readable;
 inspect the actual manifest if the hint is incomplete. Local files are editable
@@ -235,7 +244,8 @@ Tools and input:
   remain in compiler_diagnostics. Output after build-finished retains its bytes
   before the ordinary bounded head/tail preview; preview_truncated labels omission.
   Full raw stdout/stderr and hashes remain in output_files for source repair.
-- remember: JSON {"kind":"fact|report|hypothesis|episode|skill","text":"..."}.
+- remember: JSON {"kind":"fact|report|hypothesis|episode|skill","text":"..."},
+  or the bounded goal-revision-scoped kind=plan record described above.
   Your notes remain agent-authored, even if named fact. Search matches related
   goal words and labelled historical observations; it does not require an exact
   phrase. Historical locations and claims require fresh observation. Never reuse
@@ -266,6 +276,22 @@ Tools and input:
   inventory. Missing requirements reject completion and keep the goal active.
   An explicit success claim without configured criteria is still only a model
   claim. Completion never certifies an external benchmark pass.
+  These are terminal postconditions, not prerequisites for every intermediate
+  action. Temporarily placing or using a resource can support unfinished work;
+  account for the remaining dependencies before consuming inputs or duplicating
+  a reusable resource solely because it is not currently retained.
+
+For multi-step work, keep an explicit active_plan through the existing remember
+tool: {"kind":"plan","goal_revision":"current goal_revision","plan":{
+"next_step":"current intended step","dependencies":["remaining prerequisite"],
+"resources":["resource to reuse or preserve, with its observation/action reference"]}}.
+Its complete content is retained across ordinary reads and working_notes changes;
+revise it deliberately when new evidence changes the work. The expected revision
+must match the actual active goal. A new goal or completion contract invalidates
+the current plan. Plans are model hypotheses, not observed facts, authority,
+permission or completion credit; recheck referenced world resources before use.
+No plan is required to think, chat or act. Ordinary remember kinds retain their
+existing {"kind":"fact|report|hypothesis|episode|skill","text":"..."} form.
 
 SDK controls available through sdk: look {yaw,pitch}; start_move {target:{x,y,z},
 jump:false,max_ticks:60}; cancel_control {action_id}; dig {block:{x,y,z},

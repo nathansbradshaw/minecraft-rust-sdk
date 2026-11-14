@@ -134,11 +134,12 @@ pub struct Choice {
     #[serde(default)]
     pub experiment: bool,
 }
-pub const TOOLS: [&str; 19] = [
+pub const TOOLS: [&str; 20] = [
     "develop",
     "observe",
     "query",
     "navigate",
+    "craft_once",
     "sdk",
     "status",
     "reconcile",
@@ -166,7 +167,7 @@ pub(crate) fn validate_choice(choice: &Choice) -> Result<()> {
     )
 }
 pub fn schema() -> Value {
-    json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, Lua execution, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual input: Lua source for write; JSON old/new/expected_sha256 for edit; path or JSON path/start_line/end_line for read; shell command for terminal; relative .lua path for run (legacy exact Cargo binary also supported); typed action JSON for sdk. For navigate, a normal goal or explicit {goal,until_inventory:{item,minimum}} acquisition wrapper; retained inventory completion differs from positional arrival. For observe, use supported view JSON; menu_inspection retains answered menu pages. During investigation/alternatives choose an unresolved question or changed experiment, not a covered menu selector with new notes or page size."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write/edit; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
+    json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, Lua execution, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual input: Lua source for write; JSON old/new/expected_sha256 for edit; path or JSON path/start_line/end_line for read; shell command for terminal; relative .lua path for run (legacy exact Cargo binary also supported); typed action JSON for sdk. For craft_once, JSON {recipe,operation_id} only, path empty: one bounded prepare/take/store helper with its own harness-resolved journal; reuse the SAME operation_id after interruption. Requires suitable open menu and empty grid/cursor before a new batch. For navigate, a normal goal or explicit {goal,until_inventory:{item,minimum}} acquisition wrapper; retained inventory completion differs from positional arrival. For observe, use supported view JSON; menu_inspection retains answered menu pages. During investigation/alternatives choose an unresolved question or changed experiment, not a covered menu selector with new notes or page size."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write/edit; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
 fn session_schema(development: bool) -> Value {
     let mut schema = schema();
@@ -426,6 +427,163 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn routine_and_development_requests_explain_lua_shapes_and_preserve_native_lives() {
+        // Exercise the actual request path without a reference read or any
+        // live provider/actor. Same UUID/entity/health can belong to a new life.
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move {
+            for (provider, purpose, life) in [
+                ("gpt-6-luna", "plan", json!("fixture-life-a")),
+                ("gpt-6.1-sol", "develop", json!("fixture-life-b")),
+                ("gpt-6-luna", "plan", Value::Null),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                assert_eq!(request["model"], provider);
+                assert_eq!(request["purpose"], purpose);
+                assert_eq!(request["messages"][0]["role"], "system");
+                let prompt = request["messages"][0]["content"].as_str().unwrap();
+                for contract in [
+                    "observation.world.auditory.recent_emissions",
+                    "ctx.observation.world.auditory.events",
+                    "unknown, not silence",
+                    "dropped loss metadata",
+                    "observation.player.life_id",
+                    "original life",
+                ] {
+                    assert!(
+                        prompt.contains(contract),
+                        "always-delivered contract: {contract}"
+                    );
+                }
+                let context: Value =
+                    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
+                        .unwrap();
+                assert!(context.get("sdk_reference").is_none());
+                let player = &context["observation"]["player"];
+                assert_eq!(player["uuid"], "fixture-player");
+                assert_eq!(player["entity_id"], 7);
+                assert_eq!(player["health"], 20.);
+                assert_eq!(player["life_id"], life);
+                let choice = json!({"tool":"observe","input":"","path":"","summary":"Inspect","notes":"","experiment":false});
+                let reply =
+                    json!({"done":true,"message":{"content":choice.to_string()}}).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let model = Model {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint,
+        };
+        let mut observation = minecraft_sdk::Observation {
+            revision: "synthetic-life-transition".into(),
+            player: json!({"uuid":"fixture-player","entity_id":7,"health":20.}),
+            world: json!({}),
+            menu: json!({}),
+        };
+        for (development, life) in [
+            (false, Some("fixture-life-a")),
+            (true, Some("fixture-life-b")),
+            (false, None),
+        ] {
+            if let Some(life) = life {
+                observation.player["life_id"] = json!(life);
+            } else {
+                observation
+                    .player
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("life_id");
+            }
+            let mut context = json!({"goal":"Record delivered cues","observation":crate::projection(&observation)});
+            crate::fit_context(&mut context).unwrap();
+            model
+                .choose_for(&context, development, development)
+                .await
+                .unwrap();
+        }
+        upstream.await.unwrap();
+    }
+    #[tokio::test]
+    async fn active_plan_and_terminal_semantics_reach_actual_bounded_model_request_intact() {
+        // Controlled local HTTP responder, no live model or Minecraft. Exercise
+        // the real remember executor, context fitting and request serialization.
+        use tokio::io::AsyncWriteExt;
+        let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");
+        brain
+            .cfg
+            .completion_inventory
+            .insert("fixture:result".into(), 1);
+        brain
+            .journal
+            .select_goal(&brain.goal, "fixture", json!({}), None)
+            .unwrap();
+        crate::completion::bind(&brain.journal, &brain.cfg, &brain.goal, &brain.observed).unwrap();
+        let choice = Choice {
+            tool: "remember".into(),
+            input: json!({"kind":"plan",
+            "goal_revision":brain.journal.get("goal_revision").unwrap(),
+            "plan":{"next_step":"Use the recorded intermediate resource before final retention",
+            "dependencies":["Keep material for the remaining result"],
+            "resources":["Historical interaction reference; verify current facts"]}})
+            .to_string(),
+            path: String::new(),
+            summary: "Keep active plan".into(),
+            notes: String::new(),
+            experiment: false,
+        };
+        crate::tools::execute(&mut brain, &choice).await.unwrap();
+        let mut context = json!({"goal":brain.goal,"working_notes":"A later inspection note",
+            "completion_requirements":crate::completion::view(&brain.cfg,&brain.goal),
+            "observation":{"menu":{"menu_id":1,"state_id":7,"type":"minecraft:crafting"}},
+            "last_tool_result":{"result":{"after":{"menu":{"menu_id":1,"state_id":1,"type":"minecraft:crafting"}}}},
+            "memory":vec![json!({"text":"noise".repeat(3000)});20],
+            "recent":vec![json!({"text":"noise".repeat(3000)});20]});
+        crate::goal_plan::supply(&brain.journal, &mut context);
+        let expected = context["active_plan"].clone();
+        crate::fit_context(&mut context).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(
+                request["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("terminal postconditions")
+            );
+            let serialized = request["messages"][1]["content"].as_str().unwrap();
+            assert!(serialized.len() <= 32768);
+            let delivered: Value = serde_json::from_str(serialized).unwrap();
+            assert_eq!(delivered["active_plan"], expected);
+            assert_eq!(delivered["active_plan"]["native_evidence"], false);
+            assert_eq!(
+                delivered["completion_requirements"]["evaluation_phase"],
+                "final_success_claim_only"
+            );
+            let choice = json!({"tool":"report","input":"Fixture observed","path":"","summary":"Fixture report","notes":"","experiment":false});
+            let reply = json!({"done":true,"message":{"content":choice.to_string()}}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+        });
+        let model = Model {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint,
+        };
+        let (_, usage) = model.choose(&context, false).await.unwrap();
+        let attestation = &usage["context_attestation"];
+        assert_eq!(attestation["active_plan"]["complete_content"], true);
+        assert_eq!(
+            attestation["active_plan"]["actual_content_sha256"],
+            context["active_plan"]["content_sha256"]
+        );
+        assert_eq!(attestation["observation_menu"]["state_id"], 7);
+        assert_eq!(attestation["last_tool_after_menu"]["state_id"], 1);
+        upstream.await.unwrap();
+    }
     #[tokio::test]
     async fn accepted_usage_attests_the_exact_final_context_without_changing_the_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

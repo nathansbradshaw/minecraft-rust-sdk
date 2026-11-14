@@ -16,9 +16,11 @@ pub struct Output {
     pub stderr: Vec<u8>,
     pub timed_out: bool,
     pub callback_error: Option<String>,
+    pub output_limit_exceeded: bool,
 }
 pub trait Runner {
     fn ca(&mut self, _: Option<&Path>) {}
+    fn output_limit(&mut self, _: usize) {}
     fn run(
         &mut self,
         program: &Path,
@@ -31,6 +33,7 @@ pub trait Runner {
 #[derive(Default)]
 pub struct SystemRunner {
     ca: Option<PathBuf>,
+    output_limit: Option<usize>,
 }
 impl SystemRunner {
     pub fn new() -> Self {
@@ -56,6 +59,9 @@ impl Drop for ChildGuard {
     }
 }
 impl Runner for SystemRunner {
+    fn output_limit(&mut self, bytes: usize) {
+        self.output_limit = Some(bytes);
+    }
     fn ca(&mut self, path: Option<&Path>) {
         self.ca = path.map(Path::to_path_buf);
     }
@@ -119,6 +125,7 @@ impl Runner for SystemRunner {
         let mut interrupted = false;
         let mut failed = false;
         let mut callback_error = None;
+        let mut output_limit_exceeded = false;
         let mut status = None;
         loop {
             if take_interrupt() {
@@ -134,8 +141,9 @@ impl Runner for SystemRunner {
             match recv.recv_timeout(Duration::from_millis(25)) {
                 Ok((is_err, Ok(bytes))) => {
                     let target = if is_err { &mut stderr } else { &mut stdout };
-                    if target.len() + bytes.len() > 16 * 1024 * 1024 {
+                    if target.len() + bytes.len() > self.output_limit.unwrap_or(16 * 1024 * 1024) {
                         failed = true;
+                        output_limit_exceeded = true;
                         let _ = child.kill();
                         break;
                     }
@@ -209,6 +217,7 @@ impl Runner for SystemRunner {
             stderr: secrets.scrub(&stderr),
             timed_out,
             callback_error,
+            output_limit_exceeded,
         })
     }
 }
@@ -226,6 +235,11 @@ pub fn execute(
 ) -> Result<Output> {
     tool.verify()?;
     let mut secrets = f.secrets()?;
+    runner.output_limit(if label == "handler" {
+        f.trace_bytes_limit() as usize
+    } else {
+        16 * 1024 * 1024
+    });
     runner.ca(if tool.path == f.sdk.path {
         f.ca_file.as_ref().map(|ca| ca.file.path.as_path())
     } else {
@@ -260,7 +274,7 @@ pub fn execute(
     stderr.sync_all()?;
     save(
         &case.join(format!("{label}.status.json")),
-        &json!({"started_utc_ms":started,"finished_utc_ms":utc_ms()?,"success":out.success,"exit_code":out.exit_code,"signal":out.signal,"interrupted":out.interrupted,"timed_out":out.timed_out,"callback_error":out.callback_error,"stdout_sha256":sha256(&out.stdout),"stderr_sha256":sha256(&out.stderr),"argv_retained":false}),
+        &json!({"started_utc_ms":started,"finished_utc_ms":utc_ms()?,"success":out.success,"exit_code":out.exit_code,"signal":out.signal,"interrupted":out.interrupted,"timed_out":out.timed_out,"callback_error":out.callback_error,"output_limit_exceeded":out.output_limit_exceeded,"stdout_sha256":sha256(&out.stdout),"stderr_sha256":sha256(&out.stderr),"argv_retained":false}),
     )?;
     Ok(out)
 }

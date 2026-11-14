@@ -436,6 +436,14 @@ pub fn archive(
         }
     };
     let mut exclusions = Vec::new();
+    let dependencies = if handler_and_actor_closed {
+        Some(dependencies::select(runner, f, case))
+    } else {
+        None
+    };
+    if let Some(selected) = &dependencies {
+        exclusions.extend(selected.exclusions.iter().cloned());
+    }
     for (index, binary) in binary_inputs.iter().enumerate() {
         // Host originals do not stand in for modified container bytes. Only a
         // current regular-file/hash match authorizes this exact path exclusion.
@@ -517,10 +525,17 @@ pub fn archive(
         && summary["signal"].is_null();
     let path = archive.join("stdout.log");
     let bytes = read(&path, 16 * 1024 * 1024)?;
-    let complete = complete && bytes.starts_with(&[0x1f, 0x8b]) && handler_and_actor_closed;
+    let dependencies_unchanged = match &dependencies {
+        Some(selected) => dependencies::finish(runner, f, case, selected).unwrap_or(false),
+        None => f.read_only_dependency_corpora.is_empty(),
+    };
+    let complete = complete
+        && bytes.starts_with(&[0x1f, 0x8b])
+        && handler_and_actor_closed
+        && dependencies_unchanged;
     save(
         &case.join("workspace-archive.json"),
-        &json!({"complete":complete,"compressed_tar_file":"workspace-archive/stdout.log","sha256":sha256(&bytes),"bytes":bytes.len(),"pinned_binary_inputs":binary_inputs,"excluded_verified_container_paths":exclusions,"pinned_binary_budget_bytes":PINNED_BINARY_BUDGET,"compressed_log_budget_bytes":8388608,"handler_and_actor_closure_verified":handler_and_actor_closed,"descendant_quiescence_verified":false,"secret_mount_outside_workspace":true,"credential_file_patterns_excluded":true,"arbitrary_embedded_content_certified_keyfree":false,"scope":"Pinned ELF inputs are retained as separately bounded verified byte copies. Only current matching regular container files are excluded by exact path; changed inputs remain in the snapshot and may exceed its unchanged cap. This is not final writes of remaining descendants or continuous immutability. Operator must verify content before publication; compressed bytes are not text-scrubbed."}),
+        &json!({"complete":complete,"compressed_tar_file":"workspace-archive/stdout.log","sha256":sha256(&bytes),"bytes":bytes.len(),"pinned_binary_inputs":binary_inputs,"excluded_verified_container_paths":exclusions,"dependency_corpora_verified":dependencies_unchanged,"dependency_corpus_receipt":if f.read_only_dependency_corpora.is_empty(){Value::Null}else{json!("archive-dependency-corpora.json")},"pinned_binary_budget_bytes":PINNED_BINARY_BUDGET,"compressed_log_budget_bytes":8388608,"handler_and_actor_closure_verified":handler_and_actor_closed,"descendant_quiescence_verified":false,"secret_mount_outside_workspace":true,"credential_file_patterns_excluded":true,"arbitrary_embedded_content_certified_keyfree":false,"scope":"Pinned ELF inputs are retained separately. Declared dependency-only read-only binds require actual pinned tree witnesses before/after archive and operator retention of the host corpus/provenance. Literal path exclusions never depend on the name vendor. Changed or unverifiable inputs keep this export incomplete; changed-before corpora remain in the tar and unchanged archive size limits still apply. Not continuous host immutability or descendant final writes. Operator must verify content before publication; compressed bytes are not text-scrubbed."}),
     )?;
     Ok(complete)
 }
@@ -606,6 +621,7 @@ mod tests {
                 signal: None,
                 interrupted: false,
                 callback_error: None,
+                output_limit_exceeded: false,
             })
         }
     }
@@ -764,6 +780,7 @@ mod tests {
                     signal: None,
                     interrupted: false,
                     callback_error: None,
+                    output_limit_exceeded: false,
                 })
             }
         }

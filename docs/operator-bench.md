@@ -1,5 +1,9 @@
 # Run a bounded operator fixture
 
+For the separate no-NPC1200-second Brain acquisition path, see
+[qa-acquisition-lifecycle.md](qa-acquisition-lifecycle.md). Its source preparation
+and validation status are tracked separately from this120-second skeleton mode.
+
 The operator commands prepare, run and close one frozen fixture. Their receipts
 record failures and incomplete cleanup; they never award gameplay success.
 The isolated RCON list fast path checks the installation without an actor:
@@ -280,3 +284,35 @@ percentiles or discard missing timing attempts.
 lines; `native-projection.jsonl` contains only parsed JSON and explicitly counts
 excluded lines. Neither projection nor a clean exit certifies goal completion,
 full health continuity, actual inference/compiler overlap or Survival competence.
+
+## Keep closure and goal results distinct
+
+Cleanup loads one bounded fallback ring and, if the exact owned skeleton's native
+position lies outside it, at most one additional current chunk. Every new ticket
+has an absent-before receipt and is released afterward; preexisting tickets stay
+in place. A confirmed kill is never replayed while its death animation settles.
+
+An optional `operator_gateway_journal` names the reviewed authoritative host
+gateway SQLite file. Keep it private, canonical and outside every bot mount.
+The bench uses a read-only transaction to bind instance ID and the operator
+profile's exact bot ID/UUID, then counts all session rows, including connecting
+states. This is an operator-attested journal snapshot, not automatic proof that
+an arbitrary copy belongs to a running gateway. No key or session token is copied.
+
+If the controller already disconnected, the SDK cleanup call can report
+`SessionRequired`. Its acknowledgement remains false and its original error is
+retained. Only a zero-session journal snapshot plus independent native actor
+absence and remote-handler closure can establish `already_closed_verified`.
+Missing or mismatched proof stays incomplete; the disconnect is not replayed.
+These separate snapshots provide no continuous admission fence or survival credit.
+
+Freeze the completion condition together with the task goal. A pure Lua helper
+pressure case must explicitly use and check `completion_inventory: {}`; a kit
+acquisition case must declare its required items. An inherited kit goal can keep
+a successfully run helper working beyond its intended completion. Never rewrite
+an already-run fixture or turn that observation into survival credit.
+
+For large regenerable dependency inputs, use the reviewed opt-in
+[read-only dependency corpus](read-only-dependency-corpora.md) contract. Ordinary
+directories named `vendor` remain archived; changed or unverifiable corpora and
+true size overflow remain incomplete.

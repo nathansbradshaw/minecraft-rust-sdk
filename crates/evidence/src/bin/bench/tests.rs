@@ -47,7 +47,7 @@ impl Runner for Fake {
         Ok(out)
     }
 }
-fn output(text: String, success: bool) -> process::Output {
+pub(super) fn output(text: String, success: bool) -> process::Output {
     process::Output {
         exit_code: Some(if success { 0 } else { 1 }),
         signal: None,
@@ -57,6 +57,7 @@ fn output(text: String, success: bool) -> process::Output {
         success,
         timed_out: false,
         callback_error: None,
+        output_limit_exceeded: false,
     }
 }
 pub(super) struct Setup {
@@ -118,10 +119,10 @@ pub(super) fn setup() -> Setup {
         case: base.join("case"),
     }
 }
-fn observation(f: &Fixture) -> Value {
+pub(super) fn observation(f: &Fixture) -> Value {
     json!({"revision":"test","player":{"uuid":f.player_uuid,"life_id":"eac7697a-2c77-4ae2-a7f9-a9ed7aac21b5","dimension":"minecraft:overworld","health":20.0,"food":20,"position":f.expected_player_position,"inventory":[]},"world":{},"menu":{"menu_id":0,"slots":[],"carried":{"item":"minecraft:air","count":0}}})
 }
-fn mounts(f: &Fixture) -> Value {
+pub(super) fn mounts(f: &Fixture) -> Value {
     json!({"id":f.container_id,"started_at":f.container_started_at,"running":true,"readonly_rootfs":true,"privileged":false,"user":"1000:1000","memory":536870912,"nano_cpus":1000000000u64,"pids":256,"cap_drop":["ALL"],"cap_add":[],"security":["no-new-privileges:true"],"network":"existing-private-network","pid_mode":"","ipc_mode":"private","devices":[],"env_names":["PATH","HOME"],"mounts":[{"Type":"bind","Source":f.secret_dir,"Destination":f.container_secret_dir,"RW":false},{"Type":"tmpfs","Source":"","Destination":"/workspace","RW":true}]})
 }
 fn preflight_replies(f: &Fixture) -> VecDeque<process::Output> {
@@ -137,7 +138,10 @@ fn preflight_replies(f: &Fixture) -> VecDeque<process::Output> {
         q.push_back(output(String::new(), true));
     }
     q.push_back(output("1000".into(), true));
-    q.push_back(output("8180 600 1000\n8180 600 1000\n".into(), true));
+    q.push_back(output(
+        "8180 600 1000\n".repeat(f.private_input_paths().unwrap().len()),
+        true,
+    ));
     q.push_back(output(json!({"format":"minecraft-runtime-filesystem-check-v1","unix_socket_bind":true,"socket_mode_0600":true,"probe_removed":true,"sdk_or_gameplay_calls":false}).to_string(), true));
     q.push_back(output(json!({"ready":true,"instance_id":f.instance_id,"capabilities":["minecraft:fresh_observation"]}).to_string(),true));
     q
@@ -206,6 +210,28 @@ fn unsupported_runtime_socket_stops_before_actor_connection() {
     assert!(!s.case.join("stage-intent.json").exists());
 }
 #[test]
+fn acquisition_preflight_checks_only_its_private_brain_config_without_connecting() {
+    let s = acquisition_config_tests::acquisition();
+    let mut fake = Fake {
+        replies: preflight_replies(&s.f),
+        calls: vec![],
+    };
+    preflight(&mut fake, &s.f, &s.case, "acquisition-preflight").unwrap();
+    let metadata = fake
+        .calls
+        .iter()
+        .find(|args| args.get(2).is_some_and(|s| s == "stat"))
+        .unwrap();
+    assert_eq!(&metadata[6..], &[s.f.config_path().unwrap().to_owned()]);
+    assert!(
+        !fake
+            .calls
+            .iter()
+            .any(|args| args.first().is_some_and(|s| s == "connect"))
+    );
+    assert!(!s.case.join("stage-intent.json").exists());
+}
+#[test]
 fn actual_compiler_environment_names_pass_but_credentials_and_unknown_names_fail() {
     let s = setup();
     let mut fixture = mounts(&s.f);
@@ -264,6 +290,31 @@ fn mounts_reject_rw_secret_alias_and_unreviewed_credentials() {
     let mut m = mounts(&s.f);
     m["mounts"].as_array_mut().unwrap().push(json!({"Type":"bind","Source":s.f.secret_dir.parent().unwrap(),"Destination":"/host","RW":false}));
     assert!(config::validate_mounts(&s.f, &m).is_err());
+}
+#[test]
+fn operator_gateway_journal_is_private_and_cannot_be_exposed_by_any_bot_mount() {
+    let mut s = setup();
+    let journal = s.f.workspace.parent().unwrap().join("operator-only.sqlite");
+    write(&journal, b"private fixture journal");
+    s.f.operator_gateway_journal = Some(journal.clone());
+    s.f.validate().unwrap();
+    let mut exposed = mounts(&s.f);
+    exposed["mounts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"Type":"bind","Source":journal,"Destination":"/reviewed-journal","RW":false}));
+    assert!(
+        config::validate_mounts(&s.f, &exposed)
+            .unwrap_err()
+            .to_string()
+            .contains("gateway journal exposed")
+    );
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(s.f.validate().is_err());
+    let inside = s.f.workspace.join("journal.sqlite");
+    write(&inside, b"fixture");
+    s.f.operator_gateway_journal = Some(inside);
+    assert!(s.f.validate().is_err());
 }
 #[test]
 fn blocked_requires_no_model_key_but_task_does() {
@@ -475,9 +526,27 @@ fn fake_launch_retains_fatal_tail_and_disconnects_without_pass() {
 }
 #[test]
 fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() {
+    native_capture_scenario(false, None);
+    for mismatch in [
+        None,
+        Some("stdout_sha256"),
+        Some("stderr_sha256"),
+        Some("missing_stderr"),
+        Some("missing_status"),
+    ] {
+        native_capture_scenario(true, mismatch);
+    }
+}
+fn native_capture_scenario(combined: bool, mismatch: Option<&str>) {
     use minecraft_sdk_core::{Action, ActionRequest, Outcome, Receipt};
     use minecraft_sdk_evidence::{ExpectedAction, ResourceUsage, Spec};
-    let s = setup();
+    let mut s = setup();
+    if combined {
+        s.f.mode = config::Mode::Combined;
+        let frozen = b"synthetic frozen combined fixture";
+        write(&s.case.join("fixture.json"), frozen);
+        save(&s.case.join("combined-episode-baseline.json"),&json!({"fixture_sha256":sha256(frozen),"instance_id":s.f.instance_id,"player_uuid":s.f.player_uuid,"bot_id":"owned","actions_before":0,"sessions_before":0})).unwrap();
+    }
     let dbpath = s.case.join("gateway.sqlite");
     write(&dbpath, b"");
     let db = rusqlite::Connection::open(&dbpath).unwrap();
@@ -497,7 +566,11 @@ fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() 
             2 => Outcome::Uncertain,
             _ => Outcome::Running,
         };
-        let id = format!("body-owned-{seq}");
+        let id = if combined && seq % 2 == 0 {
+            format!("lua-generated-{seq}")
+        } else {
+            format!("body-owned-{seq}")
+        };
         let receipt = Receipt {
             action_id: id.clone(),
             outcome,
@@ -525,8 +598,22 @@ fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() 
     trace.extend(b"Error: real fatal tail\n");
     let tracepath = s.case.join("input.log");
     write(&tracepath, &trace);
-    write(&s.case.join("input.stderr"), b"fatal stderr preserved");
-    write(&s.case.join("input.status.json"), b"{\"exit_code\":1}");
+    let stderr = b"fatal stderr preserved";
+    write(&s.case.join("input.stderr"), stderr);
+    let mut status = json!({"exit_code":1,"output_limit_exceeded":false,"stdout_sha256":sha256(&trace),"stderr_sha256":sha256(stderr)});
+    if let Some(field) = mismatch {
+        if field == "missing_stderr" {
+            fs::remove_file(s.case.join("input.stderr")).unwrap();
+        } else if field != "missing_status" {
+            status[field] = json!("f".repeat(64));
+        }
+    }
+    if mismatch != Some("missing_status") {
+        write(
+            &s.case.join("input.status.json"),
+            &serde_json::to_vec(&status).unwrap(),
+        );
+    }
     let spec = Spec {
         run_id: "test-run".into(),
         goal: "retain failures".into(),
@@ -558,7 +645,16 @@ fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() 
     };
     let specpath = s.case.join("template.json");
     write(&specpath, &serde_json::to_vec(&spec).unwrap());
-    capture::native(&s.f, &s.case, &dbpath, &tracepath, &specpath, &[]).unwrap();
+    let captured =
+        capture::native_with_space(&s.f, &s.case, &dbpath, &tracepath, &specpath, &[], || {
+            Ok(503_000_000_000)
+        });
+    if mismatch.is_some() {
+        assert!(captured.is_err());
+        assert!(!s.case.join("capture-manifest.json").exists());
+        return;
+    }
+    captured.unwrap();
     let manifest = json(&s.case.join("capture-manifest.json"), 65536).unwrap();
     assert_eq!(manifest["all_original_actions"], 131);
     assert_eq!(

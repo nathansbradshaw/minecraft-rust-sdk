@@ -165,6 +165,8 @@ pub(super) struct Discovery {
     routes: Vec<Admitted>,
     received: Option<Instant>,
     prefix_busy_retries: u8,
+    preference: Option<[f64; 3]>,
+    preference_refreshed: bool,
 }
 impl Default for Discovery {
     fn default() -> Self {
@@ -178,6 +180,8 @@ impl Default for Discovery {
             routes: Vec::new(),
             received: None,
             prefix_busy_retries: 0,
+            preference: None,
+            preference_refreshed: false,
         }
     }
 }
@@ -201,7 +205,46 @@ impl Discovery {
         self.routes.clear();
         self.received = None;
         self.prefix_busy_retries = 0;
+        self.preference = None;
+        self.preference_refreshed = false;
         // Keep the request spacing even across movement/scene changes.
+    }
+    fn update_basis(&mut self, o: &Observation, first_prefix_only: bool, axis: f64) {
+        let physical = crate::digest(
+            json!({"physical":basis(o),"first_prefix_only":first_prefix_only,"axis":axis})
+                .to_string()
+                .as_bytes(),
+        );
+        if physical != self.basis {
+            self.reset(physical);
+            // Reuse the existing defensive choice only as a read-order hint.
+            // It is not native admission or a newly known enemy position.
+            // Pin even an absent hint through this basis's busy retry/cursor;
+            // moving enemies must not continuously invalidate an in-flight read.
+            self.preference = first_prefix_only
+                .then(|| geometry::evade_with_limits(o, &[], &[], &[], axis))
+                .flatten()
+                .map(|route| [route.target.x, route.target.y, route.target.z]);
+        } else if first_prefix_only
+            && self.done
+            && self.task.is_none()
+            && !self.preference_refreshed
+            && self
+                .preference
+                .is_some_and(|p| geometry::toward_close_threat(o, p))
+        {
+            let next = geometry::evade_with_limits(o, &[], &[], &[], axis)
+                .map(|route| [route.target.x, route.target.y, route.target.z]);
+            if next.is_some() && next != self.preference {
+                // One changed-threat investigation, never a clock/ambient
+                // reset or a new mutation allowance. In-flight/busy reads keep
+                // their exact target; request spacing survives this reset.
+                let basis = self.basis.clone();
+                self.reset(basis);
+                self.preference = next;
+                self.preference_refreshed = true;
+            }
+        }
     }
     pub fn waiting(&self) -> bool {
         self.task.is_some()
@@ -219,10 +262,7 @@ impl Discovery {
             self.reset(String::new());
             return Ok(Vec::new());
         }
-        let basis = basis(o);
-        if basis != self.basis {
-            self.reset(basis);
-        }
+        self.update_basis(o, first_prefix_only, axis);
         if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
             let task = self.task.take().unwrap();
             let result = match task.await {
@@ -260,8 +300,14 @@ impl Discovery {
         }
         if self.task.is_none() && !self.done && Instant::now() >= self.next_query {
             let offset = self.offset;
+            let mut input = json!({"offset":offset,"limit":8});
+            if let Some(target) = self.preference {
+                input["target"] = json!(target);
+            }
             self.next_query = Instant::now() + Duration::from_millis(500);
             j.event("body_native_escape_query",json!({"offset":offset,"limit":8,
+                "target":self.preference,"target_scope":"Pinned existing defensive choice; read ordering only, not native admission or current hidden enemy position",
+                "completed_prefix_refresh_used":self.preference_refreshed,
                 "revision":o.revision,"origin":o.player["position"],
                 "reason":if first_prefix_only{"Native held-input movement rejected; inspect one current prefix"}else{"No two-block defensive displacement over80advancing native ticks"},
                 "execution":"Read-only background query; body observations and urgent defense continue"}))?;
@@ -270,7 +316,7 @@ impl Discovery {
                     Duration::from_millis(750),
                     client.read_observation(&ObservationQuery {
                         capability: "minecraft:movement_options".into(),
-                        input: json!({"offset":offset,"limit":8}),
+                        input,
                     }),
                 )
                 .await
@@ -373,6 +419,165 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn preference_floor() -> Observation {
+        let mut o = observation();
+        let mut blocks = Vec::new();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                for y in -2..=4 {
+                    blocks.push(json!({"position":[x,y,z],
+                        "block":if y==0{"minecraft:stone"}else{"minecraft:air"},
+                        "collision":if y==0{json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+                }
+            }
+        }
+        o.world["blocks"] = json!(blocks);
+        o
+    }
+    #[test]
+    fn native_required_preference_is_existing_behavior_and_pinned_to_physical_basis() {
+        let mut o = preference_floor();
+        let route = geometry::evade_with_limits(&o, &[], &[], &[], 3.5).unwrap();
+        let expected = [route.target.x, route.target.y, route.target.z];
+        assert!(
+            expected[0] < 0.5,
+            "existing close-threat behavior points away"
+        );
+        let mut d = Discovery::default();
+        d.update_basis(&o, true, 3.5);
+        assert_eq!(d.preference, Some(expected));
+        o.world["entities"][0]["position"] = json!([-3.5, 1., 0.5]);
+        d.update_basis(&o, true, 3.5);
+        assert_eq!(
+            d.preference,
+            Some(expected),
+            "same physical basis pins query target, including readiness retry"
+        );
+        o.player["position"][2] = json!(0.6);
+        d.update_basis(&o, true, 3.5);
+        assert!(
+            d.preference.unwrap()[0] > 0.5,
+            "new pose obtains a new preference and new options"
+        );
+        d.update_basis(&o, false, 3.5);
+        assert_eq!(
+            d.preference, None,
+            "ordinary stalled paging keeps its default ordering"
+        );
+        o.world["entities"] = json!([]);
+        d.update_basis(&o, true, 3.5);
+        assert_eq!(d.preference, None, "no invented threat or goal");
+    }
+    #[tokio::test]
+    async fn completed_unsafe_prefix_gets_one_changed_threat_read_without_player_motion() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(
+            Client::with_profile(&minecraft_sdk::Profile {
+                endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+                instance_id: "fixture".into(),
+                credential: minecraft_sdk::Credential {
+                    bot_id: "own".into(),
+                    player_uuid: "own".into(),
+                    key: "fixture-key".into(),
+                },
+                session: None,
+            })
+            .unwrap()
+            .without_local_arbiter(),
+        );
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(socket.read_u8().await.unwrap());
+                    assert!(headers.len() < 8192);
+                }
+                let headers = std::str::from_utf8(&headers).unwrap();
+                assert!(
+                    headers.starts_with("POST /v1/bots/own/observations/query "),
+                    "read only"
+                );
+                let size = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                assert!(size < 16384);
+                let mut bytes = vec![0; size];
+                socket.read_exact(&mut bytes).await.unwrap();
+                let query: ObservationQuery = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(query.capability, "minecraft:movement_options");
+                assert_eq!(query.input["offset"], 0);
+                assert_eq!(query.input["limit"], 8);
+                let target = geometry::point(&query.input["target"]).unwrap();
+                assert!(if index == 0 {
+                    target[0] < 0.5
+                } else {
+                    target[0] > 0.5
+                });
+                let mut response = page();
+                response["scene"] = json!(format!("target-{index}"));
+                response["options"][0]["target"] = json!(target);
+                let body = response.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), listener.accept())
+                    .await
+                    .is_err(),
+                "one refresh, no mutation/paging/storm"
+            );
+        });
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&root.path().join("body.sqlite")).unwrap();
+        let mut o = preference_floor();
+        let mut d = Discovery::default();
+        for index in 0..2 {
+            if index == 1 {
+                let old = d.preference.unwrap();
+                o.world["entities"][0]["position"] = json!([-3.5, 1., 0.5]);
+                assert!(geometry::toward_close_threat(&o, old));
+                let spacing = d.next_query;
+                d.update_basis(&o, true, 3.5);
+                assert_eq!(
+                    d.next_query, spacing,
+                    "changed threat cannot waive read spacing"
+                );
+                assert!(d.routes.is_empty() && d.scene.is_none());
+                assert!(d.preference_refreshed && !d.done);
+                tokio::time::sleep_until(d.next_query.into()).await;
+            }
+            d.tick(client.clone(), &o, true, true, 3.5, &journal)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while d.waiting() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    d.tick(client.clone(), &o, true, true, 3.5, &journal)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(d.done && d.routes.len() == 1);
+        }
+        let final_preference = d.preference;
+        o.world["entities"][0]["position"] = json!([4.5, 1., 0.5]);
+        d.tick(client, &o, true, true, 3.5, &journal).await.unwrap();
+        assert!(d.done && !d.waiting());
+        assert_eq!(
+            d.preference, final_preference,
+            "no general liveness claim after the one same-pose refresh"
+        );
+        assert_eq!(o.player["position"], json!([0.5, 1., 0.5]));
+        server.await.unwrap();
+    }
     #[test]
     fn only_definite_typed_rejection_requires_native_until_life_or_episode_changes() {
         let o = observation();

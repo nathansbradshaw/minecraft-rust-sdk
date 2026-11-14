@@ -1,6 +1,15 @@
 use super::*;
 use serde::Deserialize;
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Skeleton,
+    Acquisition,
+    Combined,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pinned {
@@ -21,12 +30,21 @@ pub struct OperatorRcon {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DependencyCorpus {
+    pub host_dir: PathBuf,
+    pub container_path: String,
+    pub sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fixture {
     pub version: u32,
+    #[serde(default)]
+    pub mode: Mode,
     pub case_id: String,
     pub instance_id: String,
     pub player_uuid: String,
-    pub npc_uuid: String,
+    pub npc_uuid: Option<String>,
     pub connection_request_id: String,
     pub duration_secs: u64,
     pub source_revision: String,
@@ -42,6 +60,9 @@ pub struct Fixture {
     pub container_secret_dir: String,
     pub profile_name: String,
     pub operator_profile: Option<PathBuf>,
+    pub operator_gateway_journal: Option<PathBuf>,
+    #[serde(default)]
+    pub read_only_dependency_corpora: Vec<DependencyCorpus>,
     pub model_key_name: Option<String>,
     pub allocated_model_actor_uuid: Option<String>,
     pub allocated_model_kind: Option<String>,
@@ -54,7 +75,7 @@ pub struct Fixture {
     pub runtime_check: Option<String>,
     pub handler_args: Vec<String>,
     pub expected_player_position: [f64; 3],
-    pub expected_npc_position: [f64; 3],
+    pub expected_npc_position: Option<[f64; 3]>,
     pub position_tolerance: f64,
     pub expected_health: f64,
     pub expected_food: u64,
@@ -103,11 +124,63 @@ impl Fixture {
             .as_deref()
             .ok_or_else(|| "frozen owned container ID required".into())
     }
+    pub fn is_acquisition(&self) -> bool {
+        self.mode == Mode::Acquisition
+    }
+    pub fn is_combined(&self) -> bool {
+        self.mode == Mode::Combined
+    }
+    pub fn immediate_launch(&self) -> bool {
+        self.is_acquisition() || self.is_combined()
+    }
+    pub fn child_deadlines(&self) -> (u64, u64) {
+        match self.mode {
+            Mode::Skeleton => (245, 255),
+            Mode::Acquisition => (1200, 1210),
+            Mode::Combined => (1325, 1335), // Admission120 + work1200 + child settlement.
+        }
+    }
+    pub fn trace_bytes_limit(&self) -> u64 {
+        if self.is_combined() {
+            128 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        }
+    }
+    pub fn action_limit(&self) -> usize {
+        if self.is_combined() { 32768 } else { 4096 }
+    }
+    pub fn config_path(&self) -> Result<&str> {
+        self.handler_args
+            .get(if self.is_acquisition() { 1 } else { 0 })
+            .map(String::as_str)
+            .ok_or_else(|| "config argument absent".into())
+    }
+    pub fn private_input_paths(&self) -> Result<Vec<&str>> {
+        let mut paths = vec![self.config_path()?];
+        if !self.is_acquisition() {
+            paths.push(
+                self.handler_args
+                    .get(3)
+                    .ok_or("admission argument absent")?,
+            );
+        }
+        Ok(paths)
+    }
+    pub fn skeleton_npc(&self) -> Result<(&str, [f64; 3])> {
+        ensure(!self.is_acquisition(), "acquisition has no declared NPC")?;
+        Ok((
+            self.npc_uuid.as_deref().ok_or("skeleton UUID required")?,
+            self.expected_npc_position
+                .ok_or("skeleton position required")?,
+        ))
+    }
     pub fn state_path(&self) -> Result<String> {
+        let config_path = self.config_path()?;
         let artifact = self
             .artifacts
             .iter()
-            .find(|a| a.container_path == self.handler_args[0])
+            .find(|a| a.container_path == config_path)
             .ok_or("config artifact absent")?;
         let value = json(&artifact.file.path, 65536)?;
         let state = value["state"]
@@ -149,14 +222,30 @@ impl Fixture {
             .verify()?;
         ensure(
             uuid(&self.player_uuid)
-                && uuid(&self.npc_uuid)
-                && self.player_uuid != self.npc_uuid
                 && valid_hash(&self.instance_id, 64)
                 && valid_hash(&self.source_revision, 40),
             "invalid frozen identities",
         )?;
+        match self.mode {
+            Mode::Skeleton | Mode::Combined => {
+                let (npc, position) = self.skeleton_npc()?;
+                ensure(
+                    uuid(npc) && self.player_uuid != npc && position.iter().all(|p| p.is_finite()),
+                    "distinct valid skeleton identity and finite pose required",
+                )?;
+            }
+            Mode::Acquisition => ensure(
+                self.npc_uuid.is_none() && self.expected_npc_position.is_none(),
+                "acquisition forbids declared NPC identity and position",
+            )?,
+        }
+        let duration = if self.mode == Mode::Skeleton {
+            120
+        } else {
+            1200
+        };
         ensure(
-            self.duration_secs == 120
+            self.duration_secs == duration
                 && self.expected_health == 20.0
                 && self.expected_food == 20
                 && self.position_tolerance.is_finite()
@@ -182,6 +271,14 @@ impl Fixture {
         )?;
         canonical(&self.workspace)?;
         canonical(self.host_profile()?)?;
+        if let Some(journal) = &self.operator_gateway_journal {
+            canonical(journal)?;
+            minecraft_sdk_evidence::private_file(journal, 64 * 1024 * 1024 * 1024)?;
+            ensure(
+                !journal.starts_with(&self.workspace) && !journal.starts_with(&self.secret_dir),
+                "operator gateway journal must be outside bot mounts",
+            )?;
+        }
         ensure(
             !self.host_profile()?.starts_with(&self.workspace)
                 && !self.host_profile()?.starts_with(&self.secret_dir),
@@ -269,7 +366,7 @@ impl Fixture {
             artifact.file.verify()?;
             container_path(&artifact.container_path)?;
             ensure(
-                paths.insert(&artifact.container_path)
+                paths.insert(artifact.container_path.clone())
                     && !Path::new(&artifact.container_path).starts_with(&self.container_secret_dir),
                 "artifact must be distinct from secret paths",
             )?;
@@ -294,34 +391,52 @@ impl Fixture {
             self.trace_action_prefix.as_deref().is_none_or(id),
             "invalid optional exact action prefix",
         )?;
+        match self.mode {
+            Mode::Skeleton => ensure(
+                self.handler_args.len() == 4
+                    && matches!(self.handler_args[1].as_str(), "blocked" | "task")
+                    && self.handler_args[2] == "120",
+                "existing bounded probe argv required",
+            )?,
+            Mode::Acquisition => ensure(
+                self.handler_args.len() == 2 && self.handler_args[0] == "run",
+                "acquisition requires pinned Brain argv [run, CONFIG]",
+            )?,
+            Mode::Combined => ensure(
+                self.handler_args.len() == 4
+                    && self.handler_args[1] == "task-kit"
+                    && self.handler_args[2] == "1200"
+                    && self.operator_gateway_journal.is_some(),
+                "combined requires task-kit1200 argv and authoritative operator journal",
+            )?,
+        }
         ensure(
-            self.expected_npc_position.iter().all(|p| p.is_finite()),
-            "finite NPC pose required",
-        )?;
-        ensure(
-            self.handler_args.len() == 4
-                && matches!(self.handler_args[1].as_str(), "blocked" | "task")
-                && self.handler_args[2] == "120",
-            "existing bounded probe argv required",
-        )?;
-        ensure(
-            self.handler_args[1] != "task"
+            (!self.is_acquisition() && !self.is_combined() && self.handler_args[1] != "task")
                 || (self.model_key_name.is_some()
                     && self.allocated_model_kind.as_deref() == Some("operator-allocated-proxy")),
-            "task mode requires an explicitly allocated proxy key",
+            "coding and acquisition modes require an explicitly allocated proxy key",
         )?;
-        for argument in [&self.handler_args[0], &self.handler_args[3]] {
+        for argument in self.private_input_paths()? {
             ensure(
                 paths.contains(argument),
                 "config and admission spec must be pinned artifacts",
             )?;
         }
+        let config_path = self.config_path()?;
         let config = self
             .artifacts
             .iter()
-            .find(|a| a.container_path == self.handler_args[0])
+            .find(|a| a.container_path == config_path)
             .ok_or("config artifact absent")?;
         let cfg = json(&config.file.path, 65536)?;
+        if self.is_combined() {
+            ensure(
+                cfg["completion_inventory"]
+                    == json!({"minecraft:crafting_table":1,"minecraft:wooden_pickaxe":1})
+                    && cfg["goal"].as_str().is_some_and(|g| !g.trim().is_empty()),
+                "combined requires explicit goal and exact retained table/pickaxe completion contract",
+            )?;
+        }
         ensure(
             cfg["profile"] == self.container_profile()
                 && self
@@ -335,30 +450,33 @@ impl Fixture {
                     .is_some_and(|p| Path::new(p).starts_with(&self.container_workspace))
                 && cfg["body"]["period_ms"] == 150
                 && cfg["body"]["decision_samples"] == 128
-                && cfg["body"]["enabled"] == false,
-            "handler config must bind scoped secrets, workspace and pre-admission body",
+                && cfg["body"]["enabled"] == self.is_acquisition(),
+            "handler config must bind scoped secrets, workspace and mode-specific startup body",
         )?;
-        let admission = self
-            .artifacts
-            .iter()
-            .find(|a| a.container_path == self.handler_args[3])
-            .ok_or("admission artifact absent")?;
-        let spec = json(&admission.file.path, 16384)?;
-        ensure(
-            spec["entity_uuid"] == self.npc_uuid
-                && spec["entity_type"] == "minecraft:skeleton"
-                && spec["main_hand"] == "minecraft:bow"
-                && spec["entity_health"].as_f64() == Some(20.0)
-                && spec["position_tolerance"]
-                    .as_f64()
-                    .is_some_and(|n| n.is_finite() && (0.0..=self.position_tolerance).contains(&n))
-                && spec["player_health"].as_f64() == Some(20.0)
-                && spec["player_food"] == 20
-                && spec["timeout_secs"] == 120
-                && same_point(&spec["player_position"], self.expected_player_position)
-                && same_point(&spec["entity_position"], self.expected_npc_position),
-            "admission spec differs from fixture",
-        )?;
+        if !self.is_acquisition() {
+            let (npc, position) = self.skeleton_npc()?;
+            let admission = self
+                .artifacts
+                .iter()
+                .find(|a| a.container_path == self.handler_args[3])
+                .ok_or("admission artifact absent")?;
+            let spec = json(&admission.file.path, 16384)?;
+            ensure(
+                spec["entity_uuid"] == npc
+                    && spec["entity_type"] == "minecraft:skeleton"
+                    && spec["main_hand"] == "minecraft:bow"
+                    && spec["entity_health"].as_f64() == Some(20.0)
+                    && spec["position_tolerance"].as_f64().is_some_and(|n| {
+                        n.is_finite() && (0.0..=self.position_tolerance).contains(&n)
+                    })
+                    && spec["player_health"].as_f64() == Some(20.0)
+                    && spec["player_food"] == 20
+                    && spec["timeout_secs"] == 120
+                    && same_point(&spec["player_position"], self.expected_player_position)
+                    && same_point(&spec["entity_position"], position),
+                "admission spec differs from fixture",
+            )?;
+        }
         if let Some(rcon) = &self.operator_rcon {
             ensure(
                 rcon.address.ip().is_loopback(),
@@ -374,6 +492,76 @@ impl Fixture {
         }
         self.secrets()?;
         self.state_path()?;
+        self.validate_dependency_corpora()?;
+        Ok(())
+    }
+    fn validate_dependency_corpora(&self) -> Result<()> {
+        ensure(
+            self.read_only_dependency_corpora.len() <= 4,
+            "at most four reviewed dependency corpora",
+        )?;
+        for (i, corpus) in self.read_only_dependency_corpora.iter().enumerate() {
+            canonical(&corpus.host_dir)?;
+            ensure(
+                fs::symlink_metadata(&corpus.host_dir)?.is_dir() && valid_hash(&corpus.sha256, 64),
+                "reviewed dependency directory and tree digest required",
+            )?;
+            container_path(&corpus.container_path)?;
+            let dest = Path::new(&corpus.container_path);
+            ensure(
+                dest.starts_with(&self.container_workspace)
+                    || (dest.starts_with("/deps") && dest != Path::new("/deps")),
+                "dependency destination must be inside workspace or below /deps",
+            )?;
+            ensure(
+                !self.workspace.starts_with(&corpus.host_dir)
+                    && !self.secret_dir.starts_with(&corpus.host_dir)
+                    && !corpus.host_dir.starts_with(&self.secret_dir)
+                    && !self.host_profile()?.starts_with(&corpus.host_dir)
+                    && self
+                        .operator_gateway_journal
+                        .as_ref()
+                        .is_none_or(|p| !p.starts_with(&corpus.host_dir))
+                    && self
+                        .operator_rcon
+                        .as_ref()
+                        .is_none_or(|r| !r.password_file.starts_with(&corpus.host_dir)),
+                "dependency corpus overlaps private operator inputs or workspace root",
+            )?;
+            let state = self.state_path()?;
+            let config_path = self.config_path()?;
+            let config = self
+                .artifacts
+                .iter()
+                .find(|a| a.container_path == config_path)
+                .ok_or("config artifact absent")?;
+            let cfg = json(&config.file.path, 65536)?;
+            let program = cfg["workspace"]
+                .as_str()
+                .ok_or("program workspace absent")?;
+            ensure(
+                !Path::new(&self.container_workspace).starts_with(dest)
+                    && !Path::new(program).starts_with(dest)
+                    && !Path::new(&self.container_secret_dir).starts_with(dest)
+                    && !dest.starts_with(&self.container_secret_dir)
+                    && !Path::new(&state).starts_with(dest)
+                    && !dest.starts_with(&state)
+                    && self.artifacts.iter().chain(self.ca_file.iter()).all(|a| {
+                        !Path::new(&a.container_path).starts_with(dest)
+                            && !dest.starts_with(&a.container_path)
+                    }),
+                "dependency corpus overlaps pinned inputs, secrets, state or workspace root",
+            )?;
+            for other in &self.read_only_dependency_corpora[..i] {
+                ensure(
+                    !dest.starts_with(&other.container_path)
+                        && !Path::new(&other.container_path).starts_with(dest)
+                        && !corpus.host_dir.starts_with(&other.host_dir)
+                        && !other.host_dir.starts_with(&corpus.host_dir),
+                    "overlapping dependency corpora forbidden",
+                )?;
+            }
+        }
         Ok(())
     }
     pub fn secrets(&self) -> Result<Secrets> {
@@ -439,6 +627,7 @@ fn same_point(value: &Value, expected: [f64; 3]) -> bool {
 }
 /// Inspect only selected Docker fields, never Config.Env or full inspect output.
 pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
+    validate_dependency_mounts(f, value)?;
     ensure(
         value["id"].as_str() == f.container_id.as_deref()
             && value["started_at"].as_str() == f.container_started_at.as_deref(),
@@ -558,6 +747,12 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
                 "operator password exposed by bot mount",
             )?;
         }
+        if let Some(journal) = &f.operator_gateway_journal {
+            ensure(
+                source.is_empty() || !journal.starts_with(source),
+                "operator gateway journal exposed by bot mount",
+            )?;
+        }
         ensure(
             !dest.contains("docker.sock") && !source.contains("docker.sock"),
             "Docker socket forbidden",
@@ -579,7 +774,11 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
                         a.file.path == Path::new(source) && a.container_path == dest && !rw
                     });
                 ensure(
-                    artifact || (Path::new(source) == f.workspace && dest == f.container_workspace),
+                    artifact
+                        || (Path::new(source) == f.workspace && dest == f.container_workspace)
+                        || f.read_only_dependency_corpora.iter().any(|c| {
+                            c.host_dir == Path::new(source) && c.container_path == dest && !rw
+                        }),
                     "unreviewed host bind mount forbidden",
                 )?;
             } else {
@@ -601,4 +800,53 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
         secret,
         "dedicated read-only secret directory mount required",
     )
+}
+/// Exact read-only bind plus no nested override or writable alias to its source.
+pub fn validate_dependency_mounts(f: &Fixture, value: &Value) -> Result<()> {
+    if f.read_only_dependency_corpora.is_empty() {
+        return Ok(());
+    }
+    let mounts = value["mounts"]
+        .as_array()
+        .ok_or("dependency mount inventory absent")?;
+    for corpus in &f.read_only_dependency_corpora {
+        let mut exact = 0;
+        for mount in mounts {
+            let dest = mount["Destination"]
+                .as_str()
+                .ok_or("mount destination absent")?;
+            let source = mount["Source"].as_str().unwrap_or("");
+            if dest == corpus.container_path {
+                exact += 1;
+                ensure(
+                    mount["Type"] == "bind"
+                        && mount["RW"] == false
+                        && Path::new(source) == corpus.host_dir,
+                    "dependency corpus must be an exact read-only bind",
+                )?;
+            } else {
+                ensure(
+                    !Path::new(dest).starts_with(&corpus.container_path),
+                    "nested mount overrides dependency corpus",
+                )?;
+            }
+            if mount["Type"] == "bind" && mount["RW"] == true && !source.is_empty() {
+                if let Ok(relative) = corpus.host_dir.strip_prefix(source) {
+                    ensure(
+                        Path::new(dest).join(relative) == Path::new(&corpus.container_path),
+                        "writable alias exposes dependency corpus",
+                    )?;
+                }
+                ensure(
+                    !Path::new(source).starts_with(&corpus.host_dir),
+                    "writable dependency subdirectory bind forbidden",
+                )?;
+            }
+        }
+        ensure(
+            exact == 1,
+            "missing or duplicate dependency read-only mount",
+        )?;
+    }
+    Ok(())
 }
