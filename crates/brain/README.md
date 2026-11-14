@@ -40,6 +40,12 @@ the resident PID; `lua_reload_rejected` and the tool's `rejected_update` disclos
 failure. Reload never changes the Brain PID, ownership, body or SDK session.
 Only explicit JSON state persists. Lua closures/globals are recreated per step.
 
+Large `last_result` values keep exact receipt IDs/outcomes, bounded errors and
+verification/release flags instead of dropping the receipt. `feedback_view`
+marks omitted evidence with its original hash; `after` may be a focused historical
+view. Current full state remains in `ctx.observation`, and full receipts remain
+in the Brain journal. Omission does not establish a gameplay effect.
+
 State is scoped to workspace/path, instance, actor and goal revision and persists
 across reloads and restarts. A slice runs at most128 commands within the configured
 tool timeout. Resume `slice_exhausted` with the same `run` path. Pending actions

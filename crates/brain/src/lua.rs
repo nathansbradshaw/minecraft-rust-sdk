@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod feedback;
+
 const SOURCE_LIMIT: usize = 32768;
 const STATE_LIMIT: usize = 16384;
 const STEP_LIMIT: usize = 128;
@@ -264,7 +266,7 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
                     }
                 };
                 if receipt.outcome.terminal() {
-                    checkpoint.result["receipt"] = serde_json::to_value(receipt)?;
+                    feedback::settle(&mut checkpoint.result, serde_json::to_value(receipt)?)?;
                     checkpoint.pending_action = None;
                     break;
                 }
@@ -345,26 +347,10 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
             feedback.push(json!({"request":result["request"],"response":crate::feedback::receipt_summary(&serde_json::from_value(result["receipt"].clone())?)}));
         }
         checkpoint.result = result;
-        checkpoint.pending_action = checkpoint.result["receipt"]
-            .as_object()
-            .and_then(|_| {
-                serde_json::from_value::<minecraft_sdk::Receipt>(
-                    checkpoint.result["receipt"].clone(),
-                )
-                .ok()
-            })
-            .filter(|receipt| !receipt.outcome.terminal())
-            .map(|receipt| receipt.action_id)
-            .or_else(|| {
-                checkpoint.result["navigation"]["report"]["pending_action"]
-                    .as_str()
-                    .map(str::to_owned)
-            });
+        checkpoint.pending_action = feedback::pending(&checkpoint.result);
         // Results may be large. Retain a bounded view; full SDK receipts remain
         // independently journalled by the resident Rust executor.
-        if serde_json::to_vec(&checkpoint.result)?.len() > 32768 {
-            checkpoint.result = json!({"truncated":true,"note":"Use a focused observation/query; original action IDs remain in the Brain journal"});
-        }
+        checkpoint.result = feedback::bounded(checkpoint.result)?;
         checkpoint.in_flight = false;
         brain
             .journal
@@ -561,6 +547,9 @@ mod tests {
         statuses: AtomicU32,
         fail: bool,
         hold: std::sync::atomic::AtomicBool,
+        large_receipts: std::sync::atomic::AtomicBool,
+        first_outcome: std::sync::Mutex<String>,
+        status_outcome: std::sync::Mutex<String>,
     }
     async fn observation() -> axum::Json<Value> {
         axum::Json(
@@ -585,7 +574,7 @@ mod tests {
         (
             axum::http::StatusCode::OK,
             axum::Json(
-                json!({"action_id":request["action_id"],"outcome":if requests.len()==1{"running"}else{"observed"},"adapter_version":"fixture","evidence":{},"error":null}),
+                json!({"action_id":request["action_id"],"outcome":if requests.len()==1{server.first_outcome.lock().unwrap().clone()}else{"observed".to_owned()},"adapter_version":"fixture","evidence":native_evidence(&server),"error":null}),
             ),
         )
     }
@@ -595,8 +584,16 @@ mod tests {
     ) -> axum::Json<Value> {
         server.statuses.fetch_add(1, Ordering::Relaxed);
         axum::Json(
-            json!({"action_id":id,"outcome":if server.hold.load(Ordering::Relaxed){"running"}else{"observed"},"adapter_version":"fixture","evidence":{},"error":null}),
+            json!({"action_id":id,"outcome":if server.hold.load(Ordering::Relaxed){"running".to_owned()}else{server.status_outcome.lock().unwrap().clone()},"adapter_version":"fixture","evidence":native_evidence(&server),"error":null}),
         )
+    }
+    fn native_evidence(server: &Server) -> Value {
+        if server.large_receipts.load(Ordering::Relaxed) {
+            json!({"native_effect_verified":true,"input_released":true,
+                "after":{"world":{"blocks":[{"synthetic_scene":"x".repeat(65536)}]}}})
+        } else {
+            json!({})
+        }
     }
     async fn fixture(
         next_source: String,
@@ -619,6 +616,9 @@ mod tests {
             statuses: AtomicU32::new(0),
             fail,
             hold: std::sync::atomic::AtomicBool::new(false),
+            large_receipts: std::sync::atomic::AtomicBool::new(false),
+            first_outcome: std::sync::Mutex::new("running".into()),
+            status_outcome: std::sync::Mutex::new("observed".into()),
         });
         let app = axum::Router::new()
             .route("/v1/bots/own/observations", axum::routing::get(observation))
@@ -736,6 +736,75 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["action_id"], original);
         assert_eq!(requests[1]["action"]["slot"], 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn large_native_results_keep_lua_start_finish_feedback_without_replay() {
+        // Public synthetic counterexample to F16: receipt scenes exceed32KiB.
+        // This exercises production tools/Brain.act/checkpoints and the Lua VM,
+        // not a mining walkthrough or a claim about a real block being acquired.
+        let source = "return {version=1,step=function(ctx) local n=ctx.state.n or 0; if n==2 then return {state=ctx.state,done=true} end; if n==1 then local r=ctx.last_result.receipt; if not r or r.outcome~='observed' or r.evidence.native_effect_verified~=true then return {state={failed=true},done=true} end; assert(r.feedback_view.partial and not r.evidence.after); assert(ctx.last_result.request.action.stage=='start') end; return {state={n=n+1},command={tool='sdk',input={kind='dig',block={x=0,y=64,z=0},face=1,stage=n==0 and 'start' or 'finish'}}} end}";
+        let (_root, mut brain, server, handle) = fixture(source.into(), false).await;
+        fs::write(&server.path, source).unwrap();
+        brain.server.capabilities.push("minecraft:mining".into());
+        *server.first_outcome.lock().unwrap() = "observed".into();
+        server.large_receipts.store(true, Ordering::Relaxed);
+        let result = execute(&mut brain, "behavior.lua").await.unwrap();
+        assert_eq!(result["state"]["n"], 2);
+        assert_eq!(result["done"], true);
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["action"]["stage"], "start");
+        assert_eq!(requests[1]["action"]["stage"], "finish");
+        assert_ne!(requests[0]["action_id"], requests[1]["action_id"]);
+        assert_eq!(
+            result["last_result"]["receipt"]["action_id"],
+            requests[1]["action_id"]
+        );
+        assert!(result["last_result"].to_string().len() <= feedback::LIMIT);
+        assert_eq!(
+            execute(&mut brain, "behavior.lua").await.unwrap()["steps"],
+            0
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        let journalled: String = brain
+            .journal
+            .db
+            .query_row(
+                "SELECT data FROM events WHERE kind='action_receipt' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(journalled.len() > feedback::LIMIT);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn large_pending_receipt_stays_fenced_then_resumes_same_id_with_bounded_feedback() {
+        let source = "return {version=1,step=function(ctx) if ctx.state.sent then local r=ctx.last_result.receipt; assert(r.outcome=='observed' and r.feedback_view.partial and not r.evidence.after); return {state=ctx.state,done=true} end; return {state={sent=true},command={tool='sdk',input={kind='start_move',target={x=1,y=64,z=1},jump=false,max_ticks=5}}} end}";
+        let (_root, mut brain, server, handle) = fixture(source.into(), false).await;
+        fs::write(&server.path, source).unwrap();
+        brain
+            .server
+            .capabilities
+            .push("minecraft:finite_locomotion".into());
+        server.large_receipts.store(true, Ordering::Relaxed);
+        *server.status_outcome.lock().unwrap() = "uncertain".into();
+        let first = execute(&mut brain, "behavior.lua").await.unwrap();
+        assert_eq!(first["outcome"], "uncertain");
+        assert_eq!(first["waiting_for_action"], true);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        let original = first["pending_action"].clone();
+        // Actual status changes on the owned fixture; the executor only inspects
+        // the same ID. No uncertain mutation is resubmitted or credited early.
+        *server.status_outcome.lock().unwrap() = "observed".into();
+        let second = execute(&mut brain, "behavior.lua").await.unwrap();
+        assert_eq!(second["done"], true);
+        assert_eq!(second["last_result"]["receipt"]["action_id"], original);
+        assert!(second["last_result"].to_string().len() <= feedback::LIMIT);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
         handle.abort();
     }
 }
