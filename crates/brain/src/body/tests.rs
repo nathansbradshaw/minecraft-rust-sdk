@@ -1398,7 +1398,10 @@ async fn controller_projectile_scenario(replace_projectile: bool, require_native
                 assert!(require_native && !native_queried);
                 let query: ObservationQuery = serde_json::from_slice(&body).unwrap();
                 assert_eq!(query.capability, "minecraft:movement_options");
-                assert_eq!(query.input, json!({"offset":0,"limit":8}));
+                assert_eq!(
+                    query.input,
+                    json!({"offset":0,"limit":8,"target":[-0.5,1.,-2.5]})
+                );
                 native_queried = true;
                 json!({"format":"minecraft-movement-options-v1","scene":"urgent-native-prefix",
                     "origin":{"position":[0.5,1.,0.5],"dimension":"minecraft:overworld"},

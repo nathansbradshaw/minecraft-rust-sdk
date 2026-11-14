@@ -36,7 +36,17 @@ pub(super) fn validate(input: &Value) -> AnyResult<()> {
     parse(input).map(|_| ())
 }
 pub(super) fn schema() -> Value {
-    json!({"description":"Read-only locally reachable grounded waypoints using this adapter's collision/gravity admission. Predictions are not game effects. Use limit for small diagnostic pages; follow pagination only while scene and origin match.","input_schema":{"type":"object","additionalProperties":false,"properties":{"offset":{"type":"integer","minimum":0,"maximum":1024},"limit":{"type":"integer","minimum":1,"maximum":64,"default":64},"target":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}},"max_evaluations":64,"min_interval_ms":INTERVAL_MS})
+    json!({"description":"Read-only locally reachable grounded waypoints using this adapter's collision/gravity admission. Predictions are not game effects. An explicit target orders candidates nearest that target; otherwise candidates remain nearest the player. Use limit for small diagnostic pages; follow pagination only while scene and origin match.","input_schema":{"type":"object","additionalProperties":false,"properties":{"offset":{"type":"integer","minimum":0,"maximum":1024},"limit":{"type":"integer","minimum":1,"maximum":64,"default":64},"target":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}}},"max_evaluations":64,"min_interval_ms":INTERVAL_MS})
+}
+fn order_candidates(candidates: &mut [[f64; 3]], start: [f64; 3], target: Option<[f64; 3]>) {
+    let preference = target.unwrap_or(start);
+    candidates.sort_by(|a, b| {
+        let d = |p: &[f64; 3]| (0..3).map(|i| (p[i] - preference[i]).powi(2)).sum::<f64>();
+        d(a).total_cmp(&d(b))
+            .then_with(|| a[0].total_cmp(&b[0]))
+            .then_with(|| a[1].total_cmp(&b[1]))
+            .then_with(|| a[2].total_cmp(&b[2]))
+    });
 }
 fn body_cells(p: [f64; 3]) -> impl Iterator<Item = [i32; 3]> {
     let lo = [
@@ -185,13 +195,7 @@ fn page_with_pruning(
             candidates.push(target);
         }
     }
-    candidates.sort_by(|a, b| {
-        let d = |p: &[f64; 3]| (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>();
-        d(a).total_cmp(&d(b))
-            .then_with(|| a[0].total_cmp(&b[0]))
-            .then_with(|| a[1].total_cmp(&b[1]))
-            .then_with(|| a[2].total_cmp(&b[2]))
-    });
+    order_candidates(&mut candidates, start, input.target);
     candidates.dedup();
     if candidates.len() > 1024 {
         return Err("Movement option surface budget exceeded".into());
@@ -204,7 +208,7 @@ fn page_with_pruning(
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     // A changed control contract invalidates failed edges from old predictions
     // even if their terrain and endpoints are unchanged.
-    "java767-input-preview-v5".hash(&mut hash);
+    "java767-input-preview-v6-target-order".hash(&mut hash);
     // Ordering and predictions depend on the precise start and physical
     // state, including across separately resumed client invocations.
     start.map(f64::to_bits).hash(&mut hash);
@@ -266,13 +270,45 @@ fn page_with_pruning(
         }
     }
     Ok(
-        json!({"format":"minecraft-movement-options-v1","origin":{"position":start,"dimension":before.player["dimension"]},"scene":format!("{:016x}",hash.finish()),"options":options,"complete":end==candidates.len(),"next_offset":if end<candidates.len(){Some(end)}else{None},"retry_after_ms":INTERVAL_MS,"total_candidates":candidates.len(),"pruned_blocked_endpoints":pruned_candidates,"prediction_not_effect_proof":true}),
+        json!({"format":"minecraft-movement-options-v1","origin":{"position":start,"dimension":before.player["dimension"]},"scene":format!("{:016x}",hash.finish()),"ordering":if input.target.is_some(){"nearest_explicit_target"}else{"nearest_player"},"options":options,"complete":end==candidates.len(),"next_offset":if end<candidates.len(){Some(end)}else{None},"retry_after_ms":INTERVAL_MS,"total_candidates":candidates.len(),"pruned_blocked_endpoints":pruned_candidates,"prediction_not_effect_proof":true}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_target_orders_the_same_candidates_without_changing_default_ties() {
+        let start = [0.5, 1., 0.5];
+        let points = [[3.5, 1., 0.5], [0.5, 1., 1.5], [-0.5, 1., 0.5]];
+        let mut default = points;
+        order_candidates(&mut default, start, None);
+        assert_eq!(default, [points[2], points[1], points[0]]);
+        let mut directed = points;
+        order_candidates(&mut directed, start, Some(points[0]));
+        assert_eq!(directed[0], points[0]);
+        let mut same_origin = points;
+        order_candidates(&mut same_origin, start, Some(start));
+        assert_eq!(same_origin, default);
+    }
+    #[test]
+    fn target_directed_prefix_still_requires_native_admission_and_new_scene() {
+        let flat = room(false);
+        let directed = page(&flat, &json!({"target":[3.5,1.,0.5],"limit":1}), 100).unwrap();
+        assert_eq!(directed["ordering"], "nearest_explicit_target");
+        assert_eq!(directed["options"][0]["target"], json!([3.5, 1., 0.5]));
+        let default = page(&flat, &json!({"limit":1}), 100).unwrap();
+        assert_eq!(default["ordering"], "nearest_player");
+        assert_ne!(directed["scene"], default["scene"]);
+        let opposite = page(&flat, &json!({"target":[-2.5,1.,0.5],"limit":1}), 100).unwrap();
+        assert_ne!(directed["scene"], opposite["scene"]);
+        let walled = page(&room(true), &json!({"target":[3.5,1.,0.5],"limit":1}), 100).unwrap();
+        assert!(
+            walled["options"].as_array().unwrap().is_empty(),
+            "target preference cannot admit motion through the observed wall"
+        );
+        assert_eq!(walled["prediction_not_effect_proof"], true);
+    }
     fn room(wall: bool) -> Observation {
         let mut blocks = Vec::new();
         for x in -4..=4 {
