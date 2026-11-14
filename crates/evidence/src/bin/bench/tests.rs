@@ -44,7 +44,7 @@ impl Runner for Fake {
         Ok(out)
     }
 }
-fn output(text: String, success: bool) -> process::Output {
+pub(super) fn output(text: String, success: bool) -> process::Output {
     process::Output {
         exit_code: Some(if success { 0 } else { 1 }),
         signal: None,
@@ -114,7 +114,7 @@ pub(super) fn setup() -> Setup {
         case: base.join("case"),
     }
 }
-fn observation(f: &Fixture) -> Value {
+pub(super) fn observation(f: &Fixture) -> Value {
     json!({"revision":"test","player":{"uuid":f.player_uuid,"life_id":"eac7697a-2c77-4ae2-a7f9-a9ed7aac21b5","dimension":"minecraft:overworld","health":20.0,"food":20,"position":f.expected_player_position,"inventory":[]},"world":{},"menu":{"menu_id":0,"slots":[],"carried":{"item":"minecraft:air","count":0}}})
 }
 fn mounts(f: &Fixture) -> Value {
@@ -133,7 +133,10 @@ fn preflight_replies(f: &Fixture) -> VecDeque<process::Output> {
         q.push_back(output(String::new(), true));
     }
     q.push_back(output("1000".into(), true));
-    q.push_back(output("8180 600 1000\n8180 600 1000\n".into(), true));
+    q.push_back(output(
+        "8180 600 1000\n".repeat(f.private_input_paths().unwrap().len()),
+        true,
+    ));
     q.push_back(output(json!({"format":"minecraft-runtime-filesystem-check-v1","unix_socket_bind":true,"socket_mode_0600":true,"probe_removed":true,"sdk_or_gameplay_calls":false}).to_string(), true));
     q.push_back(output(json!({"ready":true,"instance_id":f.instance_id,"capabilities":["minecraft:fresh_observation"]}).to_string(),true));
     q
@@ -198,6 +201,28 @@ fn unsupported_runtime_socket_stops_before_actor_connection() {
             .calls
             .iter()
             .any(|args| args.first().is_some_and(|a| a == "connect"))
+    );
+    assert!(!s.case.join("stage-intent.json").exists());
+}
+#[test]
+fn acquisition_preflight_checks_only_its_private_brain_config_without_connecting() {
+    let s = acquisition_config_tests::acquisition();
+    let mut fake = Fake {
+        replies: preflight_replies(&s.f),
+        calls: vec![],
+    };
+    preflight(&mut fake, &s.f, &s.case, "acquisition-preflight").unwrap();
+    let metadata = fake
+        .calls
+        .iter()
+        .find(|args| args.get(2).is_some_and(|s| s == "stat"))
+        .unwrap();
+    assert_eq!(&metadata[6..], &[s.f.config_path().unwrap().to_owned()]);
+    assert!(
+        !fake
+            .calls
+            .iter()
+            .any(|args| args.first().is_some_and(|s| s == "connect"))
     );
     assert!(!s.case.join("stage-intent.json").exists());
 }

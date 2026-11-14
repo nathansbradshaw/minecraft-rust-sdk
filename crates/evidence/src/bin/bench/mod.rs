@@ -68,7 +68,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     }
     if args.is_empty() || (args.len() == 1 && args[0] == "--help") {
         println!(
-            "mc-sdk-bench rcon-list LOOPBACK_ADDR PRIVATE_PASSWORD_FILE\nmc-sdk-bench preflight|stage|run|launch FIXTURE.json SHA256 CASE_DIR\nmc-sdk-bench nativecapture FIXTURE.json SHA256 NEW_CAPTURE_DIR GATEWAY.sqlite TRACE.log SPEC_TEMPLATE.json [SAVED_JSON ...]\nSee docs/operator-bench.md. Stage/run/launch make real connections only when the operator runs them; no command awards a PASS."
+            "mc-sdk-bench rcon-list LOOPBACK_ADDR PRIVATE_PASSWORD_FILE\nmc-sdk-bench preflight|stage|run|launch|acquire FIXTURE.json SHA256 CASE_DIR\nmc-sdk-bench nativecapture FIXTURE.json SHA256 NEW_CAPTURE_DIR GATEWAY.sqlite TRACE.log SPEC_TEMPLATE.json [SAVED_JSON ...]\nSee docs/operator-bench.md. Lifecycle commands make real connections only when the operator runs them; no command awards a PASS."
         );
         return Ok(());
     }
@@ -109,8 +109,18 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     let mut runner = SystemRunner::new();
     match command {
         "preflight" if args.len() == 4 => preflight(&mut runner, &fixture, case, "preflight")?,
-        "stage" if args.len() == 4 => stage(&mut runner, &fixture, case, hash)?,
+        "stage" if args.len() == 4 => {
+            ensure(
+                !fixture.is_acquisition(),
+                "acquisition requires the combined acquire command",
+            )?;
+            stage(&mut runner, &fixture, case, hash)?;
+        }
         "run" if args.len() == 4 => {
+            ensure(
+                !fixture.is_acquisition(),
+                "acquisition requires the combined acquire command",
+            )?;
             ensure(
                 fixture.operator_rcon.is_some(),
                 "automatic run requires private typed RCON; no connected manual gap",
@@ -126,7 +136,30 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             )?;
         }
         "launch" if args.len() == 4 => {
+            ensure(
+                !fixture.is_acquisition(),
+                "acquisition requires the combined acquire command",
+            )?;
             launch(&mut runner, &mut SystemRunner::new(), &fixture, case, hash)?;
+        }
+        "acquire" if args.len() == 4 => {
+            ensure(
+                fixture.is_acquisition(),
+                "acquire requires an explicit no-NPC acquisition fixture",
+            )?;
+            ensure(
+                fixture.operator_rcon.is_some(),
+                "acquire requires typed guarded staging and native closure verification",
+            )?;
+            stage(&mut runner, &fixture, case, hash)?;
+            launch_prepared(
+                &mut runner,
+                &mut SystemRunner::new(),
+                &fixture,
+                case,
+                hash,
+                true,
+            )?;
         }
         "nativecapture" if (7..=11).contains(&args.len()) => capture::native(
             &fixture,
@@ -184,20 +217,21 @@ fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> 
     ensure(uid.success, "container UID unavailable")?;
     let uid: u32 = std::str::from_utf8(&uid.stdout)?.trim().parse()?;
     ensure(uid != 0, "effective container user must be nonroot")?;
+    let inputs = f.private_input_paths()?;
+    let mut metadata_args = vec![
+        "exec".into(),
+        f.target()?.into(),
+        "stat".into(),
+        "-c".into(),
+        "%f %a %u".into(),
+        "--".into(),
+    ];
+    metadata_args.extend(inputs.iter().map(|path| (*path).to_owned()));
     let metadata = process::execute(
         runner,
         f,
         &f.docker,
-        vec![
-            "exec".into(),
-            f.target()?.into(),
-            "stat".into(),
-            "-c".into(),
-            "%f %a %u".into(),
-            "--".into(),
-            f.handler_args[0].clone(),
-            f.handler_args[3].clone(),
-        ],
+        metadata_args,
         10,
         case,
         &format!("{label}-private-input-metadata"),
@@ -208,7 +242,10 @@ fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> 
         "container private-input metadata unavailable",
     )?;
     let lines: Vec<_> = std::str::from_utf8(&metadata.stdout)?.lines().collect();
-    ensure(lines.len() == 2, "both config/spec metadata required")?;
+    ensure(
+        lines.len() == inputs.len(),
+        "metadata required for every pinned private input",
+    )?;
     for line in lines {
         validate_private_metadata(line, uid)?;
     }
@@ -460,7 +497,7 @@ fn stage(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resul
         }
         save(
             &case.join("stage.json"),
-            &json!({"fixture_sha256":hash,"player_uuid":f.player_uuid,"life_id":life,"connected":true,"staged_native_verified":client.is_some(),"operator_handoff_pending":client.is_none(),"npc_summoned":false,"next":"Launch validates real READY before guarded summon; no heal, respawn or rollback."}),
+            &json!({"fixture_sha256":hash,"player_uuid":f.player_uuid,"life_id":life,"connected":true,"staged_native_verified":client.is_some(),"operator_handoff_pending":client.is_none(),"npc_summoned":false,"next":if f.is_acquisition(){"Immediately launch the pinned Brain with its startup body enabled; no NPC operations or manual idle gap."}else{"Launch validates real READY before guarded summon; no heal, respawn or rollback."}}),
         )?;
         if client.is_none() {
             println!(
@@ -689,20 +726,30 @@ fn launch_inner(
         json(&f.profile(), 16384)?["session"].is_object(),
         "staged controller session required",
     )?;
-    let mut console = rcon_client(f)?;
+    let mut console = if f.is_acquisition() {
+        None
+    } else {
+        rcon_client(f)?
+    };
     let mut ready = false;
     let mut admitted = false;
     let mut summon_attempted = false;
-    let mut last_npc = f.expected_npc_position;
+    let skeleton = if f.is_acquisition() {
+        None
+    } else {
+        Some(f.skeleton_npc()?)
+    };
+    let mut last_npc = skeleton.map(|(_, position)| position);
     let mut npc_native_seen = false;
     let mut remote_identity = None;
+    let mut controller_exit = None;
     save(
         &case.join("recovery.json"),
-        &json!({"container_id":f.target()?,"container_started_at":f.container_started_at,"scope":"Missing finalization is unknown, including SIGKILL/host loss. Verify ID/start before stopping only this owned container.","inspect_argv":[f.docker.path,"inspect",f.target()?],"stop_after_ownership_verification_argv":[f.docker.path,"stop","--time","2",f.target()?],"ordinary_disconnect_argv":[f.sdk.path,"disconnect",f.profile()]}),
+        &json!({"container_id":f.target()?,"container_started_at":f.container_started_at,"scope":"Missing finalization is unknown, including SIGKILL/host loss. Verify ID/start before stopping only this owned container.","inspect_argv":[f.docker.path,"inspect",f.target()?],"stop_after_ownership_verification_argv":[f.docker.path,"stop","--time","2",f.target()?],"ordinary_disconnect_argv":[f.sdk.path,"disconnect",f.host_profile()?]}),
     )?;
     save(
         &case.join("launch-intent.json"),
-        &json!({"fixture_sha256":hash,"player_uuid":f.player_uuid,"life_id":expected_life,"duration_secs":120,"utc_ms":utc_ms()?}),
+        &json!({"fixture_sha256":hash,"player_uuid":f.player_uuid,"life_id":expected_life,"duration_secs":f.duration_secs,"acquisition":f.is_acquisition(),"inner_child_secs":if f.is_acquisition(){1200}else{245},"outer_child_secs":if f.is_acquisition(){1210}else{255},"cleanup_budget_scope":"Finalization runs after the child deadline; this is not a deadline on the whole helper","utc_ms":utc_ms()?}),
     )?;
     let mut args = vec!["exec".into()];
     if let Some(ca) = &f.ca_file {
@@ -716,7 +763,11 @@ fn launch_inner(
         "timeout".into(),
         "--signal=TERM".into(),
         "--kill-after=5s".into(),
-        "245s".into(),
+        if f.is_acquisition() {
+            "1200s".into()
+        } else {
+            "245s".into()
+        },
         f.handler.clone(),
     ]);
     args.extend(f.handler_args.clone());
@@ -725,27 +776,74 @@ fn launch_inner(
         f,
         &f.docker,
         args,
-        255,
+        if f.is_acquisition() { 1210 } else { 255 },
         case,
         "handler",
         &mut |value| {
+            if f.is_acquisition() {
+                if !ready {
+                    // Bind the actual pinned remote executable, not a PID asserted
+                    // by model output. No marker is injected into a frozen arm.
+                    remote_identity = Some(remote::bind(control, f, case)?);
+                    let observed = fresh(control, f, case, "acquisition-go-native")?;
+                    ensure(
+                        observed["player"]["uuid"] == f.player_uuid
+                            && observed["player"]["life_id"] == expected_life
+                            && observed["player"]["health"]
+                                .as_f64()
+                                .is_some_and(|h| h.is_finite() && h > 0.),
+                        "acquisition startup lost the live staged actor/life",
+                    )?;
+                    let unchanged_start = validate_player(f, &observed, true).is_ok();
+                    save(
+                        &case.join("acquisition-go.json"),
+                        &json!({
+                            "player_uuid":f.player_uuid,"life_id":expected_life,"observation":observed,
+                            "first_handler_event":value["event"],"utc_ms":utc_ms()?,
+                            "declared_start_conditions_still_match":unchanged_start,
+                            "scope":"Full native query after the first host-visible handler JSON. It may follow startup activity; not an exact Brain start timestamp or a time/weather match certificate.",
+                            "body_enabled_in_pinned_config":true,"npc_operations":false,
+                            "kit_score":"External retained table/pickaxe and saved-state verification required"
+                        }),
+                    )?;
+                    ready = true;
+                }
+                if value["event"] == "brain_started" {
+                    ensure(
+                        value["data"]["uuid"] == f.player_uuid
+                            && value["data"]["instance"] == f.instance_id,
+                        "acquisition Brain startup identity differs",
+                    )?;
+                    save(&case.join("acquisition-brain-started.json"), value)?;
+                }
+                if value["event"] == "controller_exit" {
+                    ensure(
+                        controller_exit.is_none(),
+                        "duplicate acquisition controller exit",
+                    )?;
+                    controller_exit = value["data"]["disconnected"].as_bool();
+                    save(&case.join("acquisition-controller-exit.json"), value)?;
+                }
+                return Ok(());
+            }
+            let (npc_uuid, npc_position) = skeleton.ok_or("declared skeleton absent")?;
             if let Some(entities) = value["data"]["observation"]["world"]["entities"].as_array()
                 && let Some(enemy) = entities
                     .iter()
-                    .find(|e| e["uuid"] == f.npc_uuid && e["type"] == "minecraft:skeleton")
+                    .find(|e| e["uuid"] == npc_uuid && e["type"] == "minecraft:skeleton")
                 && let Some(p) = enemy["position"].as_array().filter(|p| p.len() == 3)
                 && let Some(p) = p
                     .iter()
                     .map(|v| v.as_f64().filter(|n| n.is_finite()))
                     .collect::<Option<Vec<f64>>>()
             {
-                last_npc = [p[0], p[1], p[2]];
+                last_npc = Some([p[0], p[1], p[2]]);
                 npc_native_seen = true;
             }
             if value["event"] == "body_probe_ready" {
                 ensure(!ready, "duplicate READY")?;
                 ensure(
-                    value["data"]["entity_uuid"] == f.npc_uuid,
+                    value["data"]["entity_uuid"] == npc_uuid,
                     "READY NPC identity differs",
                 )?;
                 validate_player(f, &value["data"]["observation"], true)?;
@@ -766,10 +864,10 @@ fn launch_inner(
                         client,
                         rcon::Command::GuardedSummonSkeleton {
                             actor: rcon::EntityUuid::parse(&f.player_uuid)?,
-                            npc: rcon::EntityUuid::parse(&f.npc_uuid)?,
+                            npc: rcon::EntityUuid::parse(npc_uuid)?,
                             actor_origin: f.expected_player_position,
                             tolerance: f.position_tolerance,
-                            npc_position: f.expected_npc_position,
+                            npc_position,
                         },
                         case,
                         "summon-operator",
@@ -788,7 +886,7 @@ fn launch_inner(
             }
             if value["event"] == "body_probe_stimulus_admitted" {
                 ensure(
-                    ready && !admitted && value["data"]["entity_uuid"] == f.npc_uuid,
+                    ready && !admitted && value["data"]["entity_uuid"] == npc_uuid,
                     "unexpected admission",
                 )?;
                 validate_player(f, &value["data"]["observation"], true)?;
@@ -834,13 +932,18 @@ fn launch_inner(
     })()
     .unwrap_or(false);
     let session_cleared = native_actor_absent && sync_session(f, true).is_ok();
-    let _ = save(
-        &case.join("last-known-npc.json"),
-        &json!({"npc_uuid":f.npc_uuid,"position":last_npc,"native_seen":npc_native_seen,"fallback_scope":"Declared spawn position if no native NPC snapshot was recorded; does not prove absence outside bounded ring"}),
-    );
+    if let Some(position) = last_npc {
+        let _ = save(
+            &case.join("last-known-npc.json"),
+            &json!({"npc_uuid":f.npc_uuid,"position":position,"native_seen":npc_native_seen,"fallback_scope":"Declared spawn position if no native NPC snapshot was recorded; does not prove absence outside bounded ring"}),
+        );
+    }
     let mut cleanup_complete = !summon_attempted && !admitted;
-    if summon_attempted && let Ok(Some(mut client)) = rcon_with_timeout(f, Duration::from_secs(1)) {
-        cleanup_complete = cleanup::run(&mut client, f, case, last_npc).is_ok();
+    if summon_attempted
+        && let Some(position) = last_npc
+        && let Ok(Some(mut client)) = rcon_with_timeout(f, Duration::from_secs(1))
+    {
+        cleanup_complete = cleanup::run(&mut client, f, case, position).is_ok();
     }
     let handler_ok = result.as_ref().is_ok_and(|o| o.success);
     let closed = disconnected
@@ -857,11 +960,12 @@ fn launch_inner(
         // the idle owned container/tmpfs for recovery, rather than losing source.
     } else if !stop_attempted {
         stop_attempted = true;
+        let _ = remote::archive(control, f, case, 3, false);
         container_stopped = remote::stop(control, f, case).unwrap_or(false);
     }
     save(
         &case.join("launch-result.json"),
-        &json!({"ready_native_verified":ready,"admitted_native_verified":admitted,"handler_exit_success":handler_ok,"owned_remote_handler_gone":remote_closed,"owned_container_stop_attempted":stop_attempted,"owned_container_stopped":container_stopped,"sdk_disconnect_acknowledged":closed,"sdk_disconnected":closed,"native_actor_absent":native_actor_absent,"archive_complete":archive_complete,"idle_container_preserved_for_archive_recovery":remote_closed && native_actor_absent && !archive_complete && !container_stopped,"artifact_hashes_unchanged":post_hash.is_ok(),"owned_npc_cleanup_attempted":summon_attempted,"cleanup_complete":cleanup_complete,"saved_state_evidence":"Pending independent before/after projection capture; entity absence does not prove saved health/deaths/inventory","certifies_goal_completion":false,"original_errors_retained":true}),
+        &json!({"acquisition":f.is_acquisition(),"ready_native_verified":ready,"stimulus_admission_required":!f.is_acquisition(),"admitted_native_verified":admitted,"handler_exit_success":handler_ok,"acquisition_controller_disconnect_ack":controller_exit,"owned_remote_handler_gone":remote_closed,"owned_container_stop_attempted":stop_attempted,"owned_container_stopped":container_stopped,"sdk_disconnect_acknowledged":closed,"sdk_disconnected":closed,"native_actor_absent":native_actor_absent,"archive_complete":archive_complete,"idle_container_preserved_for_archive_recovery":remote_closed && native_actor_absent && !archive_complete && !container_stopped,"artifact_hashes_unchanged":post_hash.is_ok(),"owned_npc_cleanup_attempted":summon_attempted,"cleanup_complete":cleanup_complete,"saved_state_evidence":"Pending independent before/after projection capture; entity absence does not prove saved health/deaths/inventory","kit_score":"External retained crafting table and wooden pickaxe required; no score awarded here","certifies_goal_completion":false,"original_errors_retained":true}),
     )?;
     ensure(
         handler_ok
@@ -871,11 +975,15 @@ fn launch_inner(
             && session_cleared
             && archive_complete
             && ready
-            && admitted
+            && (f.is_acquisition() || admitted)
             && post_hash.is_ok()
             && cleanup_complete,
         "launch failed/incomplete; retained outputs are not a PASS",
     )
 }
+#[cfg(test)]
+mod acquisition_config_tests;
+#[cfg(test)]
+mod acquisition_lifecycle_tests;
 #[cfg(test)]
 mod tests;
