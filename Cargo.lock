@@ -785,6 +785,7 @@ dependencies = [
 name = "minecraft-sdk-evidence"
 version = "0.1.0-alpha.6"
 dependencies = [
+ "flate2",
  "libc",
  "minecraft-sdk-core",
  "rusqlite",
