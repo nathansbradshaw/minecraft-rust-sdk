@@ -322,8 +322,9 @@ After a definite native trajectory refusal, movement instead requires fresh
 native options for that escape episode; hazards do not authorize another blind
 geometric guess. A ready page with zero usable options may follow its advancing
 cursor while incomplete, up to four ready pages of eight requested candidates
-per physical search. Reads retain 500 ms spacing, the 750 ms deadline and one
-busy-readiness retry. Continuations require the exact first origin, scene and
+per physical search. Ready-page continuations retain 500 ms spacing and the
+750 ms deadline. One busy-readiness retry instead honors the existing clamped
+25–5000 ms server hint. Continuations require the exact first origin, scene and
 pinned target; they stop at the first usable options, complete result, malformed
 or stale page, or exhausted budget. The existing single changed-threat hint
 refresh cannot refund these read budgets. Observations and independent defense
