@@ -428,6 +428,86 @@ fn conversation_prompt(path: Option<&Path>) -> Result<String> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn routine_and_development_requests_explain_lua_shapes_and_preserve_native_lives() {
+        // Exercise the actual request path without a reference read or any
+        // live provider/actor. Same UUID/entity/health can belong to a new life.
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move {
+            for (provider, purpose, life) in [
+                ("gpt-6-luna", "plan", json!("fixture-life-a")),
+                ("gpt-6.1-sol", "develop", json!("fixture-life-b")),
+                ("gpt-6-luna", "plan", Value::Null),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                assert_eq!(request["model"], provider);
+                assert_eq!(request["purpose"], purpose);
+                assert_eq!(request["messages"][0]["role"], "system");
+                let prompt = request["messages"][0]["content"].as_str().unwrap();
+                for contract in [
+                    "observation.world.auditory.recent_emissions",
+                    "ctx.observation.world.auditory.events",
+                    "unknown, not silence",
+                    "dropped loss metadata",
+                    "observation.player.life_id",
+                    "original life",
+                ] {
+                    assert!(
+                        prompt.contains(contract),
+                        "always-delivered contract: {contract}"
+                    );
+                }
+                let context: Value =
+                    serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
+                        .unwrap();
+                assert!(context.get("sdk_reference").is_none());
+                let player = &context["observation"]["player"];
+                assert_eq!(player["uuid"], "fixture-player");
+                assert_eq!(player["entity_id"], 7);
+                assert_eq!(player["health"], 20.);
+                assert_eq!(player["life_id"], life);
+                let choice = json!({"tool":"observe","input":"","path":"","summary":"Inspect","notes":"","experiment":false});
+                let reply =
+                    json!({"done":true,"message":{"content":choice.to_string()}}).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let model = Model {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint,
+        };
+        let mut observation = minecraft_sdk::Observation {
+            revision: "synthetic-life-transition".into(),
+            player: json!({"uuid":"fixture-player","entity_id":7,"health":20.}),
+            world: json!({}),
+            menu: json!({}),
+        };
+        for (development, life) in [
+            (false, Some("fixture-life-a")),
+            (true, Some("fixture-life-b")),
+            (false, None),
+        ] {
+            if let Some(life) = life {
+                observation.player["life_id"] = json!(life);
+            } else {
+                observation
+                    .player
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("life_id");
+            }
+            let mut context = json!({"goal":"Record delivered cues","observation":crate::projection(&observation)});
+            crate::fit_context(&mut context).unwrap();
+            model
+                .choose_for(&context, development, development)
+                .await
+                .unwrap();
+        }
+        upstream.await.unwrap();
+    }
+    #[tokio::test]
     async fn accepted_usage_attests_the_exact_final_context_without_changing_the_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
