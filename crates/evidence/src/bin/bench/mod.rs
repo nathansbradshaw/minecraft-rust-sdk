@@ -10,6 +10,7 @@ use std::{
 };
 mod capture;
 mod cleanup;
+mod closure;
 mod config;
 mod io;
 mod process;
@@ -833,7 +834,27 @@ fn launch_inner(
         Ok(reply.text.trim() == "No entity was found")
     })()
     .unwrap_or(false);
-    let session_cleared = native_actor_absent && sync_session(f, true).is_ok();
+    let acknowledged = disconnected
+        .as_ref()
+        .is_ok_and(|v| v["disconnected"] == true);
+    // SessionRequired alone is also returned for stale tokens. Only an
+    // reviewed authoritative journal snapshot showing no row (including connecting),
+    // plus independently absent native actor and closed handler, can substitute
+    // for an API acknowledgement. Never repeat the disconnect mutation.
+    let gateway_absent = !acknowledged
+        && remote_closed
+        && native_actor_absent
+        && closure::gateway_absent(f, case).unwrap_or(false);
+    let closed = acknowledged || gateway_absent;
+    let session_cleared = native_actor_absent && closed && sync_session(f, true).is_ok();
+    save(
+        &case.join("disconnect-closure.json"),
+        &json!({"api_acknowledged":acknowledged,
+        "native_actor_absent":native_actor_absent,"owned_remote_handler_gone":remote_closed,
+        "gateway_session_absent":gateway_absent,"already_disconnected_observed":gateway_absent,
+        "session_sync_cleared":session_cleared,"disconnect_replayed":false,
+        "scope":"Separate scoped gateway/native closure snapshots; no continuous admission fence or survival claim"}),
+    )?;
     let _ = save(
         &case.join("last-known-npc.json"),
         &json!({"npc_uuid":f.npc_uuid,"position":last_npc,"native_seen":npc_native_seen,"fallback_scope":"Declared spawn position if no native NPC snapshot was recorded; does not prove absence outside bounded ring"}),
@@ -843,9 +864,6 @@ fn launch_inner(
         cleanup_complete = cleanup::run(&mut client, f, case, last_npc).is_ok();
     }
     let handler_ok = result.as_ref().is_ok_and(|o| o.success);
-    let closed = disconnected
-        .as_ref()
-        .is_ok_and(|v| v["disconnected"] == true);
     let mut archive_complete = false;
     if remote_closed && native_actor_absent {
         archive_complete = remote::archive(control, f, case, 45, true).unwrap_or(false);
@@ -861,10 +879,11 @@ fn launch_inner(
     }
     save(
         &case.join("launch-result.json"),
-        &json!({"ready_native_verified":ready,"admitted_native_verified":admitted,"handler_exit_success":handler_ok,"owned_remote_handler_gone":remote_closed,"owned_container_stop_attempted":stop_attempted,"owned_container_stopped":container_stopped,"sdk_disconnect_acknowledged":closed,"sdk_disconnected":closed,"native_actor_absent":native_actor_absent,"archive_complete":archive_complete,"idle_container_preserved_for_archive_recovery":remote_closed && native_actor_absent && !archive_complete && !container_stopped,"artifact_hashes_unchanged":post_hash.is_ok(),"owned_npc_cleanup_attempted":summon_attempted,"cleanup_complete":cleanup_complete,"saved_state_evidence":"Pending independent before/after projection capture; entity absence does not prove saved health/deaths/inventory","certifies_goal_completion":false,"original_errors_retained":true}),
+        &json!({"ready_native_verified":ready,"admitted_native_verified":admitted,"handler_exit_success":handler_ok,"owned_remote_handler_gone":remote_closed,"owned_container_stop_attempted":stop_attempted,"owned_container_stopped":container_stopped,"sdk_disconnect_acknowledged":acknowledged,"sdk_disconnected":acknowledged,"gateway_session_absent":gateway_absent,"already_closed_verified":gateway_absent && container_stopped,"lifecycle_closed_verified":closed && native_actor_absent && remote_closed && container_stopped && session_cleared,"native_actor_absent":native_actor_absent,"archive_complete":archive_complete,"idle_container_preserved_for_archive_recovery":remote_closed && native_actor_absent && !archive_complete && !container_stopped,"artifact_hashes_unchanged":post_hash.is_ok(),"owned_npc_cleanup_attempted":summon_attempted,"cleanup_complete":cleanup_complete,"saved_state_evidence":"Pending independent before/after projection capture; entity absence does not prove saved health/deaths/inventory","certifies_goal_completion":false,"original_errors_retained":true}),
     )?;
     ensure(
         handler_ok
+            && closed
             && remote_closed
             && container_stopped
             && native_actor_absent
