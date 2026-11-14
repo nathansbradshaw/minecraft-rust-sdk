@@ -25,6 +25,28 @@ fn stat(pid: u32) -> io::Result<u64> {
         .map_err(|_| invalid("invalid process start time"))
 }
 pub(super) fn inspect(expected: &Path) -> io::Result<serde_json::Value> {
+    inspect_with_inventory(expected, || {
+        let mut pids = Vec::new();
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            if let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            {
+                pids.push(pid);
+                if pids.len() > 64 {
+                    return Err(invalid("process witness inventory exceeds64PIDs"));
+                }
+            }
+        }
+        Ok(pids)
+    })
+}
+fn inspect_with_inventory(
+    expected: &Path,
+    inventory: impl FnOnce() -> io::Result<Vec<u32>>,
+) -> io::Result<serde_json::Value> {
     let started = Instant::now();
     if !expected.is_absolute() {
         return Err(invalid("absolute executable required"));
@@ -55,19 +77,9 @@ pub(super) fn inspect(expected: &Path) -> io::Result<serde_json::Value> {
         }
         hash.update(&buffer[..n]);
     }
-    let mut pids = Vec::new();
-    for entry in fs::read_dir("/proc")? {
-        let entry = entry?;
-        if let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        {
-            pids.push(pid);
-            if pids.len() > 64 {
-                return Err(invalid("process witness inventory exceeds64PIDs"));
-            }
-        }
+    let mut pids = inventory()?;
+    if pids.len() > 64 {
+        return Err(invalid("process witness inventory exceeds64PIDs"));
     }
     pids.sort_unstable();
     let uid = unsafe { libc::geteuid() };
@@ -136,13 +148,17 @@ mod tests {
     #[test]
     fn current_executable_matches_real_pid_and_start_without_command_line_data() {
         let expected = std::env::current_exe().unwrap();
-        let value = inspect(&expected).unwrap();
+        // Exercise real /proc metadata for this process without assuming the
+        // CI host is a disposable container with at most64 processes.
+        let value = inspect_with_inventory(&expected, || Ok(vec![std::process::id()])).unwrap();
         assert_eq!(value["complete"], true);
-        assert!(value["matches"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["pid"] == std::process::id()));
+        assert!(
+            value["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["pid"] == std::process::id())
+        );
         assert!(value["executable"]["sha256"].as_str().unwrap().len() == 64);
         assert!(!value.to_string().contains("cmdline"));
     }
@@ -151,5 +167,13 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         fs::write(file.path(), b"private fixture data").unwrap();
         assert!(inspect(file.path()).is_err());
+    }
+    #[test]
+    fn oversized_inventory_is_rejected_before_matching() {
+        let error = inspect_with_inventory(&std::env::current_exe().unwrap(), || {
+            Ok(vec![std::process::id(); 65])
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds64PIDs"));
     }
 }
