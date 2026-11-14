@@ -32,8 +32,9 @@ pub(super) fn native_with_space(
             "combined capture needs2GB evidence headroom above500GB reserve",
         )?;
         ensure(
-            trace.with_extension("status.json").is_file(),
-            "combined capture requires original complete-stream status",
+            trace.with_extension("status.json").is_file()
+                && trace.with_extension("stderr").is_file(),
+            "combined capture requires original stdout, stderr and complete-stream status",
         )?;
     }
     let trace_bytes = read(trace, f.trace_bytes_limit())?;
@@ -124,10 +125,13 @@ pub(super) fn native_with_space(
     let bot: String = tx.query_row("SELECT id FROM bots WHERE uuid=?1", [&f.player_uuid], |r| {
         r.get(0)
     })?;
-    let actor_total: i64 =
+    let actor_total: i64 = if f.is_combined() {
         tx.query_row("SELECT count(*) FROM actions WHERE bot=?1", [&bot], |r| {
             r.get(0)
-        })?;
+        })?
+    } else {
+        0
+    };
     if f.is_combined() {
         let baseline = json(
             &trace
@@ -229,6 +233,7 @@ pub(super) fn native_with_space(
     )?;
     let mut files = Vec::new();
     let mut handler_streams = Vec::new();
+    let mut stderr_sha256 = None;
     for (extension, name, limit) in [
         ("stderr", "source-stderr.log", f.trace_bytes_limit()),
         ("status.json", "source-status.json", 16384),
@@ -236,11 +241,22 @@ pub(super) fn native_with_space(
         let path = trace.with_extension(extension);
         if path.exists() {
             let bytes = read(&path, limit)?;
+            if extension == "stderr" {
+                stderr_sha256 = Some(sha256(&bytes));
+            }
             if f.is_combined() && extension == "status.json" {
                 let status: Value = serde_json::from_slice(&bytes)?;
                 ensure(
                     status["output_limit_exceeded"] == false,
                     "combined trace truncation or old unknown stream-limit status; evidence incomplete",
+                )?;
+                ensure(
+                    status["stdout_sha256"] == sha256(&trace_bytes)
+                        && status["stderr_sha256"]
+                            .as_str()
+                            .zip(stderr_sha256.as_deref())
+                            .is_some_and(|(a, b)| a == b),
+                    "combined original stream hashes differ from status; evidence incomplete",
                 )?;
             }
             ensure(

@@ -526,11 +526,18 @@ fn fake_launch_retains_fatal_tail_and_disconnects_without_pass() {
 }
 #[test]
 fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() {
-    for combined in [false, true] {
-        native_capture_scenario(combined);
+    native_capture_scenario(false, None);
+    for mismatch in [
+        None,
+        Some("stdout_sha256"),
+        Some("stderr_sha256"),
+        Some("missing_stderr"),
+        Some("missing_status"),
+    ] {
+        native_capture_scenario(true, mismatch);
     }
 }
-fn native_capture_scenario(combined: bool) {
+fn native_capture_scenario(combined: bool, mismatch: Option<&str>) {
     use minecraft_sdk_core::{Action, ActionRequest, Outcome, Receipt};
     use minecraft_sdk_evidence::{ExpectedAction, ResourceUsage, Spec};
     let mut s = setup();
@@ -591,11 +598,22 @@ fn native_capture_scenario(combined: bool) {
     trace.extend(b"Error: real fatal tail\n");
     let tracepath = s.case.join("input.log");
     write(&tracepath, &trace);
-    write(&s.case.join("input.stderr"), b"fatal stderr preserved");
-    write(
-        &s.case.join("input.status.json"),
-        b"{\"exit_code\":1,\"output_limit_exceeded\":false}",
-    );
+    let stderr = b"fatal stderr preserved";
+    write(&s.case.join("input.stderr"), stderr);
+    let mut status = json!({"exit_code":1,"output_limit_exceeded":false,"stdout_sha256":sha256(&trace),"stderr_sha256":sha256(stderr)});
+    if let Some(field) = mismatch {
+        if field == "missing_stderr" {
+            fs::remove_file(s.case.join("input.stderr")).unwrap();
+        } else if field != "missing_status" {
+            status[field] = json!("f".repeat(64));
+        }
+    }
+    if mismatch != Some("missing_status") {
+        write(
+            &s.case.join("input.status.json"),
+            &serde_json::to_vec(&status).unwrap(),
+        );
+    }
     let spec = Spec {
         run_id: "test-run".into(),
         goal: "retain failures".into(),
@@ -627,10 +645,16 @@ fn native_capture_scenario(combined: bool) {
     };
     let specpath = s.case.join("template.json");
     write(&specpath, &serde_json::to_vec(&spec).unwrap());
-    capture::native_with_space(&s.f, &s.case, &dbpath, &tracepath, &specpath, &[], || {
-        Ok(503_000_000_000)
-    })
-    .unwrap();
+    let captured =
+        capture::native_with_space(&s.f, &s.case, &dbpath, &tracepath, &specpath, &[], || {
+            Ok(503_000_000_000)
+        });
+    if mismatch.is_some() {
+        assert!(captured.is_err());
+        assert!(!s.case.join("capture-manifest.json").exists());
+        return;
+    }
+    captured.unwrap();
     let manifest = json(&s.case.join("capture-manifest.json"), 65536).unwrap();
     assert_eq!(manifest["all_original_actions"], 131);
     assert_eq!(

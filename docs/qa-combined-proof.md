@@ -73,6 +73,11 @@ evidence. Keep the entire authoritative journal and partial private files for
 bounded recovery; never discard outcomes, trim a failed arm into a passing one,
 or replace original failed evidence.
 
+Complete combined capture requires the original stdout, stderr and status sidecars.
+The status must explicitly report no stream overflow and its stdout/stderr hashes
+must match the exact supplied files. A stale status cannot authenticate a replaced
+or truncated trace; missing or mismatched sidecars remain incomplete.
+
 Next: review this source and its caps, obtain the shared compiler lease, run the
 focused and required checks, build/repin the changed body-probe and operator, then
 obtain the owning chat's live trial allocation. No activation is authorized by
