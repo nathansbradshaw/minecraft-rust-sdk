@@ -99,8 +99,13 @@ last native NPC position (or declared spawn position if no later snapshot exists
 It queries existing force-load state and adds only chunks confirmed previously
 unforced. It requires a positive exact skeleton location, a confirmed typed kill
 and subsequent absence before claiming that NPC removed. It releases only loads
-confirmed added by this run; preexisting loads remain unchanged. Ambiguous
-responses, an NPC outside the loaded ring, uncertain chunk operations or failed
+confirmed added by this run; preexisting loads remain unchanged.
+After one confirmed kill, cleanup permits a two-second read-only settlement
+polling window for the normal death animation, with100ms polling plus at most
+one in-flight read under the existing one-second command deadline. This is not
+a hard two-second end-to-end deadline. It never repeats the kill. Absence must still
+be confirmed; expiry remains incomplete and owned chunk releases are attempted.
+Ambiguous responses, an NPC outside the loaded ring, uncertain chunk operations or failed
 release leave cleanup **INCOMPLETE** and the CLI nonzero, with an ownership ledger.
 There is no expanding search. Without RCON, manual cleanup remains a pending
 operator handoff and launch cannot claim complete closure. Inspect shutdown and
@@ -213,6 +218,14 @@ owned container if closure remains unknown. Before emergency stop it attempts a
 three-second nonquiescent archive, explicitly incomplete. Normal closure uses
 existing `bot-dev capture` for an untouched compressed tar of workspace and the
 distinct pinned config `state` path, preserving path hierarchy and runtime journals.
+Exact pinned ELF inputs are retained separately as mode600 byte copies with
+verified hashes (64MiB total budget). Only current container paths independently
+verified as matching regular files are then excluded by anchored literal paths.
+Changed files, symlinks and replacement directories remain in the source capture.
+Source, config, admission and runtime journals stay in the compressed
+snapshot. The existing8MiB log limit is unchanged; overflowing snapshots remain
+incomplete and preserve the idle container for recovery. Copying inputs must
+retain500GB free on the operator host.
 This is a bounded file snapshot before final container stop; the old handler's
 exit and actor absence do not establish that remaining descendants have stopped
 writing. The archive explicitly records that limit, and the final container stop

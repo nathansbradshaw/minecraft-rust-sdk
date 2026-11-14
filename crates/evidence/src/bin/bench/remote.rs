@@ -221,6 +221,136 @@ pub fn stop(runner: &mut dyn Runner, f: &Fixture, case: &Path) -> Result<bool> {
     );
     Ok(!snapshot(runner, f, case, "stop-container-after")?)
 }
+const PINNED_BINARY_BUDGET: u64 = 64 * 1024 * 1024;
+fn retain_binary_inputs(f: &Fixture, case: &Path) -> Result<Vec<Value>> {
+    retain_binary_inputs_with_space(f, case, || free_bytes(case))
+}
+fn retain_binary_inputs_with_space(
+    f: &Fixture,
+    case: &Path,
+    mut available: impl FnMut() -> Result<u64>,
+) -> Result<Vec<Value>> {
+    let state = f.state_path()?;
+    let root = case.join("pinned-binary-inputs");
+    let mut records = Vec::new();
+    let mut total = 0_u64;
+    for artifact in &f.artifacts {
+        let path = Path::new(&artifact.container_path);
+        if !path.starts_with(&f.container_workspace) && !path.starts_with(&state) {
+            continue;
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut input = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&artifact.file.path)?;
+        let mut magic = [0; 4];
+        if let Err(error) = input.read_exact(&mut magic) {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if magic != *b"\x7fELF" {
+            continue;
+        }
+        artifact.file.verify()?;
+        let size = input.metadata()?.len();
+        ensure(
+            size <= PINNED_BINARY_BUDGET.saturating_sub(total),
+            "pinned binary input budget exceeded",
+        )?;
+        ensure(
+            available()? >= 500_000_000_000 + size,
+            "preserve500GB while retaining pinned binary inputs",
+        )?;
+        if records.is_empty() {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&root)?;
+        }
+        let relative = format!("pinned-binary-inputs/{}.elf", records.len());
+        let retained = case.join(&relative);
+        let mut output = create(&retained)?;
+        output.write_all(&magic)?;
+        let copied = std::io::copy(
+            &mut std::io::Read::by_ref(&mut input).take(size - 4),
+            &mut output,
+        )? + 4;
+        output.sync_all()?;
+        let mut trailing = [0];
+        ensure(
+            copied == size
+                && input.read(&mut trailing)? == 0
+                && input.metadata()?.len() == size
+                && hash_file(&retained)? == artifact.file.sha256,
+            "retained pinned binary differs; do not exclude it from source capture",
+        )?;
+        total += copied;
+        records.push(
+            json!({"container_path":artifact.container_path,"retained_file":relative,
+            "sha256":artifact.file.sha256,"bytes":copied}),
+        );
+    }
+    Ok(records)
+}
+fn container_matches_binary(
+    runner: &mut dyn Runner,
+    f: &Fixture,
+    case: &Path,
+    binary: &Value,
+    index: usize,
+) -> Result<bool> {
+    let path = binary["container_path"]
+        .as_str()
+        .ok_or("binary path absent")?;
+    let metadata = tool(
+        runner,
+        f,
+        vec![
+            "exec".into(),
+            f.target()?.into(),
+            "stat".into(),
+            "-c".into(),
+            "%f".into(),
+            "--".into(),
+            path.into(),
+        ],
+    )?;
+    let mode = std::str::from_utf8(&metadata.stdout)
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim(), 16).ok());
+    let regular = metadata.success && mode.is_some_and(|mode| mode & 0o170000 == 0o100000);
+    let mut digest = None;
+    if regular {
+        let hashed = tool(
+            runner,
+            f,
+            vec![
+                "exec".into(),
+                f.target()?.into(),
+                "sha256sum".into(),
+                "--".into(),
+                path.into(),
+            ],
+        )?;
+        if hashed.success {
+            digest = std::str::from_utf8(&hashed.stdout)
+                .ok()
+                .and_then(|s| s.split_whitespace().next())
+                .filter(|s| valid_hash(s, 64))
+                .map(str::to_owned);
+        }
+    }
+    let matches = regular && digest.as_deref() == binary["sha256"].as_str();
+    save(
+        &case.join(format!("archive-binary-{index}-container-witness.json")),
+        &json!({
+            "container_path":path,"mode":mode,"sha256":digest,"matches_retained_input":matches,
+            "scope":"Current regular-file/hash witness, not continuous immutability or descendant quiescence"
+        }),
+    )?;
+    Ok(matches)
+}
 pub fn archive(
     runner: &mut dyn Runner,
     f: &Fixture,
@@ -232,6 +362,31 @@ pub fn archive(
         snapshot(runner, f, case, "archive-container-before")?,
         "archive requires matching running owned container",
     )?;
+    // Executable inputs already have frozen hashes. Retain verified byte copies
+    // separately, so they cannot consume the source/runtime compressed-log cap.
+    let binary_inputs = match retain_binary_inputs(f, case) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            let _ = save(
+                &case.join("archive-input-selection-failed.json"),
+                &json!({"complete":false,"error":error.to_string(),"pinned_binary_budget_bytes":PINNED_BINARY_BUDGET,"compressed_log_budget_bytes":8388608}),
+            );
+            return Err(error);
+        }
+    };
+    let mut exclusions = Vec::new();
+    for (index, binary) in binary_inputs.iter().enumerate() {
+        // Host originals do not stand in for modified container bytes. Only a
+        // current regular-file/hash match authorizes this exact path exclusion.
+        if container_matches_binary(runner, f, case, binary, index).unwrap_or(false) {
+            exclusions.push(
+                binary["container_path"]
+                    .as_str()
+                    .ok_or("binary path absent")?
+                    .to_owned(),
+            );
+        }
+    }
     let bot = f.bot_dev.as_ref().ok_or("pinned bot-dev unavailable")?;
     let archive = case.join("workspace-archive");
     let mut args = vec![
@@ -264,6 +419,11 @@ pub fn archive(
     if let Some(name) = &f.model_key_name {
         args.push(format!("--exclude={name}"));
     }
+    args.extend(["--anchored".into(), "--no-wildcards".into()]);
+    for path in &exclusions {
+        args.push(format!("--exclude={}", path.trim_start_matches('/')));
+    }
+    args.extend(["--no-anchored".into(), "--wildcards".into()]);
     args.extend([
         "-czf".into(),
         "-".into(),
@@ -299,7 +459,7 @@ pub fn archive(
     let complete = complete && bytes.starts_with(&[0x1f, 0x8b]) && handler_and_actor_closed;
     save(
         &case.join("workspace-archive.json"),
-        &json!({"complete":complete,"compressed_tar_file":"workspace-archive/stdout.log","sha256":sha256(&bytes),"bytes":bytes.len(),"handler_and_actor_closure_verified":handler_and_actor_closed,"descendant_quiescence_verified":false,"secret_mount_outside_workspace":true,"credential_file_patterns_excluded":true,"arbitrary_embedded_content_certified_keyfree":false,"scope":"Existing bot-dev preserves a bounded selected-file snapshot before final container stop, not final writes of remaining descendants. Operator must verify content before publication; compressed bytes are not text-scrubbed."}),
+        &json!({"complete":complete,"compressed_tar_file":"workspace-archive/stdout.log","sha256":sha256(&bytes),"bytes":bytes.len(),"pinned_binary_inputs":binary_inputs,"excluded_verified_container_paths":exclusions,"pinned_binary_budget_bytes":PINNED_BINARY_BUDGET,"compressed_log_budget_bytes":8388608,"handler_and_actor_closure_verified":handler_and_actor_closed,"descendant_quiescence_verified":false,"secret_mount_outside_workspace":true,"credential_file_patterns_excluded":true,"arbitrary_embedded_content_certified_keyfree":false,"scope":"Pinned ELF inputs are retained as separately bounded verified byte copies. Only current matching regular container files are excluded by exact path; changed inputs remain in the snapshot and may exceed its unchanged cap. This is not final writes of remaining descendants or continuous immutability. Operator must verify content before publication; compressed bytes are not text-scrubbed."}),
     )?;
     Ok(complete)
 }
@@ -437,5 +597,99 @@ mod tests {
             json(&s.case.join("stop-container-before.json"), 1024).unwrap()["old"],
             true
         );
+    }
+    #[test]
+    fn pinned_elf_inputs_are_retained_separately_without_removing_source_or_journals() {
+        let mut s = super::super::tests::setup();
+        let payload = b"\x7fELF\0\xfffixture-pinned-controller";
+        fs::write(&s.f.artifacts[0].file.path, payload).unwrap();
+        s.f.artifacts[0].file.sha256 = sha256(payload);
+        let source = s.f.workspace.join("program.rs");
+        fs::write(&source, b"fn main() { /* preserve */ }").unwrap();
+        let records = retain_binary_inputs_with_space(&s.f, &s.case, || {
+            Ok(500_000_000_000 + PINNED_BINARY_BUDGET)
+        })
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["container_path"], s.f.handler);
+        let copied = s.case.join(records[0]["retained_file"].as_str().unwrap());
+        assert_eq!(fs::read(copied).unwrap(), payload);
+        assert_eq!(records[0]["sha256"], sha256(payload));
+        assert_eq!(fs::read(source).unwrap(), b"fn main() { /* preserve */ }");
+        assert!(s.f.artifacts[1].file.path.is_file());
+        assert!(s.f.artifacts[2].file.path.is_file());
+    }
+    #[test]
+    fn changed_binary_or_disk_reserve_cannot_be_silently_excluded() {
+        let mut s = super::super::tests::setup();
+        let payload = b"\x7fELFfixture";
+        fs::write(&s.f.artifacts[0].file.path, payload).unwrap();
+        assert!(retain_binary_inputs_with_space(&s.f, &s.case, || Ok(u64::MAX)).is_err());
+        assert!(!s.case.join("pinned-binary-inputs").exists());
+        s.f.artifacts[0].file.sha256 = sha256(payload);
+        assert!(retain_binary_inputs_with_space(&s.f, &s.case, || Ok(500_000_000_000)).is_err());
+        assert!(!s.case.join("pinned-binary-inputs").exists());
+    }
+    #[test]
+    fn container_changed_or_replaced_pinned_path_is_not_excluded() {
+        struct Witness {
+            mode: &'static str,
+            digest: String,
+            hash_reads: usize,
+        }
+        impl Runner for Witness {
+            fn run(
+                &mut self,
+                _: &Path,
+                args: &[String],
+                _: u64,
+                _: &Secrets,
+                _: &mut dyn FnMut(&Value) -> Result<()>,
+            ) -> Result<process::Output> {
+                let text = match args.get(2).map(String::as_str) {
+                    Some("stat") => self.mode.to_owned(),
+                    Some("sha256sum") => {
+                        self.hash_reads += 1;
+                        self.digest.clone()
+                    }
+                    _ => panic!("unexpected witness operation"),
+                };
+                Ok(process::Output {
+                    stdout: text.into_bytes(),
+                    stderr: vec![],
+                    success: true,
+                    timed_out: false,
+                    exit_code: Some(0),
+                    signal: None,
+                    interrupted: false,
+                })
+            }
+        }
+        for (mode, changed, expected) in [
+            ("8180", false, true),
+            ("8180", true, false),
+            ("41ed", false, false),
+            ("a1ff", false, false),
+        ] {
+            let s = super::super::tests::setup();
+            s.f.artifacts[0].file.verify().unwrap(); // Host original remains valid.
+            let binary =
+                json!({"container_path":s.f.handler,"sha256":s.f.artifacts[0].file.sha256});
+            let digest = if changed {
+                "f".repeat(64)
+            } else {
+                s.f.artifacts[0].file.sha256.clone()
+            };
+            let mut witness = Witness {
+                mode,
+                digest,
+                hash_reads: 0,
+            };
+            assert_eq!(
+                container_matches_binary(&mut witness, &s.f, &s.case, &binary, 0).unwrap(),
+                expected
+            );
+            assert_eq!(witness.hash_reads, usize::from(mode == "8180"));
+        }
     }
 }
