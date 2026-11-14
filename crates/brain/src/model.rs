@@ -1,9 +1,11 @@
 use crate::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1/provider-investigation-v1/canonical-menu-questions-v1/opt-in-acquisition-v1/serialized-wire-budget-v1";
+pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1/provider-investigation-v1/canonical-menu-questions-v1/opt-in-acquisition-v1/serialized-wire-budget-v1/task-lineage-v1";
 mod active_source;
 mod context_attestation;
+#[cfg(test)]
+mod conversation_refinement_tests;
 pub(crate) mod provider_investigation;
 mod repair;
 mod wire;
@@ -250,6 +252,7 @@ pub struct Model {
 #[serde(rename_all = "snake_case")]
 pub enum GoalAction {
     Continue,
+    Refine,
     Replace,
 }
 #[derive(Debug, Deserialize, Serialize)]
@@ -336,7 +339,7 @@ impl Model {
     pub async fn converse(&self, context: &Value) -> Result<(Conversation, Value)> {
         let path = std::env::var_os("MC_SDK_CONVERSATION_PROMPT");
         let prompt = conversation_prompt(path.as_deref().map(Path::new))?;
-        let format = json!({"type":"object","properties":{"message":{"type":"string","maxLength":256},"goal_action":{"type":"string","enum":["continue","replace"]},"goal":{"type":"string","maxLength":2048},"reason":{"type":"string","maxLength":512}},"required":["message","goal_action","goal","reason"],"additionalProperties":false});
+        let format = json!({"type":"object","properties":{"message":{"type":"string","maxLength":256},"goal_action":{"type":"string","enum":["continue","refine","replace"]},"goal":{"type":"string","maxLength":2048},"reason":{"type":"string","maxLength":512}},"required":["message","goal_action","goal","reason"],"additionalProperties":false});
         let (content, usage) = self
             .request(context, "gpt-6-luna", "plan", format, &prompt, 1024)
             .await?;
@@ -675,7 +678,7 @@ mod tests {
         };
         crate::tools::execute(&mut brain, &choice).await.unwrap();
         let mut context = json!({"goal":brain.goal,"working_notes":"A later inspection note",
-            "completion_requirements":crate::completion::view(&brain.cfg,&brain.goal),
+            "completion_requirements":crate::completion::view(&brain.journal,&brain.cfg,&brain.goal).unwrap(),
             "observation":{"menu":{"menu_id":1,"state_id":7,"type":"minecraft:crafting"}},
             "last_tool_result":{"result":{"after":{"menu":{"menu_id":1,"state_id":1,"type":"minecraft:crafting"}}}},
             "memory":vec![json!({"text":"noise".repeat(3000)});20],

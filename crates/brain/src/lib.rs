@@ -205,7 +205,7 @@ impl Journal {
         data: Value,
         player_request: Option<&str>,
     ) -> Result<i64> {
-        self.select_goal_checked(goal, kind, data, player_request, None)?
+        self.select_goal_checked(goal, kind, data, player_request, None, false)?
             .ok_or_else(|| "Unconditional goal selection failed".into())
     }
     /// Explicit configured work needs the same durable scope as player tasks.
@@ -232,6 +232,7 @@ impl Journal {
         data: Value,
         player_request: Option<&str>,
         expected_revision: Option<&str>,
+        retain_task: bool,
     ) -> Result<Option<i64>> {
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
@@ -258,9 +259,13 @@ impl Journal {
                     |r| r.get(0),
                 )
                 .optional()?;
-            // A repeated description of active work is continuation. A new
-            // request for the same completed objective still creates a task.
-            if current_goal.as_deref() == Some(goal) && completed.as_deref() != Some(expected) {
+            // Refinement is not a request to repeat already completed work.
+            if retain_task && completed.as_deref() == Some(expected) {
+                return Ok(None);
+            }
+            // Continue/refine are not new work. Explicit replace starts a new
+            // task even if its wording happens to match an earlier objective.
+            if retain_task && current_goal.as_deref() == Some(goal) {
                 return Ok(None);
             }
         }
@@ -269,9 +274,46 @@ impl Journal {
             params![now(), kind, data.to_string()],
         )?;
         let id = tx.last_insert_rowid();
+        let task_revision = if retain_task {
+            tx.query_row(
+                "SELECT value FROM meta WHERE key='task_revision'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .or(tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key='goal_revision'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| id.to_string())
+        } else {
+            id.to_string()
+        };
+        let task_goal = if retain_task {
+            tx.query_row(
+                "SELECT value FROM meta WHERE key='task_origin_goal'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .or(tx
+                .query_row("SELECT value FROM meta WHERE key='goal'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?)
+            .unwrap_or_else(|| goal.to_owned())
+        } else {
+            goal.to_owned()
+        };
         for (key, value) in [
             ("goal", goal),
             ("goal_revision", &id.to_string()),
+            ("task_revision", task_revision.as_str()),
+            ("task_origin_goal", task_goal.as_str()),
             ("completed_goal", ""),
             ("completed_revision", ""),
             ("inspection_streak", "0"),
@@ -298,13 +340,23 @@ impl Journal {
         if reply.goal_action == model::GoalAction::Continue || reply.goal.trim().is_empty() {
             return Ok(false);
         }
+        let refine = reply.goal_action == model::GoalAction::Refine;
+        let player = messages.as_array().is_some_and(|rows| {
+            !rows.is_empty()
+                && rows.iter().all(|m| {
+                    m["kind"] == "player"
+                        && m["sender_uuid"].as_str().is_some_and(|s| !s.is_empty())
+                })
+        });
+        let request = messages.to_string();
         Ok(self
             .select_goal_checked(
                 &reply.goal,
-                "player_goal_selected",
-                json!({"goal":reply.goal,"reason":reply.reason,"messages":messages}),
-                Some(&messages.to_string()),
+                if refine {"conversation_goal_refined"} else if player {"player_goal_selected"} else {"conversation_goal_selected"},
+                json!({"goal":reply.goal,"reason":reply.reason,"messages":messages,"task_relationship":if refine{"retain"}else{"new"},"player_attribution_verified":player}),
+                if refine {None} else if player {Some(request.as_str())} else {Some("")},
                 Some(expected_revision),
+                refine,
             )?
             .is_some())
     }
@@ -1344,7 +1396,11 @@ impl Brain {
             });
             context["deployment_instructions"] = json!(self.cfg.instructions);
             context["project_manifest"] = workspace::manifest_hint(&self.cfg.workspace);
-            context["completion_requirements"] = completion::view(&self.cfg, &self.goal);
+            context["completion_requirements"] =
+                completion::view(&self.journal, &self.cfg, &self.goal)?;
+            if context["completion_requirements"]["superseded"] == true {
+                continue; // A concurrent conversation update is ordinary rescheduling.
+            }
             goal_plan::supply(&self.journal, &mut context);
             context["decision_worker"] = json!({"enabled":self.cfg.decision_worker.is_some(),"protocol":1,"activate":"replace_worker with a compiled Rust executable path; current decision/tool settles first; body and native connection stay resident"});
             context["inspected_containers"] = self
@@ -2493,7 +2549,7 @@ mod tests {
             .unwrap();
         let messages = json!([{"kind":"system","message":"peer joined the game"}]);
         // Defensive handling also covers a model filling goal while saying continue.
-        for action in [model::GoalAction::Continue, model::GoalAction::Replace] {
+        for action in [model::GoalAction::Continue, model::GoalAction::Refine] {
             assert!(
                 !j.conversation_goal(&conversation(action, "collect wood"), &revision, &messages)
                     .unwrap()
@@ -2537,7 +2593,10 @@ mod tests {
             j.get("goal_revision").unwrap().as_deref(),
             Some(revision.as_str())
         );
-        assert_eq!(j.get("player_request").unwrap(), Some(request.to_string()));
+        assert_eq!(j.get("player_request").unwrap(), Some(String::new()));
+        let evidence = j.history("please collect another log").unwrap();
+        assert_eq!(evidence[0]["event"], "conversation_goal_selected");
+        assert_eq!(evidence[0]["data"]["messages"], request);
     }
     #[test]
     fn delayed_conversation_cannot_replace_newer_work_from_another_connection() {

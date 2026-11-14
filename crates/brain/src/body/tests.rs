@@ -1358,6 +1358,7 @@ async fn controller_projectile_scenario(
     );
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
+    let (closed, mut controller_ended) = tokio::sync::oneshot::channel();
     let mut upstream = tokio::spawn(async move {
         let mut blocks = Vec::new();
         for x in -4..=4 {
@@ -1378,7 +1379,10 @@ async fn controller_projectile_scenario(
         let mut observation_reads = 0;
         let mut move_attempts = 0;
         loop {
-            let (mut socket, _) = http.accept().await.unwrap();
+            let (mut socket, _) = tokio::select! {
+                connection=http.accept()=>connection.unwrap(),
+                _=&mut controller_ended=>break,
+            };
             let mut header = Vec::new();
             while !header.ends_with(b"\r\n\r\n") {
                 header.push(socket.read_u8().await.unwrap());
@@ -1493,7 +1497,8 @@ async fn controller_projectile_scenario(
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             if finished {
                 stopped.store(true, Ordering::Release);
-                break;
+                // Finish serving this real controller cycle: a cooldown-ready
+                // defensive attack may follow the final movement/cancellation.
             }
         }
         actions
@@ -1531,6 +1536,7 @@ async fn controller_projectile_scenario(
         ),
     )
     .await;
+    let _ = closed.send(());
     let joined = tokio::time::timeout(Duration::from_secs(1), &mut upstream).await;
     if joined.is_err() {
         upstream.abort();
@@ -1547,7 +1553,23 @@ async fn controller_projectile_scenario(
             2
         );
     } else {
-        assert!(matches!(actions.last(), Some(Action::CancelControl { .. })));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::CancelControl { .. }))
+                .count(),
+            1
+        );
+        let cancelled = actions
+            .iter()
+            .position(|a| matches!(a, Action::CancelControl { .. }))
+            .unwrap();
+        assert!(
+            actions[cancelled + 1..]
+                .iter()
+                .all(|a| matches!(a, Action::Attack { entity: 9 })),
+            "only cooldown defense may follow cancellation; never start another movement"
+        );
     }
 }
 #[tokio::test]

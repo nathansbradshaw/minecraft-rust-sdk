@@ -422,7 +422,12 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
             let crate::completion::Status::Succeeded = claim.status;
             let claimed_goal = brain.goal.clone();
             brain.refresh().await?;
-            let checks = crate::completion::verify(&brain.cfg, &claimed_goal, &brain.observed)?;
+            let checks = crate::completion::verify(
+                &brain.journal,
+                &brain.cfg,
+                &claimed_goal,
+                &brain.observed,
+            )?;
             brain.journal.event("model_completion_claim",json!({"goal":claimed_goal,"claim":choice.input,"observed":crate::projection(&brain.observed),"externally_verified":false}))?;
             Ok(
                 json!({"recorded":"model claim","summary":claim.summary,"configured_checks":checks,"native_observation":crate::projection(&brain.observed),"benchmark_pass_granted":false}),

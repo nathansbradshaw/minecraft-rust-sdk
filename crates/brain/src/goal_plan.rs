@@ -342,7 +342,9 @@ mod tests {
         let view = view(&brain.journal, &brain.goal).unwrap();
         assert_eq!(view["native_evidence"], false);
         assert_eq!(view["completion_credit"], false);
-        assert!(completion::verify(&brain.cfg, &brain.goal, &brain.observed).is_err());
+        assert!(
+            completion::verify(&brain.journal, &brain.cfg, &brain.goal, &brain.observed).is_err()
+        );
         let claim = crate::model::Choice {
             tool: "complete".into(),
             input: json!({"status":"succeeded","summary":"The plan says to finish"}).to_string(),
@@ -375,7 +377,7 @@ mod tests {
         server.await.unwrap();
         assert!(!brain.journal.goal_completed(&brain.goal).unwrap());
         assert_eq!(
-            completion::view(&brain.cfg, &brain.goal)["evaluation_phase"],
+            completion::view(&brain.journal, &brain.cfg, &brain.goal).unwrap()["evaluation_phase"],
             "final_success_claim_only"
         );
     }
@@ -436,7 +438,7 @@ mod tests {
         let expected = view(&brain.journal, &brain.goal).unwrap();
         let saved = brain.journal.get(KEY).unwrap();
         for gap in [512, 1] {
-            let mut frame = json!({"goal":brain.goal,"completion_requirements":completion::view(&brain.cfg,&brain.goal),
+            let mut frame = json!({"goal":brain.goal,"completion_requirements":completion::view(&brain.journal,&brain.cfg,&brain.goal).unwrap(),
                 "mandatory_fixture":""});
             crate::fit_context(&mut frame).unwrap();
             let pad = 32768 - gap - serde_json::to_vec(&frame).unwrap().len();
