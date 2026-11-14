@@ -1878,7 +1878,7 @@ async fn controller_cover_occlusion_lease_starts_after_original_input_is_release
     assert_ne!(endpoint, final_point, "fixture needs remaining work");
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
-    let upstream = tokio::spawn(async move {
+    let mut upstream = tokio::spawn(async move {
         let mut phase = 0usize;
         let mut original = None::<String>;
         let mut reads = 0;
@@ -1983,7 +1983,11 @@ async fn controller_cover_occlusion_lease_starts_after_original_input_is_release
     )
     .await;
     stop.store(true, Ordering::Release);
-    upstream.await.unwrap();
+    let joined = tokio::time::timeout(Duration::from_secs(1), &mut upstream).await;
+    if joined.is_err() {
+        upstream.abort();
+    }
+    joined.expect("bounded HTTP fixture shutdown").unwrap();
     result.unwrap().unwrap();
     let events = journal.history("original_action_id").unwrap();
     let events = events.as_array().unwrap();
