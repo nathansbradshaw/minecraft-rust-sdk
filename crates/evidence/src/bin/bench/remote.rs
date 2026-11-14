@@ -102,40 +102,101 @@ fn start(runner: &mut dyn Runner, f: &Fixture, pid: u32) -> Result<u64> {
         .parse()?)
 }
 pub fn bind(runner: &mut dyn Runner, f: &Fixture, case: &Path) -> Result<Identity> {
+    let started = Instant::now();
+    let result = bind_witness(runner, f, case);
+    if let Err(error) = &result {
+        let secrets = f.secrets()?;
+        let message = secrets.scrub(error.to_string().as_bytes());
+        save(
+            &case.join("remote-bind-failed.json"),
+            &json!({
+                "complete":false,"error":String::from_utf8_lossy(&message),
+                "elapsed_ms":started.elapsed().as_millis(),"scope":"READY process ownership binding; no admission or gameplay credit"
+            }),
+        )?;
+    }
+    result
+}
+fn bind_witness(runner: &mut dyn Runner, f: &Fixture, case: &Path) -> Result<Identity> {
     ensure(
         snapshot(runner, f, case, "ready-container-identity")?,
         "container stopped before READY",
     )?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut found = None;
-    for pid in pids(runner, f)? {
-        ensure(Instant::now() < deadline, "PID binding deadline exceeded")?;
-        let out = tool(
-            runner,
-            f,
-            vec![
-                "exec".into(),
-                f.target()?.into(),
-                "readlink".into(),
-                format!("/proc/{pid}/exe"),
-            ],
-        )?;
-        if out.success && std::str::from_utf8(&out.stdout)?.trim() == f.handler {
-            let identity = Identity {
-                pid,
-                start: start(runner, f, pid)?,
-            };
-            ensure(
-                found.is_none(),
-                "multiple matching handlers; ownership ambiguous",
-            )?;
-            found = Some(identity);
-        }
-    }
-    let identity = found.ok_or("exact handler PID not found")?;
+    let helper = f
+        .runtime_check
+        .as_ref()
+        .ok_or("pinned runtime helper absent")?;
+    ensure(
+        f.artifacts.iter().any(|a| &a.container_path == helper),
+        "runtime helper is not a frozen artifact",
+    )?;
+    let handler = f
+        .artifacts
+        .iter()
+        .find(|a| a.container_path == f.handler)
+        .ok_or("frozen handler artifact absent")?;
+    let out = tool_with_timeout(
+        runner,
+        f,
+        vec![
+            "exec".into(),
+            f.target()?.into(),
+            helper.clone(),
+            "process-witness".into(),
+            f.handler.clone(),
+        ],
+        10,
+    )?;
+    let secrets = f.secrets()?;
+    ensure(
+        out.stdout.len() <= 65536,
+        "process witness output exceeds bound",
+    )?;
+    let bytes = secrets.scrub(&out.stdout);
+    let parsed = serde_json::from_slice::<Value>(&bytes);
+    save(
+        &case.join("ready-process-witness.json"),
+        &json!({"success":out.success,"timed_out":out.timed_out,"exit_code":out.exit_code,"signal":out.signal,"witness":parsed.as_ref().ok(),"stdout":String::from_utf8_lossy(&bytes),"stderr":String::from_utf8_lossy(&secrets.scrub(&out.stderr[..out.stderr.len().min(16384)]))}),
+    )?;
+    let witness = parsed?;
+    ensure(
+        out.success && !out.timed_out,
+        "process witness command failed; see ready-process-witness.json",
+    )?;
+    ensure(
+        witness["format"] == "minecraft-runtime-process-witness-v1" && witness["complete"] == true,
+        "process witness incomplete or unsupported",
+    )?;
+    ensure(
+        witness["executable"]["path"] == f.handler
+            && witness["executable"]["sha256"] == handler.file.sha256,
+        "process witness executable path/hash differs from frozen handler",
+    )?;
+    let matches = witness["matches"]
+        .as_array()
+        .ok_or("process witness matches absent")?;
+    ensure(matches.len() == 1, "exact handler PID absent or ambiguous")?;
+    let matched = &matches[0];
+    ensure(
+        matched["exe_path"] == f.handler
+            && matched["uid"].is_u64()
+            && matched["uid"] == witness["uid"],
+        "process witness executable/UID differs",
+    )?;
+    let identity = Identity {
+        pid: matched["pid"]
+            .as_u64()
+            .and_then(|p| u32::try_from(p).ok())
+            .filter(|p| *p > 0)
+            .ok_or("process witness PID invalid")?,
+        start: matched["start_jiffies"]
+            .as_u64()
+            .filter(|s| *s > 0)
+            .ok_or("process witness start time invalid")?,
+    };
     save(
         &case.join("owned-remote-handler.json"),
-        &json!({"container_id":f.target()?,"container_started_at":f.container_started_at,"pid":identity.pid,"start_jiffies":identity.start,"reviewed_executable_match":true,"scope":"Container-scoped /proc identity; no argv/environment retained"}),
+        &json!({"container_id":f.target()?,"container_started_at":f.container_started_at,"pid":identity.pid,"start_jiffies":identity.start,"reviewed_executable_match":true,"executable":witness["executable"],"scope":"Same-UID container /proc device/inode/hash identity snapshot; no argv/environment retained"}),
     )?;
     Ok(identity)
 }
@@ -471,6 +532,10 @@ mod tests {
         container: String,
         started: String,
         handler: String,
+        handler_sha: String,
+        witness_calls: usize,
+        witness_complete: bool,
+        witness_matches: usize,
         running: bool,
         pid_present: bool,
         start: u64,
@@ -497,6 +562,14 @@ mod tests {
                     self.container.clone()
                 }
                 Some("exec") => match args.get(2).map(String::as_str) {
+                    Some("/workspace/mc-sdk-runtime-check") => {
+                        self.witness_calls += 1;
+                        assert_eq!(&args[3..], &["process-witness", self.handler.as_str()]);
+                        let matches: Vec<_> = (0..self.witness_matches).map(|i| json!({"pid":10+i,"start_jiffies":self.start,"exe_path":self.handler,"uid":501})).collect();
+                        json!({"format":"minecraft-runtime-process-witness-v1","complete":self.witness_complete,"uid":501,
+                            "executable":{"path":self.handler,"sha256":self.handler_sha,"device":1,"inode":2},
+                            "matches":matches,"processes":(1..=64).map(|pid|json!({"pid":pid,"status":"other_executable_or_uid"})).collect::<Vec<_>>()}).to_string()
+                    }
                     Some("ps") => if self.pid_present {
                         "1\n10\n11\n"
                     } else {
@@ -532,6 +605,7 @@ mod tests {
                 exit_code: Some(0),
                 signal: None,
                 interrupted: false,
+                callback_error: None,
             })
         }
     }
@@ -540,6 +614,10 @@ mod tests {
             container: f.target().unwrap().into(),
             started: f.container_started_at.clone().unwrap(),
             handler: f.handler.clone(),
+            handler_sha: f.artifacts[0].file.sha256.clone(),
+            witness_calls: 0,
+            witness_complete: true,
+            witness_matches: 1,
             running: true,
             pid_present: true,
             start: 42,
@@ -553,8 +631,31 @@ mod tests {
         let mut c = fake(&s.f);
         let id = bind(&mut c, &s.f, &s.case).unwrap();
         assert_eq!((id.pid, id.start), (10, 42));
+        assert_eq!(c.witness_calls, 1);
         assert!(close(&mut c, &s.f, &s.case, Some(id)).unwrap());
         assert_eq!(c.kills, vec!["10"]);
+    }
+    #[test]
+    fn incomplete_ambiguous_or_changed_executable_witness_is_retained_and_rejected() {
+        for failure in 0..4 {
+            let s = super::super::tests::setup();
+            let mut c = fake(&s.f);
+            match failure {
+                0 => c.witness_complete = false,
+                1 => c.witness_matches = 2,
+                2 => c.handler_sha = "f".repeat(64),
+                _ => c.witness_matches = 0,
+            }
+            let error = bind(&mut c, &s.f, &s.case).err().unwrap().to_string();
+            assert_eq!(c.witness_calls, 1);
+            assert!(s.case.join("ready-process-witness.json").is_file());
+            assert!(!s.case.join("owned-remote-handler.json").exists());
+            assert_eq!(
+                json(&s.case.join("remote-bind-failed.json"), 4096).unwrap()["error"],
+                error
+            );
+            assert!(c.kills.is_empty());
+        }
     }
     #[test]
     fn reused_pid_is_never_signalled_and_old_handler_is_gone() {
@@ -662,6 +763,7 @@ mod tests {
                     exit_code: Some(0),
                     signal: None,
                     interrupted: false,
+                    callback_error: None,
                 })
             }
         }
