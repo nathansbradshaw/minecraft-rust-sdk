@@ -42,8 +42,9 @@ impl Runner for Host {
             out.stdout = secrets.scrub(&out.stdout);
             for line in out.stdout.split(|b| *b == b'\n') {
                 if let Ok(value) = serde_json::from_slice(line)
-                    && on_line(&value).is_err()
+                    && let Err(error) = on_line(&value)
                 {
+                    out.callback_error = Some(error.to_string().chars().take(1024).collect());
                     out.success = false;
                     break;
                 }
@@ -125,6 +126,12 @@ impl Runner for Control {
                 summary.to_string()
             },
             Some("exec")=>match args.get(2).map(String::as_str) {
+                Some("/workspace/mc-sdk-runtime-check")=>{
+                    assert_eq!(&args[3..], &["process-witness", self.handler.as_str()]);
+                    json!({"format":"minecraft-runtime-process-witness-v1","complete":true,"uid":501,
+                        "executable":{"path":self.handler,"sha256":self.artifact_hashes.get(&self.handler).ok_or("unmocked handler hash")?,"device":1,"inode":2},
+                        "matches":[{"pid":10,"start_jiffies":42,"exe_path":self.handler,"uid":501}],"processes":[{"pid":10,"status":"matched"}]}).to_string()
+                },
                 Some("ps")=>if !self.finished.load(Ordering::SeqCst) || (self.remote_survives && !self.interrupted) {"1\n10\n11\n"}else{"1\n11\n"}.into(),
                 Some("readlink")=>if args[3]=="/proc/10/exe" {self.handler.clone()}else{"/usr/bin/mock-helper".into()},
                 Some("cat")=>{let mut fields=vec!["S".to_owned();20];fields[19]="42".into();format!("10 (mock-brain) {}",fields.join(" "))},
@@ -336,7 +343,7 @@ fn acquisition_brain_first_json_binds_fresh_go_and_closes_without_npc_or_kit_cre
     assert!(
         control.commands[..query]
             .iter()
-            .any(|a| a.iter().any(|v| v == "/proc/10/stat"))
+            .any(|a| a.iter().any(|v| v == "process-witness"))
     );
     let go = json(&setup.case.join("acquisition-go.json"), 1024 * 1024).unwrap();
     assert_eq!(go["first_handler_event"], "brain_started");
