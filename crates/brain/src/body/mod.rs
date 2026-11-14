@@ -1,5 +1,6 @@
 //! Replaceable container-local safety behavior, independent of model/terminal work.
 mod aerial;
+mod cover_handoff;
 pub mod decision;
 pub mod geometry;
 mod hearing;
@@ -700,6 +701,7 @@ async fn controller(
     let mut retreat_progress = recovery::Progress::default();
     let mut native_escape = recovery::Discovery::default();
     let mut native_required = recovery::Required::default();
+    let mut cover_handoff = cover_handoff::Handoff::default();
     let mut last_meal = None;
     let mut owned_meal: Option<(String, tactics::Meal)> = None;
     loop {
@@ -920,20 +922,33 @@ async fn controller(
         // immediately restores the fast route without waiting for the query.
         let awaiting_native =
             (require_native || (discover && native_escape.waiting())) && admitted.is_empty();
+        let continuation = cover_handoff.propose(
+            &policy_observed,
+            &owned_control,
+            urgent || require_native || discover,
+            &rejected_routes,
+            finite_waypoint_axis,
+        );
+        if let Some((original, reason)) = cover_handoff.take_invalidation() {
+            j.event("body_cover_handoff_invalidated", json!({"original_action_id":original,"reason":reason,"revision":observed.revision,"replayed":false}))?;
+        }
+        let continuing_cover = continuation.is_some();
         let escape = if active["outcome"] != "running" && !awaiting_native {
-            let defensive = geometry::evade_policy(
-                &policy_observed,
-                &rejected_routes,
-                &stationary_projectiles,
-                &trail,
-                finite_waypoint_axis,
-                &admitted,
-                cfg.experimental_ranged_boundary_turns,
-            );
-            defensive.or_else(|| {
-                owned_water_control
-                    .then(|| geometry::shore_after_breath(&policy_observed, &rejected_routes))
-                    .flatten()
+            continuation.or_else(|| {
+                let defensive = geometry::evade_policy(
+                    &policy_observed,
+                    &rejected_routes,
+                    &stationary_projectiles,
+                    &trail,
+                    finite_waypoint_axis,
+                    &admitted,
+                    cfg.experimental_ranged_boundary_turns,
+                );
+                defensive.or_else(|| {
+                    owned_water_control
+                        .then(|| geometry::shore_after_breath(&policy_observed, &rejected_routes))
+                        .flatten()
+                })
             })
         } else {
             None
@@ -1099,6 +1114,13 @@ async fn controller(
                             json!({"death_recorded":true,"world_reset":false}),
                         )?;
                     } else if let Some(route) = escape {
+                        if continuing_cover {
+                            let Some(original) = cover_handoff.consume() else {
+                                next_cycle(started, cfg.period_ms).await;
+                                continue;
+                            };
+                            j.event("body_cover_handoff_consumed",json!({"original_action_id":original,"revision":observed.revision,"target":route.target,"finite_max_ticks":60,"authority":"previously selected route, fresh terrain and ordinary native admission; no hidden cover safety","replayed":false}))?;
+                        }
                         let key =
                             geometry::target_key([route.target.x, route.target.y, route.target.z]);
                         *shared.reason.lock().map_err(|_| "Body state unavailable")? =
@@ -1121,6 +1143,7 @@ async fn controller(
                                     ranged
                                 });
                         let through = through_supported
+                            && !continuing_cover
                             && ranged_only
                             && !burning
                             && geometry::can_pass_waypoint(&observed, &route);
@@ -1161,7 +1184,7 @@ async fn controller(
                                 &client,
                                 j,
                                 Action::StartMove {
-                                    target: route.target,
+                                    target: route.target.clone(),
                                     jump: route.jump,
                                     max_ticks: 60,
                                 },
@@ -1180,6 +1203,7 @@ async fn controller(
                             }
                         }
                         if r.outcome == Outcome::Running {
+                            cover_handoff.record(&policy_observed, &route, &dispatched_id);
                             owned_control = dispatched_id.clone();
                             owned_water_shore =
                                 route.reason == "leave water for observed dry support";

@@ -3,6 +3,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 mod boundary;
 mod cover;
+pub(super) fn continue_cover(
+    o: &Observation,
+    remaining: &[[f64; 3]],
+    blocked: &[[i32; 3]],
+    axis: f64,
+) -> Option<Escape> {
+    cover::continue_route(o, remaining, blocked, axis)
+}
 type Cells<'a> = HashMap<[i32; 3], &'a Value>;
 
 pub fn point(v: &Value) -> Option<[f64; 3]> {
