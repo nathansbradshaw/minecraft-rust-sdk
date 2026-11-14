@@ -66,6 +66,21 @@ only while origin and scene match. A candidate may yield no waypoint, so an
 empty page does not imply completion. Smaller pages bound output, not a new
 movement capability or evidence that the goal is reachable.
 
+An explicit `target` orders candidate evaluation nearest that target, including
+when a distant target cannot itself be a local waypoint. Omitting it preserves
+nearest-player ordering. Responses label `ordering`; the target and ordering
+contract are bound to the scene, so changing them invalidates old page cursors.
+Ordering changes neither the local candidate bounds nor native collision,
+gravity, known-terrain, tick and action-admission checks. The body can pin its
+existing defensive choice as a first-prefix ordering preference after a native
+refusal. That hint is client behavior, not a guarantee of a longer safe route,
+a current hidden enemy position, or Survival performance.
+The hint stays pinned through an in-flight read and its bounded busy retry. A
+completed prefix gets at most one same-pose refresh if the existing close-threat
+rule rejects its old hint and current defensive behavior supplies a different
+one. Normal read spacing remains in force. This does not establish general
+liveness for repeated threat changes or an empty/unusable native prefix.
+
 The adapter excludes endpoints that necessarily intersect solid terrain before
 running trajectory search. The test accounts for arrival tolerance and keeps
 grazing contacts that might still admit a nearby legal pose. Diagnostic fields
