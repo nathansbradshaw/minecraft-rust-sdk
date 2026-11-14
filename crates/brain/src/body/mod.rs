@@ -901,9 +901,9 @@ async fn controller(
                 .flatten()
                 .any(|e| e["visible"] == true && geometry::primed_blast(e).is_some());
         let require_native = native_required.for_threat(&observed, threatened, water_emergency);
-        let discover = (require_native || (stalled && !urgent))
+        let discover = (require_native
+            || (stalled && !urgent && observed.player["on_ground"] == true))
             && threatened
-            && observed.player["on_ground"] == true
             && active["outcome"] != "running";
         let admitted = native_escape
             .tick(
@@ -1269,6 +1269,7 @@ async fn controller(
                 body_sprint = false;
             }
             shared.set_urgent(false);
+            native_required.episode_ended();
             owned_water_control = false;
             owned_water_shore = false;
             *shared.reason.lock().map_err(|_| "Body state unavailable")? =
