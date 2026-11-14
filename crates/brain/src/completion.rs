@@ -39,7 +39,18 @@ pub(crate) fn validate_config(cfg: &Config) -> Result<()> {
 }
 pub(crate) fn view(cfg: &Config, goal: &str) -> Value {
     let active = goal == cfg.goal && !cfg.completion_inventory.is_empty();
-    json!({"configured_goal":cfg.goal,"applies_to_current_goal":active,"inventory_minimum":if active {json!(cfg.completion_inventory)}else {json!({})},"scope":"Current retained player inventory only; menu output and carried stacks do not count. Optional client checks do not certify external benchmarks."})
+    json!({"configured_goal":cfg.goal,"applies_to_current_goal":active,
+        "inventory_minimum":if active {json!(cfg.completion_inventory)}else {json!({})},
+        "contract":contract(cfg),"evaluation_phase":"final_success_claim_only",
+        "intermediate_steps":"These are terminal postconditions, not prerequisites for each action. Temporary placement/use of a reusable resource, recipe inputs in a menu, or a cursor-held result can be legitimate incomplete progress. Preserve their dependencies; they still cannot satisfy the final retained-inventory check.",
+        "scope":"Current retained player inventory only for the success claim; menu output, placed resources and carried stacks do not count. Plans are model hypotheses, never completion evidence. Optional client checks do not certify external benchmarks."})
+}
+pub(crate) fn contract(cfg: &Config) -> String {
+    crate::digest(
+        json!([cfg.goal, cfg.completion_inventory])
+            .to_string()
+            .as_bytes(),
+    )
 }
 pub(crate) fn verify(cfg: &Config, goal: &str, observation: &Observation) -> Result<Value> {
     let mut checked = Vec::new();
@@ -70,11 +81,7 @@ pub(crate) fn bind(
     goal: &str,
     observed: &Observation,
 ) -> Result<()> {
-    let contract = crate::digest(
-        json!([cfg.goal, cfg.completion_inventory])
-            .to_string()
-            .as_bytes(),
-    );
+    let contract = contract(cfg);
     if journal.get("completion_inventory_contract")?.as_deref() == Some(&contract) {
         return Ok(());
     }

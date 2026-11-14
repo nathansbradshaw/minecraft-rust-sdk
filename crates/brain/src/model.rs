@@ -508,6 +508,83 @@ mod tests {
         upstream.await.unwrap();
     }
     #[tokio::test]
+    async fn active_plan_and_terminal_semantics_reach_actual_bounded_model_request_intact() {
+        // Controlled local HTTP responder, no live model or Minecraft. Exercise
+        // the real remember executor, context fitting and request serialization.
+        use tokio::io::AsyncWriteExt;
+        let (_root, mut brain) = crate::admission_tests::fixture("http://127.0.0.1:1/");
+        brain
+            .cfg
+            .completion_inventory
+            .insert("fixture:result".into(), 1);
+        brain
+            .journal
+            .select_goal(&brain.goal, "fixture", json!({}), None)
+            .unwrap();
+        crate::completion::bind(&brain.journal, &brain.cfg, &brain.goal, &brain.observed).unwrap();
+        let choice = Choice {
+            tool: "remember".into(),
+            input: json!({"kind":"plan",
+            "goal_revision":brain.journal.get("goal_revision").unwrap(),
+            "plan":{"next_step":"Use the recorded intermediate resource before final retention",
+            "dependencies":["Keep material for the remaining result"],
+            "resources":["Historical interaction reference; verify current facts"]}})
+            .to_string(),
+            path: String::new(),
+            summary: "Keep active plan".into(),
+            notes: String::new(),
+            experiment: false,
+        };
+        crate::tools::execute(&mut brain, &choice).await.unwrap();
+        let mut context = json!({"goal":brain.goal,"working_notes":"A later inspection note",
+            "completion_requirements":crate::completion::view(&brain.cfg,&brain.goal),
+            "observation":{"menu":{"menu_id":1,"state_id":7,"type":"minecraft:crafting"}},
+            "last_tool_result":{"result":{"after":{"menu":{"menu_id":1,"state_id":1,"type":"minecraft:crafting"}}}},
+            "memory":vec![json!({"text":"noise".repeat(3000)});20],
+            "recent":vec![json!({"text":"noise".repeat(3000)});20]});
+        crate::goal_plan::supply(&brain.journal, &mut context);
+        let expected = context["active_plan"].clone();
+        crate::fit_context(&mut context).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(
+                request["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("terminal postconditions")
+            );
+            let serialized = request["messages"][1]["content"].as_str().unwrap();
+            assert!(serialized.len() <= 32768);
+            let delivered: Value = serde_json::from_str(serialized).unwrap();
+            assert_eq!(delivered["active_plan"], expected);
+            assert_eq!(delivered["active_plan"]["native_evidence"], false);
+            assert_eq!(
+                delivered["completion_requirements"]["evaluation_phase"],
+                "final_success_claim_only"
+            );
+            let choice = json!({"tool":"report","input":"Fixture observed","path":"","summary":"Fixture report","notes":"","experiment":false});
+            let reply = json!({"done":true,"message":{"content":choice.to_string()}}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+        });
+        let model = Model {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint,
+        };
+        let (_, usage) = model.choose(&context, false).await.unwrap();
+        let attestation = &usage["context_attestation"];
+        assert_eq!(attestation["active_plan"]["complete_content"], true);
+        assert_eq!(
+            attestation["active_plan"]["actual_content_sha256"],
+            context["active_plan"]["content_sha256"]
+        );
+        assert_eq!(attestation["observation_menu"]["state_id"], 7);
+        assert_eq!(attestation["last_tool_after_menu"]["state_id"], 1);
+        upstream.await.unwrap();
+    }
+    #[tokio::test]
     async fn accepted_usage_attests_the_exact_final_context_without_changing_the_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

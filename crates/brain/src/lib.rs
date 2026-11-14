@@ -14,6 +14,7 @@ mod diagnostics;
 mod discovery;
 pub mod feedback;
 mod gameplay_failure;
+mod goal_plan;
 mod handoff;
 pub mod lua;
 pub mod memory;
@@ -1344,6 +1345,7 @@ impl Brain {
             context["deployment_instructions"] = json!(self.cfg.instructions);
             context["project_manifest"] = workspace::manifest_hint(&self.cfg.workspace);
             context["completion_requirements"] = completion::view(&self.cfg, &self.goal);
+            goal_plan::supply(&self.journal, &mut context);
             context["decision_worker"] = json!({"enabled":self.cfg.decision_worker.is_some(),"protocol":1,"activate":"replace_worker with a compiled Rust executable path; current decision/tool settles first; body and native connection stay resident"});
             context["inspected_containers"] = self
                 .journal
@@ -1900,6 +1902,9 @@ fn fit_context(context: &mut Value) -> Result<()> {
             "view":"bounded_historical_searches","original_bytes":bytes,
             "retained_in":"client search cache and original tool history"});
     }
+    // A saved plan is optional model intent. Preserve it whole when possible,
+    // but never let it prevent delivery of an otherwise usable native frame.
+    goal_plan::fit_optional(context)?;
     ensure(
         serde_json::to_vec(context)?.len() <= 32768,
         "Context budget exceeded",
@@ -1927,6 +1932,7 @@ pub fn replay_context(journal: &Journal, context: &mut Value) -> Result<Value> {
             .unwrap_or(Value::Null);
     }
     context["working_notes"] = json!(journal.get("working_notes")?);
+    goal_plan::supply(journal, context);
     context["compiler_feedback"] =
         journal.compiler_feedback(&journal.get("goal_revision")?.unwrap_or_default())?;
     let sizes = |v: &Value| -> Value {

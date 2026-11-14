@@ -244,7 +244,8 @@ Tools and input:
   remain in compiler_diagnostics. Output after build-finished retains its bytes
   before the ordinary bounded head/tail preview; preview_truncated labels omission.
   Full raw stdout/stderr and hashes remain in output_files for source repair.
-- remember: JSON {"kind":"fact|report|hypothesis|episode|skill","text":"..."}.
+- remember: JSON {"kind":"fact|report|hypothesis|episode|skill","text":"..."},
+  or the bounded goal-revision-scoped kind=plan record described above.
   Your notes remain agent-authored, even if named fact. Search matches related
   goal words and labelled historical observations; it does not require an exact
   phrase. Historical locations and claims require fresh observation. Never reuse
@@ -275,6 +276,22 @@ Tools and input:
   inventory. Missing requirements reject completion and keep the goal active.
   An explicit success claim without configured criteria is still only a model
   claim. Completion never certifies an external benchmark pass.
+  These are terminal postconditions, not prerequisites for every intermediate
+  action. Temporarily placing or using a resource can support unfinished work;
+  account for the remaining dependencies before consuming inputs or duplicating
+  a reusable resource solely because it is not currently retained.
+
+For multi-step work, keep an explicit active_plan through the existing remember
+tool: {"kind":"plan","goal_revision":"current goal_revision","plan":{
+"next_step":"current intended step","dependencies":["remaining prerequisite"],
+"resources":["resource to reuse or preserve, with its observation/action reference"]}}.
+Its complete content is retained across ordinary reads and working_notes changes;
+revise it deliberately when new evidence changes the work. The expected revision
+must match the actual active goal. A new goal or completion contract invalidates
+the current plan. Plans are model hypotheses, not observed facts, authority,
+permission or completion credit; recheck referenced world resources before use.
+No plan is required to think, chat or act. Ordinary remember kinds retain their
+existing {"kind":"fact|report|hypothesis|episode|skill","text":"..."} form.
 
 SDK controls available through sdk: look {yaw,pitch}; start_move {target:{x,y,z},
 jump:false,max_ticks:60}; cancel_control {action_id}; dig {block:{x,y,z},
