@@ -190,6 +190,15 @@ no-new-privileges, non-host/non-shared namespaces and positive limits of at most
 including read-only volumes, and checks an allowlist of environment **names**
 without returning their values. This checks these declared boundaries; it is not
 a general sandbox certification or an audit of every existing workspace file.
+The reviewed compiler-image names are explicitly allowed: `CARGO_HOME`,
+`CARGO_TARGET_DIR`, `CARGO_INCREMENTAL`, `CARGO_BUILD_JOBS`,
+`CARGO_PROFILE_DEV_DEBUG`, `MC_SDK_CA_CERT`, `MC_SDK_SOURCE`, `PATH`,
+`RUSTUP_HOME`, `RUST_VERSION`, `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER`,
+`CC_x86_64_unknown_linux_gnu`, `CXX_x86_64_unknown_linux_gnu`,
+`PKG_CONFIG_ALLOW_CROSS` and `PKG_CONFIG_LIBDIR`. This is an exact list, with no
+`CARGO_*` wildcard. Credential/account names such as `GITHUB_TOKEN`, `CODEX_HOME`
+and `CARGO_REGISTRIES_CRATES_IO_TOKEN` remain rejected. Mount/resource checks
+still apply to the same container.
 For task mode, supply the allocated model key/name and
 `allocated_model_kind:"operator-allocated-proxy"`; actor allocation metadata is
 optional operator context, not proof that a shared proxy key is actor-unique.

@@ -461,8 +461,20 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
                 "LC_ALL",
                 "LC_CTYPE",
                 "CARGO_HOME",
+                // Exact noncredential names used by the reviewed compiler image.
+                // Keep this explicit: CARGO_* also includes registry credentials.
+                "CARGO_TARGET_DIR",
+                "CARGO_INCREMENTAL",
+                "CARGO_BUILD_JOBS",
+                "CARGO_PROFILE_DEV_DEBUG",
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                "CC_x86_64_unknown_linux_gnu",
+                "CXX_x86_64_unknown_linux_gnu",
+                "PKG_CONFIG_ALLOW_CROSS",
+                "PKG_CONFIG_LIBDIR",
                 "RUSTUP_HOME",
                 "RUSTUP_TOOLCHAIN",
+                "RUST_VERSION",
                 "HTTP_PROXY",
                 "HTTPS_PROXY",
                 "ALL_PROXY",
@@ -474,6 +486,7 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
                 "SSL_CERT_FILE",
                 "SSL_CERT_DIR",
                 "MC_SDK_CA_CERT",
+                "MC_SDK_SOURCE",
             ]
             .contains(&name),
             "unreviewed container environment variable; no credential environment allowed",
