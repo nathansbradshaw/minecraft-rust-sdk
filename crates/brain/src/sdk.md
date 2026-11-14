@@ -284,6 +284,9 @@ action ID string), and `navigate` (SDK navigation Goal table). Action/query fiel
 match the JSON forms in this reference; use Lua tables, not JSON strings.
 SDK results retain `request`, `receipt`, and `after`; status returns a receipt.
 Observe returns a compact overview; `ctx.observation` retains the full snapshot.
+In particular, raw sounds are in `ctx.observation.world.auditory.events`.
+The compact model/observe view calls its limited sound list `recent_emissions`;
+that name is not the raw SDK field. See the Lua delivered sounds section below.
 
 Each step is a pure decision. Rust validates and executes its one operation.
 Scripts cannot directly call the network, filesystem or shell. Only saved JSON
@@ -308,3 +311,71 @@ The VM allows math/string/table/utf8 and ordinary base operations. Limits are
 instructions and a checked100ms computation deadline per step. Host operations
 use the separate tool timeout. No `os`, `io`, `package`, `debug`, `require`,
 dynamic code loading, `pcall`/`xpcall`, or coroutine library is exposed.
+
+- Lua delivered sounds (full auditory.events, not compact recent_emissions):
+
+### Capturing delivered sound facts
+
+This one-shot recorder saves at most eight recent delivered emissions. It does
+not run continuously while the model is thinking; the independent Rust body
+handles urgent protection. Run the script again for another snapshot, or return
+bounded commands from a behavior to keep sampling between its settled actions.
+
+```lua
+return {
+  version = 1,
+  step = function(ctx)
+    local observation = ctx.observation
+    local player = observation.player
+    local frame = observation.world.auditory
+    local hearing = { available = false }
+    if frame and frame.format == "minecraft-sdk-auditory-v1"
+        and type(frame.events) == "table" then
+      hearing = {
+        available = true,
+        epoch = frame.epoch,
+        listener_uuid = frame.listener_uuid,
+        dimension = frame.dimension,
+        sample_game_time = frame.sample_game_time,
+        latest_sequence = frame.latest_sequence,
+        retention_ticks = frame.retention_ticks,
+        dropped = frame.dropped,
+        retained_count = #frame.events,
+        omitted_count = math.max(0, #frame.events - 8),
+        events = {}
+      }
+      for i = math.max(1, #frame.events - 7), #frame.events do
+        hearing.events[#hearing.events + 1] = frame.events[i]
+      end
+    end
+    return {
+      state = {
+        player_uuid = player.uuid,
+        life_id = player.life_id,
+        dimension = player.dimension,
+        health = player.health,
+        observed_game_time = observation.world.game_time,
+        auditory = hearing
+      },
+      done = true
+    }
+  end
+}
+```
+
+Each event retains `sequence`, `sound_id`, `category`, `origin`, `game_time`,
+`volume`, `pitch`, `delivery`, `server_range`, and `distance_at_delivery`.
+`origin` is the delivered emission location, not an unseen entity's identity or
+current position. Do not invent a shooter or a current enemy path from a sound.
+`available=false` means the expected frame was unavailable, not silence.
+`dropped` reports server-reported cue loss; `omitted_count` reports this recorder's
+bound. Even an available empty frame only describes its retained time window.
+
+For repeated cue processing, retain an epoch/sequence cursor scoped to player,
+`life_id` and dimension; reset it when that scope changes. Process newer
+sequences once, check age using `sample_game_time` and event `game_time`, and
+retain loss/availability information. Lua state survives respawn and dimension
+changes within a task; old plans or health snapshots do not prove survival of
+the original life. Projectile motion is separate native evidence in
+`observation.world.entities`: inspect `projectile`, `position` and `velocity`
+when provided, instead of reducing every cue to an entity type or sound ID.

@@ -380,6 +380,115 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn documented_auditory_recorder_uses_full_native_events_and_reports_loss() {
+        // Synthetic schema-valid delivered facts: no live actor or hidden
+        // shooter identity is needed to reproduce the recorded compact/raw mismatch.
+        let events: Vec<_> = (1..=10)
+            .map(|sequence| {
+                json!({
+                    "sequence":sequence,"sound_id":"minecraft:entity.skeleton.shoot",
+                    "category":"minecraft:hostile","origin":[2.,64.,0.],
+                    "game_time":90+sequence,"volume":1.,"pitch":1.,
+                    "delivery":"position_sound","server_range":16.,"distance_at_delivery":2.
+                })
+            })
+            .collect();
+        let observation: minecraft_sdk::Observation = serde_json::from_value(json!({
+            "revision":"synthetic-lua-auditory-1",
+            "player":{"uuid":"fixture-listener","life_id":"fixture-life-a",
+                "dimension":"minecraft:overworld","position":[0.,64.,0.],"health":15.},
+            "world":{"game_time":100,"entities":[],"auditory":{
+                "format":"minecraft-sdk-auditory-v1","epoch":"fixture-auditory-a",
+                "listener_uuid":"fixture-listener","dimension":"minecraft:overworld",
+                "sample_game_time":100,"latest_sequence":10,"dropped":3,
+                "retention_ticks":200,"events":events,
+                "scope":"Synthetic delivered emissions, not current shooter positions"
+            }},"menu":{}
+        }))
+        .unwrap();
+        minecraft_sdk::auditory::frame(&observation).unwrap();
+        let index = crate::workspace::reference_index();
+        let section = index["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| {
+                section["title"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("- Lua delivered sounds")
+            })
+            .unwrap();
+        let page = crate::workspace::read(
+            Path::new("/does-not-exist"),
+            &json!({
+                "path":"sdk://reference","start_line":section["start_line"],
+                "end_line":section["end_line"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            page["range_complete"], true,
+            "model can retrieve the complete example"
+        );
+        let example = page["content"]
+            .as_str()
+            .unwrap()
+            .split_once("```lua\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        let answer = step(example, &json!({"state":{},"observation":observation})).unwrap();
+        assert!(answer.done && answer.command.is_none());
+        assert_eq!(answer.state["life_id"], "fixture-life-a");
+        assert_eq!(answer.state["health"], 15.);
+        let hearing = &answer.state["auditory"];
+        assert_eq!(hearing["available"], true);
+        for field in [
+            "epoch",
+            "listener_uuid",
+            "dimension",
+            "sample_game_time",
+            "latest_sequence",
+            "retention_ticks",
+            "dropped",
+        ] {
+            assert_eq!(
+                hearing[field], observation.world["auditory"][field],
+                "{field}"
+            );
+        }
+        assert_eq!(hearing["retained_count"], 10);
+        assert_eq!(hearing["omitted_count"], 2);
+        assert_eq!(hearing["events"], json!(&events[2..]));
+
+        // The model projection really does use a different field. Passing it
+        // to a raw-frame example must disclose unavailability, not fake silence.
+        let compact = crate::projection(&observation);
+        assert_eq!(
+            compact["world"]["auditory"]["recent_emissions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert!(compact["world"]["auditory"].get("events").is_none());
+        let mut missing = serde_json::to_value(&observation).unwrap();
+        missing["world"].as_object_mut().unwrap().remove("auditory");
+        for unavailable in [compact, missing] {
+            let result = step(
+                example,
+                &json!({"state":answer.state,"observation":unavailable}),
+            )
+            .unwrap();
+            assert_eq!(result.state["auditory"]["available"], false);
+            assert!(result.state["auditory"].get("events").is_none());
+        }
+    }
+    #[test]
     fn acquisition_resume_lua_navigation_shares_closed_brain_validation() {
         let goal = r#"{kind='position',dimension='fixture:world',target={1,1,1},distance=0.5}"#;
         let source = |input: &str| {
