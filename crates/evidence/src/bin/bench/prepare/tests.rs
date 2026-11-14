@@ -172,6 +172,7 @@ fn zero_player_contract_rejects_ambiguity_and_scope_paths_are_closed() {
 fn prepared() -> (super::super::tests::Setup, Spec) {
     let mut setup = super::super::tests::setup();
     let root = setup.case.parent().unwrap().to_path_buf();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     for name in ["server", "runtime", "snapshots"] {
         mkdir(&root.join(name)).unwrap();
     }

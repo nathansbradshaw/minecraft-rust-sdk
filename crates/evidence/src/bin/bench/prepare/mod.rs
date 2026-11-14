@@ -155,13 +155,17 @@ fn database(path: &Path, instance: &str) -> Result<()> {
     database_open(path, instance, false)
 }
 fn cold_database(path: &Path, instance: &str) -> Result<()> {
+    cold_sidecars(path)?;
+    database_open(path, instance, true)
+}
+fn cold_sidecars(path: &Path) -> Result<()> {
     for suffix in ["-wal", "-shm"] {
         ensure(
             !present(&PathBuf::from(format!("{}{}", path.display(), suffix)))?,
             "stopped database must be checkpointed and standalone before inspection",
         )?;
     }
-    database_open(path, instance, true)
+    Ok(())
 }
 fn database_open(path: &Path, instance: &str, immutable: bool) -> Result<()> {
     read(path, 64 * 1024 * 1024)?;
@@ -398,6 +402,7 @@ fn validate(s: &Spec, f: &Fixture) -> Result<Vec<PathBuf>> {
         beneath(&s.root, parent)?;
     }
     let db = s.root.join(&s.database.destination);
+    cold_sidecars(&db)?;
     if present(&db)? {
         cold_database(&db, &f.instance_id)?;
     }
