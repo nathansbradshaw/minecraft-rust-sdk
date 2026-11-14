@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     }
     let mode = args.get(1).and_then(|value| Mode::parse(value))
         .filter(|mode| mode.accepts_arity(args.len()))
-        .ok_or("body-probe PRIVATE_CONFIG.json blocked|compile|exposed|task|task-exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe PRIVATE_CONFIG.json shore SECONDS PRIVATE_SPEC.json | body-probe inspect-observation PRIVATE_OBSERVATION.json")?;
+        .ok_or("body-probe PRIVATE_CONFIG.json blocked|compile|exposed|task|task-exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json task-kit 1200 PRIVATE_STIMULUS.json | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe PRIVATE_CONFIG.json shore SECONDS PRIVATE_SPEC.json | body-probe inspect-observation PRIVATE_OBSERVATION.json")?;
     let seconds: u64 = args[2].parse()?;
     if !mode.accepts_seconds(seconds) {
         return Err(

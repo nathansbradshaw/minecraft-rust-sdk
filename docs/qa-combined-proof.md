@@ -1,6 +1,7 @@
 # Prepare one tools-and-threat episode
 
-Source preparation only. This mode has not been compiled, deployed or run.
+Native acceptance is pending. This mode has not been deployed or run. Local
+verification awaits the shared compiler lease; remote checks do not replace live proof.
 The existing120-second skeleton mode and1200-second no-NPC acquisition mode keep
 their contracts. Do not pool their results into a combined success.
 
