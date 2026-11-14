@@ -1,6 +1,14 @@
 use super::*;
 use serde::Deserialize;
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Skeleton,
+    Acquisition,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pinned {
@@ -23,10 +31,12 @@ pub struct OperatorRcon {
 #[serde(deny_unknown_fields)]
 pub struct Fixture {
     pub version: u32,
+    #[serde(default)]
+    pub mode: Mode,
     pub case_id: String,
     pub instance_id: String,
     pub player_uuid: String,
-    pub npc_uuid: String,
+    pub npc_uuid: Option<String>,
     pub connection_request_id: String,
     pub duration_secs: u64,
     pub source_revision: String,
@@ -54,7 +64,7 @@ pub struct Fixture {
     pub runtime_check: Option<String>,
     pub handler_args: Vec<String>,
     pub expected_player_position: [f64; 3],
-    pub expected_npc_position: [f64; 3],
+    pub expected_npc_position: Option<[f64; 3]>,
     pub position_tolerance: f64,
     pub expected_health: f64,
     pub expected_food: u64,
@@ -103,11 +113,40 @@ impl Fixture {
             .as_deref()
             .ok_or_else(|| "frozen owned container ID required".into())
     }
+    pub fn is_acquisition(&self) -> bool {
+        self.mode == Mode::Acquisition
+    }
+    pub fn config_path(&self) -> Result<&str> {
+        self.handler_args
+            .get(if self.is_acquisition() { 1 } else { 0 })
+            .map(String::as_str)
+            .ok_or_else(|| "config argument absent".into())
+    }
+    pub fn private_input_paths(&self) -> Result<Vec<&str>> {
+        let mut paths = vec![self.config_path()?];
+        if !self.is_acquisition() {
+            paths.push(
+                self.handler_args
+                    .get(3)
+                    .ok_or("admission argument absent")?,
+            );
+        }
+        Ok(paths)
+    }
+    pub fn skeleton_npc(&self) -> Result<(&str, [f64; 3])> {
+        ensure(!self.is_acquisition(), "acquisition has no declared NPC")?;
+        Ok((
+            self.npc_uuid.as_deref().ok_or("skeleton UUID required")?,
+            self.expected_npc_position
+                .ok_or("skeleton position required")?,
+        ))
+    }
     pub fn state_path(&self) -> Result<String> {
+        let config_path = self.config_path()?;
         let artifact = self
             .artifacts
             .iter()
-            .find(|a| a.container_path == self.handler_args[0])
+            .find(|a| a.container_path == config_path)
             .ok_or("config artifact absent")?;
         let value = json(&artifact.file.path, 65536)?;
         let state = value["state"]
@@ -149,14 +188,26 @@ impl Fixture {
             .verify()?;
         ensure(
             uuid(&self.player_uuid)
-                && uuid(&self.npc_uuid)
-                && self.player_uuid != self.npc_uuid
                 && valid_hash(&self.instance_id, 64)
                 && valid_hash(&self.source_revision, 40),
             "invalid frozen identities",
         )?;
+        match self.mode {
+            Mode::Skeleton => {
+                let (npc, position) = self.skeleton_npc()?;
+                ensure(
+                    uuid(npc) && self.player_uuid != npc && position.iter().all(|p| p.is_finite()),
+                    "distinct valid skeleton identity and finite pose required",
+                )?;
+            }
+            Mode::Acquisition => ensure(
+                self.npc_uuid.is_none() && self.expected_npc_position.is_none(),
+                "acquisition forbids declared NPC identity and position",
+            )?,
+        }
+        let duration = if self.is_acquisition() { 1200 } else { 120 };
         ensure(
-            self.duration_secs == 120
+            self.duration_secs == duration
                 && self.expected_health == 20.0
                 && self.expected_food == 20
                 && self.position_tolerance.is_finite()
@@ -269,7 +320,7 @@ impl Fixture {
             artifact.file.verify()?;
             container_path(&artifact.container_path)?;
             ensure(
-                paths.insert(&artifact.container_path)
+                paths.insert(artifact.container_path.clone())
                     && !Path::new(&artifact.container_path).starts_with(&self.container_secret_dir),
                 "artifact must be distinct from secret paths",
             )?;
@@ -294,32 +345,35 @@ impl Fixture {
             self.trace_action_prefix.as_deref().is_none_or(id),
             "invalid optional exact action prefix",
         )?;
+        match self.mode {
+            Mode::Skeleton => ensure(
+                self.handler_args.len() == 4
+                    && matches!(self.handler_args[1].as_str(), "blocked" | "task")
+                    && self.handler_args[2] == "120",
+                "existing bounded probe argv required",
+            )?,
+            Mode::Acquisition => ensure(
+                self.handler_args.len() == 2 && self.handler_args[0] == "run",
+                "acquisition requires pinned Brain argv [run, CONFIG]",
+            )?,
+        }
         ensure(
-            self.expected_npc_position.iter().all(|p| p.is_finite()),
-            "finite NPC pose required",
-        )?;
-        ensure(
-            self.handler_args.len() == 4
-                && matches!(self.handler_args[1].as_str(), "blocked" | "task")
-                && self.handler_args[2] == "120",
-            "existing bounded probe argv required",
-        )?;
-        ensure(
-            self.handler_args[1] != "task"
+            (!self.is_acquisition() && self.handler_args[1] != "task")
                 || (self.model_key_name.is_some()
                     && self.allocated_model_kind.as_deref() == Some("operator-allocated-proxy")),
-            "task mode requires an explicitly allocated proxy key",
+            "coding and acquisition modes require an explicitly allocated proxy key",
         )?;
-        for argument in [&self.handler_args[0], &self.handler_args[3]] {
+        for argument in self.private_input_paths()? {
             ensure(
                 paths.contains(argument),
                 "config and admission spec must be pinned artifacts",
             )?;
         }
+        let config_path = self.config_path()?;
         let config = self
             .artifacts
             .iter()
-            .find(|a| a.container_path == self.handler_args[0])
+            .find(|a| a.container_path == config_path)
             .ok_or("config artifact absent")?;
         let cfg = json(&config.file.path, 65536)?;
         ensure(
@@ -335,30 +389,33 @@ impl Fixture {
                     .is_some_and(|p| Path::new(p).starts_with(&self.container_workspace))
                 && cfg["body"]["period_ms"] == 150
                 && cfg["body"]["decision_samples"] == 128
-                && cfg["body"]["enabled"] == false,
-            "handler config must bind scoped secrets, workspace and pre-admission body",
+                && cfg["body"]["enabled"] == self.is_acquisition(),
+            "handler config must bind scoped secrets, workspace and mode-specific startup body",
         )?;
-        let admission = self
-            .artifacts
-            .iter()
-            .find(|a| a.container_path == self.handler_args[3])
-            .ok_or("admission artifact absent")?;
-        let spec = json(&admission.file.path, 16384)?;
-        ensure(
-            spec["entity_uuid"] == self.npc_uuid
-                && spec["entity_type"] == "minecraft:skeleton"
-                && spec["main_hand"] == "minecraft:bow"
-                && spec["entity_health"].as_f64() == Some(20.0)
-                && spec["position_tolerance"]
-                    .as_f64()
-                    .is_some_and(|n| n.is_finite() && (0.0..=self.position_tolerance).contains(&n))
-                && spec["player_health"].as_f64() == Some(20.0)
-                && spec["player_food"] == 20
-                && spec["timeout_secs"] == 120
-                && same_point(&spec["player_position"], self.expected_player_position)
-                && same_point(&spec["entity_position"], self.expected_npc_position),
-            "admission spec differs from fixture",
-        )?;
+        if !self.is_acquisition() {
+            let (npc, position) = self.skeleton_npc()?;
+            let admission = self
+                .artifacts
+                .iter()
+                .find(|a| a.container_path == self.handler_args[3])
+                .ok_or("admission artifact absent")?;
+            let spec = json(&admission.file.path, 16384)?;
+            ensure(
+                spec["entity_uuid"] == npc
+                    && spec["entity_type"] == "minecraft:skeleton"
+                    && spec["main_hand"] == "minecraft:bow"
+                    && spec["entity_health"].as_f64() == Some(20.0)
+                    && spec["position_tolerance"].as_f64().is_some_and(|n| {
+                        n.is_finite() && (0.0..=self.position_tolerance).contains(&n)
+                    })
+                    && spec["player_health"].as_f64() == Some(20.0)
+                    && spec["player_food"] == 20
+                    && spec["timeout_secs"] == 120
+                    && same_point(&spec["player_position"], self.expected_player_position)
+                    && same_point(&spec["entity_position"], position),
+                "admission spec differs from fixture",
+            )?;
+        }
         if let Some(rcon) = &self.operator_rcon {
             ensure(
                 rcon.address.ip().is_loopback(),
