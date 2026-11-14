@@ -465,9 +465,10 @@ fn acquisition_changed_container_generation_disconnects_before_brain_launch() {
 }
 #[test]
 fn already_disconnected_acquisition_requires_journal_and_native_closure_without_relabeling_ack() {
-    for scenario in 0..3 {
+    for scenario in 0..4 {
         let mut setup = prepared();
-        if scenario < 2 {
+        let verified = scenario == 0 || scenario == 3;
+        if scenario != 2 {
             let path = setup
                 .f
                 .workspace
@@ -494,6 +495,13 @@ fn already_disconnected_acquisition_requires_journal_and_native_closure_without_
             drop(db);
             setup.f.operator_gateway_journal = Some(path);
         }
+        if scenario == 3 {
+            save(
+                &setup.case.join("disconnect-closure.json"),
+                &json!({"preserved":true}),
+            )
+            .unwrap();
+        }
         let server = final_absence_server(&mut setup.f);
         let (mut host, mut control) = harness(&setup.f, Ending::Clean);
         host.disconnect_already_closed = true;
@@ -505,13 +513,13 @@ fn already_disconnected_acquisition_requires_journal_and_native_closure_without_
             &"c".repeat(64),
             true,
         );
-        assert_eq!(result.is_ok(), scenario == 0);
+        assert_eq!(result.is_ok(), verified);
         server.join().unwrap();
         let report = json(&setup.case.join("launch-result.json"), 65536).unwrap();
         assert_eq!(report["sdk_disconnect_acknowledged"], false);
         assert_eq!(report["sdk_disconnected"], false);
-        assert_eq!(report["lifecycle_closed_verified"], scenario == 0);
-        assert_eq!(report["already_closed_verified"], scenario == 0);
+        assert_eq!(report["lifecycle_closed_verified"], verified);
+        assert_eq!(report["already_closed_verified"], verified);
         assert_eq!(report["certifies_goal_completion"], false);
         assert_eq!(
             host.calls
