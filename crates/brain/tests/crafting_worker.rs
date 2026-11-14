@@ -193,10 +193,10 @@ impl Peer {
             arbiter,
         }
     }
-    async fn invoke(&self) -> Value {
+    async fn invoke(&self, executable: &str) -> Value {
         let output = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_minecraft-sdk-brain"))
+            tokio::process::Command::new(executable)
                 .arg("craft-worker")
                 .arg(&self.request)
                 .env("MC_SDK_ARBITER", &self.socket)
@@ -223,12 +223,19 @@ impl Drop for Peer {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn craft_worker_pauses_after_pickup_and_resumes_only_storage_through_arbiter() {
+    check_pause_resume(env!("CARGO_BIN_EXE_minecraft-sdk-brain")).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_probe_craft_worker_pauses_after_pickup_and_resumes_only_storage_through_arbiter() {
+    check_pause_resume(env!("CARGO_BIN_EXE_body-probe")).await;
+}
+async fn check_pause_resume(executable: &str) {
     let peer = Peer::start(Fixture {
         block_store: true,
         ..Fixture::default()
     })
     .await;
-    let first = peer.invoke().await;
+    let first = peer.invoke(executable).await;
     assert_eq!(first["report"]["status"], "local_preempted");
     assert_eq!(
         peer.state.lock().unwrap().step,
@@ -236,10 +243,10 @@ async fn craft_worker_pauses_after_pickup_and_resumes_only_storage_through_arbit
         "output preserved on cursor"
     );
     peer.state.lock().unwrap().block_store = false;
-    let resumed = peer.invoke().await;
+    let resumed = peer.invoke(executable).await;
     assert_eq!(resumed["report"]["status"], "completed");
     assert_eq!(resumed["report"]["current_inventory_count"], 4);
-    let again = peer.invoke().await;
+    let again = peer.invoke(executable).await;
     assert_eq!(again["report"]["status"], "already_completed");
     let state = peer.state.lock().unwrap();
     assert_eq!(
@@ -255,15 +262,22 @@ async fn craft_worker_pauses_after_pickup_and_resumes_only_storage_through_arbit
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn craft_worker_lost_take_reply_inspects_original_id_without_replaying_mutation() {
+    check_lost_reply(env!("CARGO_BIN_EXE_minecraft-sdk-brain")).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_probe_craft_worker_lost_take_reply_inspects_original_id_without_replaying_mutation() {
+    check_lost_reply(env!("CARGO_BIN_EXE_body-probe")).await;
+}
+async fn check_lost_reply(executable: &str) {
     let peer = Peer::start(Fixture {
         lose_take_reply: true,
         ..Fixture::default()
     })
     .await;
-    let first = peer.invoke().await;
+    let first = peer.invoke(executable).await;
     assert_eq!(first["report"]["status"], "needs_inspection");
     assert_eq!(peer.state.lock().unwrap().step, 2);
-    let resumed = peer.invoke().await;
+    let resumed = peer.invoke(executable).await;
     assert_eq!(resumed["report"]["status"], "completed");
     let state = peer.state.lock().unwrap();
     assert_eq!(
@@ -279,13 +293,25 @@ async fn craft_worker_lost_take_reply_inspects_original_id_without_replaying_mut
 }
 #[tokio::test]
 async fn craft_worker_refuses_missing_arbiter_before_even_reading_profile() {
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_minecraft-sdk-brain"))
-        .arg("craft-worker")
-        .arg(Path::new("/nonexistent/fixture-request"))
-        .env_remove("MC_SDK_ARBITER")
-        .output()
-        .await
-        .unwrap();
+    check_missing_arbiter(env!("CARGO_BIN_EXE_minecraft-sdk-brain")).await;
+}
+#[tokio::test]
+async fn body_probe_craft_worker_refuses_missing_arbiter_before_even_reading_profile() {
+    check_missing_arbiter(env!("CARGO_BIN_EXE_body-probe")).await;
+}
+async fn check_missing_arbiter(executable: &str) {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(executable)
+            .arg("craft-worker")
+            .arg(Path::new("/nonexistent/fixture-request"))
+            .env_remove("MC_SDK_ARBITER")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("requires the container body arbiter")

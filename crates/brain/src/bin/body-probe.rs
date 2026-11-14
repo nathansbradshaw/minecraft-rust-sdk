@@ -16,6 +16,9 @@ async fn main() -> Result<()> {
     if args.len() == 2 && args[0] == "navigation-worker" {
         return minecraft_sdk_brain::navigation::worker(Path::new(&args[1])).await;
     }
+    if args.len() == 2 && args[0] == "craft-worker" {
+        return minecraft_sdk_brain::crafting::worker(Path::new(&args[1])).await;
+    }
     if args.len() == 2 && args[0] == "inspect-observation" {
         let bytes = private_read(Path::new(&args[1]), 1024 * 1024)?;
         let observed: minecraft_sdk::Observation = serde_json::from_slice(&bytes)?;
