@@ -15,6 +15,10 @@ use std::{
 };
 
 mod feedback;
+mod invocation;
+pub(crate) use invocation::path;
+#[cfg(test)]
+mod invocation_tests;
 
 const SOURCE_LIMIT: usize = 32768;
 const STATE_LIMIT: usize = 16384;
@@ -173,6 +177,11 @@ struct Checkpoint {
     in_flight: bool,
     #[serde(default)]
     pending_action: Option<String>,
+    #[serde(default = "assume_mutation")]
+    mutation_possible: bool,
+}
+fn assume_mutation() -> bool {
+    true
 }
 impl Default for Checkpoint {
     fn default() -> Self {
@@ -181,12 +190,29 @@ impl Default for Checkpoint {
             result: Value::Null,
             in_flight: false,
             pending_action: None,
+            mutation_possible: true,
         }
     }
 }
 
+fn program_pending(brain: &Brain) -> Result<Option<String>> {
+    Ok(brain
+        .journal
+        .get("pending_action")?
+        .filter(|id| !id.is_empty())
+        .or(brain
+            .body
+            .as_ref()
+            .map(|body| body.shared.pending_program())
+            .transpose()?
+            .flatten()))
+}
+
 /// Run a bounded behavior slice without replacing the Brain, body or SDK session.
-pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
+pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
+    let invocation =
+        invocation::Invocation::parse(input)?.ok_or("Use a Lua path or invocation JSON")?;
+    let path = invocation.path.as_str();
     // Validate the lexical path even if the file is currently unavailable.
     let relative = Path::new(path);
     ensure(
@@ -199,7 +225,7 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
         "Use a relative workspace .lua path",
     )?;
     let revision = brain.journal.get("goal_revision")?.unwrap_or_default();
-    let key = digest(
+    let legacy_key = digest(
         json!([
             brain.cfg.workspace.canonicalize()?,
             path,
@@ -210,6 +236,7 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
         .to_string()
         .as_bytes(),
     );
+    let key = invocation.bind(brain, &revision, &legacy_key)?;
     let checkpoint_key = format!("lua-checkpoint-{key}");
     let active_key = format!("lua-source-{key}");
     let mut checkpoint: Checkpoint = brain
@@ -242,16 +269,7 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
         let pending = checkpoint
             .pending_action
             .clone()
-            .or(brain
-                .journal
-                .get("pending_action")?
-                .filter(|id| !id.is_empty()))
-            .or(brain
-                .body
-                .as_ref()
-                .map(|body| body.shared.pending_program())
-                .transpose()?
-                .flatten())
+            .or(program_pending(brain)?)
             .unwrap_or_default();
         if !pending.is_empty() {
             loop {
@@ -285,7 +303,10 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
             brain.journal.get("goal_revision")?.unwrap_or_default() == revision,
             "Lua goal changed; saved state retained",
         )?;
-        let context = json!({"state":checkpoint.state,"last_result":checkpoint.result,"observation":brain.observed,"goal":brain.goal,"goal_revision":revision});
+        let mut context = json!({"state":checkpoint.state,"last_result":checkpoint.result,"observation":brain.observed,"goal":brain.goal,"goal_revision":revision});
+        if let Some(args) = invocation.args() {
+            context["args"] = args.clone();
+        }
         let candidate = source(&brain.cfg.workspace, path);
         let next = match candidate {
             Ok(candidate) if active.as_ref() != Some(&candidate) => {
@@ -331,7 +352,21 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
             );
         }
         let command = next.command.ok_or("Lua command required")?.choice()?;
+        // The direct SDK tool always journals action_intent before submission.
+        // This exact-call floor distinguishes local capability/urgency refusal
+        // from an admitted mutation whose response may have been lost.
+        let sdk_intent_floor = if command.tool == "sdk" {
+            Some(brain.journal.db.query_row(
+                "SELECT COALESCE(MAX(id),0) FROM events",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        } else {
+            None
+        };
         checkpoint.in_flight = true;
+        checkpoint.mutation_possible =
+            !matches!(command.tool.as_str(), "observe" | "query" | "status");
         // Commit state before executing anything. An interrupted/failed step is
         // fenced across process restarts, including the uncertain-dispatch gap.
         brain
@@ -341,8 +376,36 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
             Duration::from_secs(brain.cfg.tool_timeout_secs).saturating_sub(started.elapsed()),
             Box::pin(crate::tools::execute(brain, &command)),
         )
-        .await
-        .map_err(|_| "Lua action slice timed out; inspect pending IDs, never replay")??;
+        .await;
+        let result = match result {
+            Ok(Ok(result)) => result,
+            failure => {
+                // Preserve the exact original intention even if its response
+                // was lost. An explicitly reconciled successor keeps this
+                // failed checkpoint intact; a fresh ID alone is not recovery.
+                checkpoint.pending_action = program_pending(brain)?;
+                if let Some(floor) = sdk_intent_floor {
+                    let admitted: bool = brain.journal.db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events WHERE kind='action_intent' AND id>?1)",
+                        [floor],
+                        |row| row.get(0),
+                    )?;
+                    if !admitted {
+                        checkpoint.mutation_possible = false;
+                    }
+                }
+                brain
+                    .journal
+                    .set(&checkpoint_key, &serde_json::to_string(&checkpoint)?)?;
+                return Err(match failure {
+                    Ok(Err(error)) => error,
+                    Err(_) => {
+                        "Lua action slice timed out; inspect pending IDs, never replay".into()
+                    }
+                    Ok(Ok(_)) => unreachable!(),
+                });
+            }
+        };
         if result["request"].is_object() {
             feedback.push(json!({"request":result["request"],"response":crate::feedback::receipt_summary(&serde_json::from_value(result["receipt"].clone())?)}));
         }

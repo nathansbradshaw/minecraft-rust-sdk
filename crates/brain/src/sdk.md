@@ -290,6 +290,25 @@ return {
 ObservationQuery table), `sdk` (SDK Action table), `status` / `reconcile` (original
 action ID string), and `navigate` (SDK navigation Goal table). Action/query fields
 match the JSON forms in this reference; use Lua tables, not JSON strings.
+
+For caller-parameterized reuse, `run` also accepts a JSON string containing
+`{"path":"behavior.lua","invocation_id":"work-id","args":{"parameter":"value"}}`.
+The same source can serve distinct settled invocations without edits. `ctx.args`
+is the invocation's bound JSON value, at most8192 serialized bytes; each step
+receives a fresh copy, so Lua writes cannot change later argument delivery.
+Arguments are caller claims, not fresh observations or permission grants.
+Validate them against current state before acting. IDs use the existing opaque
+SDK ID syntax, at most96 bytes. The same ID resumes independent persisted state
+with identical path/args; changed binding is rejected before gameplay tools.
+Pending or uncertain work must settle under its original invocation and action
+IDs. A new invocation cannot bypass an in-flight/failed checkpoint. Do not
+change IDs to retry a mutation. Legacy plain paths preserve their old state key
+and do not gain an arguments field. Both forms retain the same slice budgets,
+hot reload, task-revision scope, typed authority and no-replay rules.
+After explicit inspection/reconciliation proves the original ID terminal and
+input released, a genuinely different reviewed successor source path may run.
+The old failed checkpoint stays fenced and retained; a new ID at the same path
+does not constitute a repair. Missing original IDs remain unknown, not settled.
 SDK results retain `request`, `receipt`, and `after`; status/reconcile return a bare
 receipt. Results above32 KiB keep the same receipt layout with exact action ID,
 outcome, verification/release flags (unknown is null), and bounded errors.

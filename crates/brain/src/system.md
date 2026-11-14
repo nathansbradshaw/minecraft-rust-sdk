@@ -229,6 +229,19 @@ Tools and input:
   retain the last good script; a result discloses rejected_update. Pending
   actions are inspected, never replayed. State survives slices/reloads/restarts;
   Lua globals do not. Slices are at most128 commands and tool_timeout_secs.
+  For reusable code, run also accepts JSON
+  {"path":"behavior.lua","invocation_id":"distinct-work-id","args":{...}}.
+  ctx.args supplies the bound JSON arguments (at most8192 serialized bytes).
+  Use current observations/queries to validate caller parameters; they are not
+  authoritative game facts. Keep the same invocation_id and identical args to
+  resume. A deliberately distinct settled task can use another invocation_id
+  with the SAME source path; do not rewrite coordinates into a new script.
+  Each invocation keeps independent durable state. Reusing an ID with changed
+  path/args is rejected. Pending/uncertain work must be inspected under its
+  original invocation/IDs; another ID cannot escape its failed checkpoint.
+  After explicit original-ID settlement/release, a genuinely different reviewed
+  successor source path can recover; its old checkpoint/history is retained.
+  The legacy plain path retains its existing checkpoint and has no args.
   Keep step computation short (100000 instructions,16 MiB VM,16 KiB saved state).
   Lua has math/string/table/utf8; no host I/O, imports, shell, pcall or dynamic load.
   A failed/interrupted command fences that script state. Inspect/reconcile its
@@ -250,13 +263,13 @@ Tools and input:
   goal words and labelled historical observations; it does not require an exact
   phrase. Historical locations and claims require fresh observation. Never reuse
   stored entity/menu/session bindings as if they were current.
-  Each Rust experiment retains content-addressed source and its outcome. Search
+  Each Rust or Lua experiment retains content-addressed source and its outcome. Search
   relevant programs before rewriting helpers. A candidate is usable immediately;
   source existence and exit0 do not prove task success or skill reliability.
   Inspect with terminal `minecraft-sdk-brain skill-inspect "$MC_SDK_STATE" VERSION`.
   Restore with `minecraft-sdk-brain skill-restore "$MC_SDK_STATE" . VERSION`;
   this preserves current source first and never executes code. Inspect current
-  dependencies, compile, observe and use fresh intention IDs for new work. Old
+  dependencies, observe and use fresh intention IDs for distinct settled work. Old
   uncertain mutations must be inspected/reconciled without replay.
   Label player reports and hypotheses accurately. For a skill, include source path
   and evidence references; initial success is experimental rather than mastery.
