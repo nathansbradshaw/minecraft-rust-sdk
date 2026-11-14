@@ -1323,14 +1323,22 @@ async fn planning_refresh_waits_for_a_fresh_retry_without_admitting_stale_state(
 }
 #[tokio::test]
 async fn controller_defends_without_ending_escape_then_cancels_a_stuck_route() {
-    controller_projectile_scenario(false, false).await;
-    controller_projectile_scenario(true, false).await;
+    controller_projectile_scenario(false, false, false).await;
+    controller_projectile_scenario(true, false, false).await;
 }
 #[tokio::test]
 async fn native_rejection_under_urgent_fire_uses_one_prefix_without_repeating_geometric_dispatch() {
-    controller_projectile_scenario(false, true).await;
+    controller_projectile_scenario(false, true, false).await;
 }
-async fn controller_projectile_scenario(replace_projectile: bool, require_native: bool) {
+#[tokio::test]
+async fn controller_empty_native_prefix_continues_reading_before_a_closing_threat() {
+    controller_projectile_scenario(false, true, true).await;
+}
+async fn controller_projectile_scenario(
+    replace_projectile: bool,
+    require_native: bool,
+    empty_prefix: bool,
+) {
     // Transport fixture only: the game is deliberately held at one position
     // while its tick counter advances. This is not native gameplay evidence.
     let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1350,7 +1358,7 @@ async fn controller_projectile_scenario(replace_projectile: bool, require_native
     );
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
-    let upstream = tokio::spawn(async move {
+    let mut upstream = tokio::spawn(async move {
         let mut blocks = Vec::new();
         for x in -4..=4 {
             for z in -4..=4 {
@@ -1364,6 +1372,10 @@ async fn controller_projectile_scenario(replace_projectile: bool, require_native
         let mut actions = Vec::new();
         let mut defended_while_moving = false;
         let mut native_queried = false;
+        let mut first_query = None;
+        let mut query_count = 0;
+        let mut reads_at_query = 0;
+        let mut observation_reads = 0;
         let mut move_attempts = 0;
         loop {
             let (mut socket, _) = http.accept().await.unwrap();
@@ -1388,26 +1400,41 @@ async fn controller_projectile_scenario(replace_projectile: bool, require_native
             let mut finished = false;
             let response = if first.starts_with("GET /v1/bots/own/observations ") {
                 tick += 4;
+                observation_reads += 1;
                 serde_json::to_value(Observation {
                     revision:tick.to_string(),
-                    player:json!({"uuid":"own","entity_id":1,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"on_ground":true,"attack_strength":1.,"control":control}),
-                    world:json!({"game_time":tick,"sample_clock":{"epoch":"fixture"},"blocks":blocks,"entities":[{"entity_id":9,"visible":true,"hostile":true,"position":[2.5,1.,0.5]},{"entity_id":if replace_projectile && tick>=116{11}else{10},"uuid":if replace_projectile && tick>=116{"new-projectile-fixture"}else{"projectile-fixture"},"visible":true,"projectile":true,"position":[2.5,1.9,0.5],"velocity":[-0.25,0.,0.]}]}),
+                    player:json!({"uuid":"own","life_id":"fixture-life","entity_id":1,"dimension":"minecraft:overworld","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"on_ground":true,"attack_strength":1.,"control":control}),
+                    world:json!({"game_time":tick,"sample_clock":{"epoch":"fixture","nanos":tick.to_string()},"blocks":blocks,"entities":[{"entity_id":9,"visible":true,"hostile":true,"position":[2.5,1.,0.5]},{"entity_id":if replace_projectile && tick>=116{11}else{10},"uuid":if replace_projectile && tick>=116{"new-projectile-fixture"}else{"projectile-fixture"},"visible":true,"projectile":true,"position":[2.5,1.9,0.5],"velocity":[-0.25,0.,0.]},{"entity_id":12,"uuid":"fixture-creeper","type":"minecraft:creeper","visible":empty_prefix,"hostile":true,"position":if tick<220{json!([7.5,1.,0.5])}else{json!([2.5,1.,0.5])}}]}),
                     menu:json!({}),
                 }).unwrap()
             } else if first.starts_with("POST /v1/bots/own/observations/query ") {
-                assert!(require_native && !native_queried);
+                assert!(require_native && (query_count == 0 || empty_prefix && query_count == 1));
                 let query: ObservationQuery = serde_json::from_slice(&body).unwrap();
                 assert_eq!(query.capability, "minecraft:movement_options");
                 assert_eq!(
                     query.input,
-                    json!({"offset":0,"limit":8,"target":[-0.5,1.,-2.5]})
+                    json!({"offset":if query_count==0{0}else{2},"limit":8,"target":[-0.5,1.,-2.5]})
                 );
                 native_queried = true;
+                query_count += 1;
+                if query_count == 1 {
+                    first_query = Some(Instant::now());
+                    reads_at_query = observation_reads;
+                } else {
+                    assert!(
+                        first_query.unwrap().elapsed() >= Duration::from_millis(450),
+                        "retain request spacing"
+                    );
+                    assert!(
+                        observation_reads > reads_at_query,
+                        "body must keep observing between pages"
+                    );
+                }
                 json!({"format":"minecraft-movement-options-v1","scene":"urgent-native-prefix",
                     "origin":{"position":[0.5,1.,0.5],"dimension":"minecraft:overworld"},
-                    "options":[{"target":[0.5,1.,2.5],"jump":false,"duration_ticks":8,
-                        "max_ticks":60,"touched_blocks":["minecraft:stone","minecraft:air"]}],
-                    "complete":false,"next_offset":8})
+                    "options":if empty_prefix&&query_count==1{json!([])}else{json!([{"target":[0.5,1.,2.5],"jump":false,"duration_ticks":8,
+                        "max_ticks":60,"touched_blocks":["minecraft:stone","minecraft:air"]}])},
+                    "complete":false,"next_offset":if empty_prefix&&query_count==1{2}else{8}})
             } else {
                 assert!(first.starts_with("POST /v1/bots/own/actions "), "{first}");
                 let request: ActionRequest = serde_json::from_slice(&body).unwrap();
@@ -1424,6 +1451,13 @@ async fn controller_projectile_scenario(replace_projectile: bool, require_native
                                     "do not dispatch another guess after native refusal"
                                 );
                                 assert_eq!([target.x, target.y, target.z], [0.5, 1., 2.5]);
+                                if empty_prefix {
+                                    assert_eq!(query_count, 2);
+                                    assert!(
+                                        tick < 220,
+                                        "new finite move before the fixture threat closes"
+                                    );
+                                }
                                 finished = true;
                             }
                             control = json!({"action_id":request.action_id,"outcome":"running","target":[target.x,target.y,target.z]});
@@ -1479,7 +1513,7 @@ async fn controller_projectile_scenario(replace_projectile: bool, require_native
     });
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(&dir.path().join("body.sqlite")).unwrap();
-    tokio::time::timeout(
+    let result = tokio::time::timeout(
         Duration::from_secs(5),
         controller(
             client,
@@ -1496,10 +1530,13 @@ async fn controller_projectile_scenario(replace_projectile: bool, require_native
             false,
         ),
     )
-    .await
-    .unwrap()
-    .unwrap();
-    let actions = upstream.await.unwrap();
+    .await;
+    let joined = tokio::time::timeout(Duration::from_secs(1), &mut upstream).await;
+    if joined.is_err() {
+        upstream.abort();
+    }
+    let actions = joined.expect("bounded native-prefix HTTP fixture").unwrap();
+    result.unwrap().unwrap();
     assert!(matches!(actions.first(), Some(Action::StartMove { .. })));
     if require_native {
         assert_eq!(
