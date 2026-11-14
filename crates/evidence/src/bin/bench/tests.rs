@@ -291,6 +291,31 @@ fn mounts_reject_rw_secret_alias_and_unreviewed_credentials() {
     assert!(config::validate_mounts(&s.f, &m).is_err());
 }
 #[test]
+fn operator_gateway_journal_is_private_and_cannot_be_exposed_by_any_bot_mount() {
+    let mut s = setup();
+    let journal = s.f.workspace.parent().unwrap().join("operator-only.sqlite");
+    write(&journal, b"private fixture journal");
+    s.f.operator_gateway_journal = Some(journal.clone());
+    s.f.validate().unwrap();
+    let mut exposed = mounts(&s.f);
+    exposed["mounts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"Type":"bind","Source":journal,"Destination":"/reviewed-journal","RW":false}));
+    assert!(
+        config::validate_mounts(&s.f, &exposed)
+            .unwrap_err()
+            .to_string()
+            .contains("gateway journal exposed")
+    );
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(s.f.validate().is_err());
+    let inside = s.f.workspace.join("journal.sqlite");
+    write(&inside, b"fixture");
+    s.f.operator_gateway_journal = Some(inside);
+    assert!(s.f.validate().is_err());
+}
+#[test]
 fn blocked_requires_no_model_key_but_task_does() {
     let mut s = setup();
     fs::remove_file(s.f.model_key().unwrap()).unwrap();
