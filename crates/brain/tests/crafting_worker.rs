@@ -24,6 +24,8 @@ struct Fixture {
     step: u8,
     block_store: bool,
     lose_take_reply: bool,
+    fail_after_take_query: bool,
+    uncertain_take: bool,
     mutations: Vec<String>,
     receipts: BTreeMap<String, Receipt>,
     direct_posts: usize,
@@ -54,10 +56,23 @@ async fn discover() -> Json<Value> {
         "capabilities":["minecraft:fresh_observation"],"limits":{}}),
     )
 }
-async fn fresh(State(state): State<Shared>, Json(query): Json<Value>) -> Json<Value> {
+async fn fresh(State(state): State<Shared>, Json(query): Json<Value>) -> (StatusCode, Json<Value>) {
     assert_eq!(query["capability"], "minecraft:fresh_observation");
-    Json(json!({"format":"minecraft-fresh-observation-v1",
-        "observation":observation(state.lock().unwrap().step)}))
+    let mut state = state.lock().unwrap();
+    if state.step == 2 && state.fail_after_take_query {
+        state.fail_after_take_query = false;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"code":"not_ready","message":"Synthetic post-pickup observation unavailable"}),
+            ),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"format":"minecraft-fresh-observation-v1",
+        "observation":observation(state.step)})),
+    )
 }
 async fn direct(State(state): State<Shared>) -> (StatusCode, Json<Value>) {
     state.lock().unwrap().direct_posts += 1;
@@ -82,6 +97,20 @@ async fn status(
         .unwrap(),
     )
 }
+async fn reconcile(
+    State(state): State<Shared>,
+    RoutePath((_bot, id)): RoutePath<(String, String)>,
+) -> Json<Value> {
+    let mut state = state.lock().unwrap();
+    let receipt = state
+        .receipts
+        .get_mut(&id)
+        .expect("reconcile exact recorded ID");
+    assert_eq!(receipt.outcome, Outcome::Uncertain);
+    receipt.outcome = Outcome::Reconciled;
+    receipt.evidence["native_effect_verified"] = json!(false);
+    Json(serde_json::to_value(receipt).unwrap())
+}
 struct Peer {
     directory: tempfile::TempDir,
     request: PathBuf,
@@ -103,6 +132,7 @@ impl Peer {
             .route("/v1/bots/{bot}/observations/query", post(fresh))
             .route("/v1/bots/{bot}/actions", post(direct))
             .route("/v1/bots/{bot}/actions/{id}", get(status))
+            .route("/v1/bots/{bot}/actions/{id}/reconcile", post(reconcile))
             .with_state(state.clone());
         let http = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -141,10 +171,14 @@ impl Peer {
                         let prepare = state.step == 0;
                         let receipt = Receipt {
                             action_id: action_id.clone(),
-                            outcome: Outcome::Observed,
+                            outcome: if state.uncertain_take && action_id.ends_with("-take") {
+                                Outcome::Uncertain
+                            } else {
+                                Outcome::Observed
+                            },
                             adapter_version: "fixture".into(),
                             error: None,
-                            evidence: json!({"native_effect_verified":true,"effect":if prepare {
+                            evidence: json!({"native_effect_verified":!(state.uncertain_take && action_id.ends_with("-take")),"effect":if prepare {
                                 json!({"kind":"recipe_preparation","recipe":"fixture:recipe",
                                     "menu_id":17,"menu_type":"fixture:table","output_slot":0,
                                     "result":{"item":"fixture:result","count":4},
@@ -287,6 +321,107 @@ async fn check_lost_reply(executable: &str) {
             "fixture-batch-take",
             "fixture-batch-store"
         ]
+    );
+    assert_eq!(state.status_reads, vec!["fixture-batch-take"]);
+    assert_eq!(state.direct_posts, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn craft_worker_error_only_after_observed_take_exposes_same_id_and_resumes_once() {
+    check_error_only(env!("CARGO_BIN_EXE_minecraft-sdk-brain")).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_probe_craft_worker_error_only_after_observed_take_exposes_same_id_and_resumes_once() {
+    check_error_only(env!("CARGO_BIN_EXE_body-probe")).await;
+}
+async fn check_error_only(executable: &str) {
+    let peer = Peer::start(Fixture {
+        fail_after_take_query: true,
+        ..Fixture::default()
+    })
+    .await;
+    let first = peer.invoke(executable).await;
+    assert_eq!(first["error"]["code"], "not_ready");
+    assert!(first.get("report").is_none());
+    assert_eq!(first["inspection"]["status"], "bound_pending");
+    assert_eq!(
+        first["inspection"]["pending_action_id"],
+        "fixture-batch-take"
+    );
+    assert_eq!(first["inspection"]["phase"], "take");
+    assert_eq!(first["inspection"]["recorded_life_id"], "life");
+    assert_eq!(first["inspection"]["current_life_verified"], false);
+    assert!(first["inspection"]["native_settled"].is_null());
+    {
+        let state = peer.state.lock().unwrap();
+        assert_eq!(state.step, 2, "cursor retains one output batch");
+        assert_eq!(
+            state.receipts["fixture-batch-take"].outcome,
+            Outcome::Observed
+        );
+    }
+    let resumed = peer.invoke(executable).await;
+    assert_eq!(resumed["report"]["status"], "completed");
+    assert_eq!(resumed["report"]["current_inventory_count"], 4);
+    assert_eq!(
+        peer.invoke(executable).await["report"]["status"],
+        "already_completed"
+    );
+    let state = peer.state.lock().unwrap();
+    assert_eq!(state.status_reads, vec!["fixture-batch-take"]);
+    assert_eq!(
+        state.mutations,
+        vec![
+            "fixture-batch-prepare",
+            "fixture-batch-take",
+            "fixture-batch-store"
+        ]
+    );
+    assert_eq!(state.direct_posts, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn craft_worker_uncertain_then_reconciled_take_never_replays_or_promotes() {
+    check_uncertain(env!("CARGO_BIN_EXE_minecraft-sdk-brain")).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_probe_craft_worker_uncertain_then_reconciled_take_never_replays_or_promotes() {
+    check_uncertain(env!("CARGO_BIN_EXE_body-probe")).await;
+}
+async fn check_uncertain(executable: &str) {
+    let peer = Peer::start(Fixture {
+        uncertain_take: true,
+        ..Fixture::default()
+    })
+    .await;
+    let first = peer.invoke(executable).await;
+    assert_eq!(first["report"]["status"], "needs_inspection");
+    assert_eq!(first["report"]["receipt_outcome"], "uncertain");
+    assert_eq!(first["report"]["action_id"], "fixture-batch-take");
+    let profile: minecraft_sdk::Profile =
+        serde_json::from_slice(&std::fs::read(peer.directory.path().join("profile.json")).unwrap())
+            .unwrap();
+    let client = minecraft_sdk::Client::with_profile(&profile).unwrap();
+    assert_eq!(
+        client
+            .reconcile("fixture-batch-take")
+            .await
+            .unwrap()
+            .outcome,
+        Outcome::Reconciled
+    );
+    let second = peer.invoke(executable).await;
+    assert_eq!(second["report"]["status"], "needs_inspection");
+    assert_eq!(second["report"]["receipt_outcome"], "reconciled");
+    assert!(second["report"]["current_inventory_count"].is_null());
+    let state = peer.state.lock().unwrap();
+    assert_eq!(
+        state.step, 2,
+        "unverified cursor is not stored or discarded"
+    );
+    assert_eq!(
+        state.mutations,
+        vec!["fixture-batch-prepare", "fixture-batch-take"]
     );
     assert_eq!(state.status_reads, vec!["fixture-batch-take"]);
     assert_eq!(state.direct_posts, 0);

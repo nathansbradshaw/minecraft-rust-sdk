@@ -10,6 +10,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+mod inspection;
+pub use inspection::{CraftInspection, CraftInspectionStatus, inspect_craft_journal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

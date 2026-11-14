@@ -72,7 +72,8 @@ pub async fn worker(path: &Path) -> Result<()> {
     .await
     {
         Ok(report) => json!({"report":report}),
-        Err(error) => json!({"error":error}),
+        Err(error) => json!({"error":error,"inspection":minecraft_sdk::menu::inspect_craft_journal(
+            &request.journal,&profile.instance_id,&profile.credential.player_uuid,&request.recipe,&request.prefix)}),
     };
     private_write(&request.result, &serde_json::to_vec(&response)?)?;
     println!("{response}");
@@ -190,6 +191,26 @@ pub async fn execute(brain: &mut Brain, bytes: &str) -> Result<Value> {
                 "Worker result unavailable: preserve and inspect this SAME operation journal and original IDs before any new batch; a process timeout cannot erase a submitted mutation."
             );
         }
+    }
+    if !result["crafting"]["error"].is_null()
+        || !result["crafting_result_error"].is_null()
+        || result["timed_out"] == true
+        || result["exit_code"] != 0
+    {
+        // The path/prefix were derived from the closed recipe+operation_id,
+        // never from worker output or a model-provided filesystem path. Read
+        // after the child ended; missing/busy/invalid remains Unknown.
+        let inspection = minecraft_sdk::menu::inspect_craft_journal(
+            &request.journal,
+            &brain.server.instance_id,
+            brain.observed.player["uuid"].as_str().unwrap_or_default(),
+            &request.recipe,
+            &request.prefix,
+        );
+        let view = serde_json::to_value(inspection)?;
+        result["crafting_inspection"] = json!({"recipe":request.recipe,"operation_id":input.operation_id,
+            "journal_key":key,"view_sha256":digest(view.to_string().as_bytes()),"view":view,
+            "scope":"Validated client journal inspection only; not native settlement, current-life proof or permission to replay. Inspect/reconcile the exact original ID and resume only this same operation."});
     }
     Ok(result)
 }

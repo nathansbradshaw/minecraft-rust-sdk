@@ -1,7 +1,10 @@
 //! Typed menu builders and optional journaled recipe-output composition.
 use crate::*;
 mod crafting;
-pub use crafting::{CraftPhase, CraftReport, CraftStatus, craft_once};
+pub use crafting::{
+    CraftInspection, CraftInspectionStatus, CraftPhase, CraftReport, CraftStatus, craft_once,
+    inspect_craft_journal,
+};
 
 pub const FRESH_OBSERVATION_CAPABILITY: &str = "minecraft:fresh_observation";
 
