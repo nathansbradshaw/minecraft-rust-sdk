@@ -127,6 +127,19 @@ SDK quick reference (Lua behaviors; Rust SDK and Brain):
   Optional `menu::craft_once(&client, recipe_id, unique_prefix, &journal_path,
   Duration::from_secs(15)).await?` composes one preparation, one output PICKUP,
   and storage in an empty permitted own slot, then checks retained item/count gain.
+  The optional `craft_once` brain tool calls this same helper without a compile
+  or a model turn for each click. Input is only
+  `{"recipe":"namespace:installed_recipe","operation_id":"unique_batch_1"}`;
+  leave `path` empty. The harness resolves its journal under this bot's state,
+  binds the actor/server, and runs through the existing per-action body arbiter.
+  Reuse the SAME operation ID after preemption/interruption, including after a
+  worker timeout. A different ID means distinct new work, never a retry shortcut.
+  Recipe changes with the same operation or life changes stop at the journal's
+  binding check. Prepare/take/store can pause independently; the cursor may hold
+  the output until the body permits continuation. Inspect original IDs when
+  requested. `historical_completion` does not prove current retention or a new
+  batch. This built-in client helper is optional, not a learned skill or a server
+  transaction; keep the existing gameplay tools and editable program strategy.
   Supply ingredients and an appropriate open menu with empty grid/cursor. It uses
   native preparation metadata, not guessed output slots. It never uses make_all
   or QUICK_MOVE. Each intended batch needs its own durable prefix/journal; repeat

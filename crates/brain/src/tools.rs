@@ -329,6 +329,13 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
             Ok(view)
         }
         "navigate" => crate::navigation::execute(brain, &choice.input).await,
+        "craft_once" => {
+            ensure(
+                choice.path.is_empty(),
+                "Craft tool accepts no filesystem path",
+            )?;
+            crate::crafting::execute(brain, &choice.input).await
+        }
         "sdk" => brain.act(serde_json::from_str(&choice.input)?).await,
         "status" => Ok(serde_json::to_value(brain.inspect(&choice.input).await?)?),
         "reconcile" => brain.settle(&choice.input).await,
