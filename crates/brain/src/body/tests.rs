@@ -1830,3 +1830,184 @@ async fn stalled_callers_cannot_lease_the_body_and_abandoned_work_never_dispatch
         "local_preempted"
     );
 }
+
+#[tokio::test]
+async fn controller_cover_occlusion_lease_starts_after_original_input_is_released() {
+    // Real controller/HTTP sequence, synthetic geometry: no native survival claim.
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Arc::new(
+        Client::with_profile(&Profile {
+            endpoint: format!("http://{}/", http.local_addr().unwrap()),
+            instance_id: "fixture".into(),
+            credential: Credential {
+                bot_id: "own".into(),
+                player_uuid: "own".into(),
+                key: "fixture".into(),
+            },
+            session: None,
+        })
+        .unwrap()
+        .without_local_arbiter(),
+    );
+    let mut blocks = Vec::new();
+    for x in -4..=6 {
+        for z in -4..=4 {
+            for y in 0..=4 {
+                let solid = y == 0 || (x == 3 && z == 1 && y <= 3);
+                blocks.push(json!({"position":[x,y,z],"block":if solid{"minecraft:stone"}else{"minecraft:air"},
+            "collision":if solid{json!([[0.,0.,0.,1.,1.,1.]])}else{json!([])}}));
+            }
+        }
+    }
+    let initial = Observation {
+        revision: "100".into(),
+        menu: json!({}),
+        player: json!({"uuid":"own","life_id":"life","entity_id":1,"dimension":"fixture:world","position":[0.5,1.,0.5],"health":20.,"food":20,"sprinting":true,"on_ground":true,"in_water":false,"in_lava":false}),
+        world: json!({"game_time":100,"sample_clock":{"epoch":"epoch","nanos":"100"},"blocks":blocks,
+            "entities":[{"uuid":"shooter","entity_id":9,"type":"minecraft:skeleton","visible":true,"hostile":true,"ranged_attack":true,"health":20.,"position":[6.5,1.,0.5]}]}),
+    };
+    let selected = geometry::evade_policy(&initial, &[], &[], &[], 1.1, &[], false)
+        .expect("synthetic visible cover route");
+    assert!(
+        selected.cover_path.len() > 1,
+        "fixture must select a multi-leg cover path: {selected:?}"
+    );
+    let endpoint = [selected.target.x, selected.target.y, selected.target.z];
+    let final_point = selected.cover_path.last().unwrap();
+    let final_point = [final_point.x, final_point.y, final_point.z];
+    assert_ne!(endpoint, final_point, "fixture needs remaining work");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let mut upstream = tokio::spawn(async move {
+        let mut phase = 0usize;
+        let mut original = None::<String>;
+        let mut reads = 0;
+        loop {
+            let (mut socket, _) = http.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let size = header
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(size < 8192);
+            let mut bytes = vec![0; size];
+            socket.read_exact(&mut bytes).await.unwrap();
+            let mut finished = false;
+            let response = if header.starts_with("GET /v1/bots/own/observations ") {
+                reads += 1;
+                assert!(reads < 30, "controller did not finish bounded sequence");
+                let mut o = initial.clone();
+                o.revision = (100 + reads).to_string();
+                o.world["game_time"] = json!(100 + reads);
+                o.world["sample_clock"]["nanos"] = json!((100 + reads).to_string());
+                if let Some(id) = &original {
+                    phase += 1;
+                    let fraction = match phase {
+                        1 => 0.25,
+                        2 => 0.5,
+                        3 => 0.75,
+                        _ => 1.,
+                    };
+                    o.player["position"] =
+                        json!(std::array::from_fn::<_, 3, _>(
+                            |i| [0.5, 1., 0.5][i] + fraction * (endpoint[i] - [0.5, 1., 0.5][i])
+                        ));
+                    o.player["control"] = json!({"action_id":id,"target":endpoint,"outcome":if phase<4{"running"}else{"observed"},"input_released":if phase<4{Value::Null}else{json!(phase>=5)},"cancel_requested":false});
+                    if phase == 2 || phase >= 4 {
+                        o.world["entities"] = json!([]);
+                    }
+                }
+                serde_json::to_value(o).unwrap()
+            } else {
+                assert!(header.starts_with("POST /v1/bots/own/actions "), "{header}");
+                let request: ActionRequest = serde_json::from_slice(&bytes).unwrap();
+                let target = match &request.action {
+                    Action::StartMove { target, .. } | Action::StartMoveThrough { target, .. } => {
+                        [target.x, target.y, target.z]
+                    }
+                    other => panic!("unexpected {other:?} phase{phase}"),
+                };
+                if let Some(id) = &original {
+                    assert!(phase >= 5, "successor before Observed+released");
+                    assert_ne!(&request.action_id, id);
+                    assert!(
+                        matches!(request.action, Action::StartMove { max_ticks: 60, .. }),
+                        "continuation must stop at its finite endpoint"
+                    );
+                    assert_eq!(
+                        target, final_point,
+                        "Running visibility changes must not poison the terminal occlusion lease"
+                    );
+                    finished = true;
+                } else {
+                    assert_eq!(target, endpoint);
+                    original = Some(request.action_id.clone());
+                }
+                json!({"action_id":request.action_id,"outcome":"running","adapter_version":"fixture","evidence":{}})
+            };
+            let body = response.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            if finished {
+                stopped.store(true, Ordering::Release);
+                break;
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        controller(
+            client,
+            Config {
+                enabled: true,
+                period_ms: 50,
+                decision_samples: 8,
+                experimental_ranged_boundary_turns: false,
+            },
+            admission_shared(),
+            stop.clone(),
+            &journal,
+            1.1,
+            false,
+        ),
+    )
+    .await;
+    stop.store(true, Ordering::Release);
+    let joined = tokio::time::timeout(Duration::from_secs(1), &mut upstream).await;
+    if joined.is_err() {
+        upstream.abort();
+    }
+    joined.expect("bounded HTTP fixture shutdown").unwrap();
+    result.unwrap().unwrap();
+    let events = journal.history("original_action_id").unwrap();
+    let events = events.as_array().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["event"] == "body_cover_handoff_consumed")
+            .count(),
+        1
+    );
+    let phases: Vec<_> = events
+        .iter()
+        .filter_map(|e| e["data"]["phase"].as_str())
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            "released_occluded_candidate",
+            "terminal_unreleased",
+            "running"
+        ]
+    );
+}

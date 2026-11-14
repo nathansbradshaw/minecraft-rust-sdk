@@ -323,8 +323,14 @@ One already-selected cover path may finish a remaining finite leg when first
 occlusion interrupts it and its owned preceding control is natively `Observed`,
 released, and at the expected endpoint. The original actor/life/clock and
 control ID remain bound; fresh known terrain, current threat guards and ordinary
-native movement admission still apply. Urgency, uncertain/cancelled input,
-foreign control, missing facts or reacquisition invalidate the continuation.
+native movement admission still apply. Visibility changes during the original
+running or releasing input do not start the occlusion lease. Only an advancing
+terminal sample at its endpoint can do so; visible completion replans normally.
+Urgency, uncertain/cancelled input, foreign control, missing perceived facts or
+reacquisition after terminal occlusion invalidate the continuation. A new escape
+also waits while its exact owned control explicitly reports unreleased input;
+independent observation, urgent cancellation and reasoning continue. Optional
+operator diagnostics record bounded handoff phase changes and current hazards.
 The one continuation is consumed before dispatch, stops at its old waypoint,
 and cannot seed another hidden plan. It grants no hidden-cover reward, Hold,
 new goal or claim of protection. Multi-shooter plans, displaced endpoints and
