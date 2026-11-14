@@ -194,6 +194,23 @@ pub(super) struct Discovery {
     page_origin: Option<[f64; 3]>,
 }
 const MAX_PREFIX_READY_PAGES: u8 = 4;
+
+fn query_preference(o: &Observation, mut target: [f64; 3]) -> [f64; 3] {
+    // Experiment: search level escape candidates first when the existing
+    // defensive hint climbs. This orders a read only; it neither establishes
+    // support at this height nor changes the native-admitted action target.
+    if o.player["on_ground"] == true
+        && o.player["in_water"] == false
+        && o.player["eyes_in_water"] == false
+        && o.player["in_lava"] == false
+        && let Some(p) = geometry::point(&o.player["position"])
+        && target[1] > p[1]
+    {
+        target[1] = p[1];
+    }
+    target
+}
+
 impl Default for Discovery {
     fn default() -> Self {
         Self {
@@ -254,7 +271,7 @@ impl Discovery {
             self.preference = first_prefix_only
                 .then(|| geometry::evade_with_limits(o, &[], &[], &[], axis))
                 .flatten()
-                .map(|route| [route.target.x, route.target.y, route.target.z]);
+                .map(|route| query_preference(o, [route.target.x, route.target.y, route.target.z]));
         } else if first_prefix_only
             && self.done
             && self.task.is_none()
@@ -265,7 +282,7 @@ impl Discovery {
                 .is_some_and(|p| geometry::toward_close_threat(o, p))
         {
             let next = geometry::evade_with_limits(o, &[], &[], &[], axis)
-                .map(|route| [route.target.x, route.target.y, route.target.z]);
+                .map(|route| query_preference(o, [route.target.x, route.target.y, route.target.z]));
             if next.is_some() && next != self.preference {
                 // One changed-threat investigation, never a clock/ambient
                 // reset or a new mutation allowance. In-flight/busy reads keep
@@ -615,6 +632,69 @@ mod tests {
         o.world["entities"] = json!([]);
         d.update_basis(&o, true, 3.5);
         assert_eq!(d.preference, None, "no invented threat or goal");
+    }
+    #[test]
+    fn level_query_preference_requires_known_grounded_dry_facts_and_an_upward_hint() {
+        let mut o = observation();
+        for field in ["in_water", "eyes_in_water", "in_lava"] {
+            o.player[field] = json!(false);
+        }
+        let up = [-2.5, 2., 0.5];
+        assert_eq!(query_preference(&o, up), [-2.5, 1., 0.5]);
+        for target in [[-2.5, 1., 0.5], [-2.5, 0., 0.5]] {
+            assert_eq!(query_preference(&o, target), target);
+        }
+        for (field, value) in [
+            ("on_ground", json!(false)),
+            ("on_ground", Value::Null),
+            ("in_water", json!(true)),
+            ("in_water", Value::Null),
+            ("eyes_in_water", json!(true)),
+            ("eyes_in_water", Value::Null),
+            ("in_lava", json!(true)),
+            ("in_lava", Value::Null),
+            ("position", Value::Null),
+        ] {
+            let mut unknown_or_immersed = o.clone();
+            unknown_or_immersed.player[field] = value;
+            assert_eq!(query_preference(&unknown_or_immersed, up), up, "{field}");
+        }
+    }
+    #[test]
+    fn level_query_hint_keeps_existing_basis_pinning_and_native_admission() {
+        // Synthetic raised floor, not a reconstructed private-world route.
+        let mut o = preference_floor();
+        for field in ["in_water", "eyes_in_water", "in_lava"] {
+            o.player[field] = json!(false);
+        }
+        for b in o.world["blocks"].as_array_mut().unwrap() {
+            if b["position"][0].as_i64().unwrap() < 0 && b["position"][1] == 1 {
+                b["block"] = json!("minecraft:stone");
+                b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
+            }
+        }
+        let route = geometry::evade_with_limits(&o, &[], &[], &[], 3.5).unwrap();
+        let original = [route.target.x, route.target.y, route.target.z];
+        assert!(original[1] > 1., "fixture must exercise the upward hint");
+        let mut d = Discovery::default();
+        d.update_basis(&o, true, 3.5);
+        let expected = [original[0], 1., original[2]];
+        assert_eq!(d.preference, Some(expected));
+        assert!(d.routes.is_empty(), "query hint is not admitted movement");
+        d.ready_pages = 2;
+        d.prefix_busy_retries = 1;
+        o.world["game_time"] = json!(123);
+        o.world["entities"][0]["position"] = json!([-3.5, 1., 0.5]);
+        d.update_basis(&o, true, 3.5);
+        assert_eq!(d.preference, Some(expected));
+        assert_eq!((d.ready_pages, d.prefix_busy_retries), (2, 1));
+        let old_basis = d.basis.clone();
+        o.player["position"][2] = json!(0.6);
+        d.update_basis(&o, true, 3.5);
+        assert_ne!(d.basis, old_basis, "changed physical pose reseeds");
+        assert_eq!((d.ready_pages, d.prefix_busy_retries), (0, 0));
+        d.update_basis(&o, false, 3.5);
+        assert_eq!(d.preference, None, "ordinary discovery remains untargeted");
     }
     #[tokio::test]
     async fn completed_unsafe_prefix_gets_one_changed_threat_read_without_player_motion() {
