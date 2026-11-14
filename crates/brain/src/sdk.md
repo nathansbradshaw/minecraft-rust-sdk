@@ -282,7 +282,14 @@ return {
 ObservationQuery table), `sdk` (SDK Action table), `status` / `reconcile` (original
 action ID string), and `navigate` (SDK navigation Goal table). Action/query fields
 match the JSON forms in this reference; use Lua tables, not JSON strings.
-SDK results retain `request`, `receipt`, and `after`; status returns a receipt.
+SDK results retain `request`, `receipt`, and `after`; status/reconcile return a bare
+receipt. Results above32 KiB keep the same receipt layout with exact action ID,
+outcome, verification/release flags (unknown is null), and bounded errors.
+`feedback_view` marks omitted native evidence and hashes the original view;
+`after` may be a focused historical view. Full SDK receipts remain in the Brain
+journal. Use `ctx.observation` for current inventory/scene, never infer an effect
+from omission, dispatch, or a terminal non-success outcome. Pending IDs are still
+inspected without replay before Lua advances.
 Observe returns a compact overview; `ctx.observation` retains the full snapshot.
 In particular, raw sounds are in `ctx.observation.world.auditory.events`.
 The compact model/observe view calls its limited sound list `recent_emissions`;
