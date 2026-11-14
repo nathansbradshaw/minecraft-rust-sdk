@@ -6,6 +6,176 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn readonly_craft_inspection_keeps_original_pending_binding_and_never_writes() {
+    let dir = Temp::new();
+    let path = dir.path();
+    let mut writer = Journal::open(
+        &path,
+        "instance",
+        "own",
+        "old-life",
+        "fixture:recipe",
+        "inspect",
+    )
+    .unwrap();
+    writer.state.pending = Some(ActionRequest {
+        action_id: "inspect-prepare".into(),
+        action: Action::Craft {
+            recipe: "fixture:recipe".into(),
+            menu_id: 17,
+            make_all: false,
+        },
+    });
+    writer.save().unwrap();
+    drop(writer);
+    let lock = path.with_extension("craft-lock");
+    let bytes = fs::read(&path).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let lock_bytes = fs::read(&lock).unwrap();
+    let lock_modified = fs::metadata(&lock).unwrap().modified().unwrap();
+    let before = fs::read_dir(&dir.0).unwrap().count();
+    let result = inspect_craft_journal(&path, "instance", "own", "fixture:recipe", "inspect");
+    assert_eq!(result.status, CraftInspectionStatus::BoundPending);
+    assert!(result.binding_verified);
+    assert_eq!(result.phase, Some(CraftPhase::Prepare));
+    assert_eq!(result.pending_action_id.as_deref(), Some("inspect-prepare"));
+    assert_eq!(result.recorded_life_id.as_deref(), Some("old-life"));
+    assert!(!result.current_life_verified);
+    assert!(result.native_settled.is_none());
+    assert_eq!(result.source_bytes, Some(bytes.len() as u64));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    assert_eq!(fs::read(&lock).unwrap(), lock_bytes);
+    assert_eq!(
+        fs::metadata(&lock).unwrap().modified().unwrap(),
+        lock_modified
+    );
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), before);
+}
+
+#[test]
+fn missing_busy_invalid_and_foreign_craft_journals_remain_unknown_not_settled() {
+    let dir = Temp::new();
+    let path = dir.path();
+    let inspect = || inspect_craft_journal(&path, "instance", "own", "fixture:recipe", "inspect");
+    assert_eq!(inspect().status, CraftInspectionStatus::Unknown);
+    assert!(!path.exists());
+    assert!(!path.with_extension("craft-lock").exists());
+    let writer = Journal::open(
+        &path,
+        "instance",
+        "own",
+        "life",
+        "fixture:recipe",
+        "inspect",
+    )
+    .unwrap();
+    assert_eq!(
+        inspect().status,
+        CraftInspectionStatus::Unknown,
+        "active writer must not expose a stale checkpoint"
+    );
+    drop(writer);
+    let valid = fs::read(&path).unwrap();
+    for (instance, actor, recipe, prefix) in [
+        ("other", "own", "fixture:recipe", "inspect"),
+        ("instance", "other", "fixture:recipe", "inspect"),
+        ("instance", "own", "other:recipe", "inspect"),
+        ("instance", "own", "fixture:recipe", "other"),
+    ] {
+        let result = inspect_craft_journal(&path, instance, actor, recipe, prefix);
+        assert_eq!(result.status, CraftInspectionStatus::Unknown);
+        assert!(!result.binding_verified);
+        assert!(result.pending_action_id.is_none());
+        assert!(result.native_settled.is_none());
+    }
+    for bytes in [
+        b"not json".to_vec(),
+        {
+            let mut state: State = serde_json::from_slice(&valid).unwrap();
+            state.pending = Some(ActionRequest {
+                action_id: "inspect-wrong-phase".into(),
+                action: Action::SelectSlot { slot: 0 },
+            });
+            serde_json::to_vec(&state).unwrap()
+        },
+        {
+            let mut state: State = serde_json::from_slice(&valid).unwrap();
+            state.pending = Some(ActionRequest {
+                action_id: "inspect-prepare".into(),
+                action: Action::SelectSlot { slot: 0 },
+            });
+            serde_json::to_vec(&state).unwrap()
+        },
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        let result = inspect();
+        assert_eq!(result.status, CraftInspectionStatus::Unknown);
+        assert!(result.pending_action_id.is_none());
+        assert!(result.native_settled.is_none());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    #[cfg(unix)]
+    {
+        let linked = dir.0.join("linked.json");
+        std::os::unix::fs::symlink(&path, &linked).unwrap();
+        std::os::unix::fs::symlink(
+            path.with_extension("craft-lock"),
+            linked.with_extension("craft-lock"),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_craft_journal(&linked, "instance", "own", "fixture:recipe", "inspect").status,
+            CraftInspectionStatus::Unknown
+        );
+    }
+}
+
+#[test]
+fn bound_checkpoints_and_completed_history_do_not_infer_no_mutation_or_current_retention() {
+    let dir = Temp::new();
+    let path = dir.path();
+    let writer = Journal::open(
+        &path,
+        "instance",
+        "own",
+        "life",
+        "fixture:recipe",
+        "inspect",
+    )
+    .unwrap();
+    drop(writer);
+    let result = inspect_craft_journal(&path, "instance", "own", "fixture:recipe", "inspect");
+    assert_eq!(result.status, CraftInspectionStatus::BoundCheckpoint);
+    assert!(result.native_settled.is_none());
+    let mut writer = Journal::open(
+        &path,
+        "instance",
+        "own",
+        "life",
+        "fixture:recipe",
+        "inspect",
+    )
+    .unwrap();
+    writer.state.phase = CraftPhase::Completed;
+    writer.state.output = Some(Output {
+        menu_id: 17,
+        menu_type: "fixture:table".into(),
+        slot: 0,
+        item: "fixture:result".into(),
+        count: 4,
+    });
+    writer.state.before_store = Some(0);
+    writer.save().unwrap();
+    drop(writer);
+    let result = inspect_craft_journal(&path, "instance", "own", "fixture:recipe", "inspect");
+    assert_eq!(result.status, CraftInspectionStatus::CompletedHistory);
+    assert!(result.pending_action_id.is_none());
+    assert!(result.native_settled.is_none());
+    assert!(!result.current_life_verified);
+}
+
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
