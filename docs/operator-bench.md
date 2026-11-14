@@ -44,6 +44,16 @@ SHA-256 of the reviewed fixture, with real allocated UUIDs and pinned artifacts;
 placeholders fail validation. Each command is attempted once in that directory.
 A failed command is retained, not replaced with a successful-looking attempt.
 
+A failed child process emits its operator step label and writes
+`STEP.failure-step.json` beside the retained output/status files. This closed
+metadata contains exit/timeout/output-limit flags, a callback-error boolean and
+relative evidence filenames, never argv, environment, child output or error
+payloads. A runner error has unknown flags and no retained-file claims. The
+diagnostic write is best effort, does not overwrite evidence, and cannot change
+the original error or cleanup. A successful process followed by JSON/fixture
+validation failure is not labelled as a failed process; that phase remains
+unknown. This diagnostic is not gameplay or harness acceptance.
+
 The automatic `run` path requires RCON and immediately chains stage and launch.
 It performs expensive SDK/artifact/filesystem preflight before connecting, then
 rechecks only the frozen container generation and local fixture at launch.
