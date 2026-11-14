@@ -311,3 +311,8 @@ pressure case must explicitly use and check `completion_inventory: {}`; a kit
 acquisition case must declare its required items. An inherited kit goal can keep
 a successfully run helper working beyond its intended completion. Never rewrite
 an already-run fixture or turn that observation into survival credit.
+
+For large regenerable dependency inputs, use the reviewed opt-in
+[read-only dependency corpus](read-only-dependency-corpora.md) contract. Ordinary
+directories named `vendor` remain archived; changed or unverifiable corpora and
+true size overflow remain incomplete.
