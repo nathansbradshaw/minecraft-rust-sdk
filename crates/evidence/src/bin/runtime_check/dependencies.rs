@@ -119,7 +119,8 @@ impl Scan {
     }
 }
 pub(super) fn inspect(root: &Path) -> io::Result<serde_json::Value> {
-    if !root.is_absolute()
+    if root.to_str().is_none()
+        || !root.is_absolute()
         || fs::canonicalize(root)? != root
         || !fs::symlink_metadata(root)?.is_dir()
     {
