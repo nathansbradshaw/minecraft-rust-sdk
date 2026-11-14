@@ -43,12 +43,22 @@ async fn main() -> Result<()> {
     }
     let mode = args.get(1).and_then(|value| Mode::parse(value))
         .filter(|mode| mode.accepts_arity(args.len()))
-        .ok_or("body-probe PRIVATE_CONFIG.json blocked|compile|exposed|task|task-exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe PRIVATE_CONFIG.json shore SECONDS PRIVATE_SPEC.json | body-probe inspect-observation PRIVATE_OBSERVATION.json")?;
+        .ok_or("body-probe PRIVATE_CONFIG.json blocked|compile|exposed|task|task-exposed SECONDS [PRIVATE_STIMULUS.json] | body-probe PRIVATE_CONFIG.json task-kit 1200 PRIVATE_STIMULUS.json | body-probe PRIVATE_CONFIG.json navigate SECONDS GOAL.json | body-probe PRIVATE_CONFIG.json shore SECONDS PRIVATE_SPEC.json | body-probe inspect-observation PRIVATE_OBSERVATION.json")?;
     let seconds: u64 = args[2].parse()?;
-    if !(1..=600).contains(&seconds) {
-        return Err("Diagnostic duration must be 1–600 seconds".into());
+    if !mode.accepts_seconds(seconds) {
+        return Err(
+            "Diagnostic duration must be1–600 seconds; task-kit requires exactly1200".into(),
+        );
     }
     let mut cfg: Config = serde_json::from_slice(&private_read(Path::new(&args[0]), 16384)?)?;
+    if mode == Mode::TaskKit {
+        ensure(
+            serde_json::to_value(&cfg.completion_inventory)?
+                == json!({"minecraft:crafting_table":1,"minecraft:wooden_pickaxe":1})
+                && !cfg.goal.trim().is_empty(),
+            "task-kit requires an explicit retained table/pickaxe goal contract",
+        )?;
+    }
     let shore = (args[1] == "shore")
         .then(|| shore_probe::Spec::read(Path::new(&args[3])))
         .transpose()?;
@@ -68,8 +78,10 @@ async fn main() -> Result<()> {
     let mut final_scene = None;
     let mut task_outcome = None;
     let run=async {
+        let mut admitted_at = Instant::now();
         if let Some(spec)=&admission {
             brain.observed=probe_admission::wait(&mut brain,spec).await?;
+            admitted_at = Instant::now();
             brain.cfg.body.enabled=enable_body;
             if enable_body {
                 let profile: minecraft_sdk::Profile=serde_json::from_slice(&private_read(&brain.cfg.profile,16384)?)?;
@@ -77,7 +89,7 @@ async fn main() -> Result<()> {
             }
         }
         continuity=Some(probe_continuity::Monitor::start(&brain, mode == Mode::TaskExposed).await?);
-        let started = Instant::now();
+        let started = if mode == Mode::TaskKit {admitted_at}else{Instant::now()};
         let initial_scene = brain.client.observe().await?;
         brain.journal.event("body_probe_scene", json!({"phase":"after_body_startup",
             "scope":"Full SDK observation; body may already be acting. Optional stimulus admission is the earlier start-state witness.",
@@ -133,8 +145,15 @@ async fn main() -> Result<()> {
             // and local gameplay arbiter keep receiving real SDK observations.
             tokio::time::sleep(Duration::from_secs(seconds)).await;
         }
-        if shore.is_none() && started.elapsed()<Duration::from_secs(seconds) {tokio::time::sleep(Duration::from_secs(seconds)-started.elapsed()).await;}
+        if shore.is_none() && mode != Mode::TaskKit && started.elapsed()<Duration::from_secs(seconds) {tokio::time::sleep(Duration::from_secs(seconds)-started.elapsed()).await;}
         let observed=brain.client.observe().await?;
+        if mode == Mode::TaskKit {
+            let table = minecraft_sdk::menu::item_count(&observed,"minecraft:crafting_table")?;
+            let pick = minecraft_sdk::menu::item_count(&observed,"minecraft:wooden_pickaxe")?;
+            brain.journal.event("body_probe_kit_final",json!({"retained_crafting_table":table,"retained_wooden_pickaxe":pick,
+                "observation":observed,"scope":"Final native observation before body stop; external saved-state, original-life and real-attack evidence still required. No benchmark verdict."}))?;
+            ensure(table >= 1 && pick >= 1,"task-kit ended without retained table and wooden pickaxe")?;
+        }
         final_scene=Some(observed.clone());
         brain.journal.event("body_probe_finished",json!({"utc_ms":probe_continuity::utc_ms()?,"elapsed_ms":started.elapsed().as_millis(),"health":observed.player["health"],"food":observed.player["food"],"position":observed.player["position"],"revision":observed.revision,"body":brain.body.as_ref().map(|b|b.shared.view()),"models_called":mode.models_called(),"task_workload":task_outcome,"ordinary_respawn_is_not_survival_success":true}))?;
         brain.journal.event("body_probe_scene",json!({"phase":"before_body_stop",

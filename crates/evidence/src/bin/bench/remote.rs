@@ -606,6 +606,7 @@ mod tests {
                 signal: None,
                 interrupted: false,
                 callback_error: None,
+                output_limit_exceeded: false,
             })
         }
     }
@@ -764,6 +765,7 @@ mod tests {
                     signal: None,
                     interrupted: false,
                     callback_error: None,
+                    output_limit_exceeded: false,
                 })
             }
         }

@@ -16,6 +16,7 @@ pub(super) enum Mode {
     Shore,
     Task,
     TaskExposed,
+    TaskKit,
 }
 impl Mode {
     pub(super) fn parse(value: &str) -> Option<Self> {
@@ -27,24 +28,32 @@ impl Mode {
             "shore" => Self::Shore,
             "task" => Self::Task,
             "task-exposed" => Self::TaskExposed,
+            "task-kit" => Self::TaskKit,
             _ => return None,
         })
     }
     pub(super) fn accepts_arity(self, n: usize) -> bool {
-        if matches!(self, Self::Navigate | Self::Shore) {
+        if matches!(self, Self::Navigate | Self::Shore | Self::TaskKit) {
             n == 4
         } else {
             matches!(n, 3 | 4)
         }
     }
     pub(super) fn is_task(self) -> bool {
-        matches!(self, Self::Task | Self::TaskExposed)
+        matches!(self, Self::Task | Self::TaskExposed | Self::TaskKit)
     }
     pub(super) fn body_enabled(self) -> bool {
         !matches!(self, Self::Exposed | Self::TaskExposed)
     }
     pub(super) fn models_called(self) -> Option<u64> {
         if self.is_task() { None } else { Some(0) }
+    }
+    pub(super) fn accepts_seconds(self, seconds: u64) -> bool {
+        if self == Self::TaskKit {
+            seconds == 1200
+        } else {
+            (1..=600).contains(&seconds)
+        }
     }
 }
 
@@ -114,6 +123,17 @@ mod tests {
         assert_eq!(Mode::parse("blocked").unwrap().models_called(), Some(0));
         assert!(!Mode::parse("navigate").unwrap().accepts_arity(3));
         assert!(Mode::parse("unknown").is_none());
+    }
+    #[test]
+    fn kit_task_has_its_own_exact_maximum_and_requires_admission() {
+        let mode = Mode::parse("task-kit").unwrap();
+        assert!(mode.is_task() && mode.body_enabled() && mode.accepts_arity(4));
+        assert!(!mode.accepts_arity(3));
+        assert_eq!(mode.models_called(), None);
+        assert!(mode.accepts_seconds(1200));
+        assert!(!mode.accepts_seconds(600) && !mode.accepts_seconds(1201));
+        assert!(Mode::Task.accepts_seconds(600));
+        assert!(!Mode::Task.accepts_seconds(1200));
     }
     #[tokio::test]
     async fn completed_and_failed_engine_futures_are_not_native_goal_acceptance() {
