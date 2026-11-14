@@ -96,6 +96,19 @@ fn relative(path: &Path) -> bool {
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
+fn present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            ensure(
+                !meta.file_type().is_symlink(),
+                "restore aliases, including dangling symlinks, are forbidden",
+            )?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
 fn beneath(root: &Path, path: &Path) -> Result<()> {
     ensure(
         canonical(path)?.starts_with(root) && path != root,
@@ -351,20 +364,24 @@ fn validate(s: &Spec, f: &Fixture) -> Result<Vec<PathBuf>> {
                 && !f.secret_dir.starts_with(&destination),
             "restore paths cannot overlap bot mounts",
         )?;
-        if destination.exists() {
+        if present(&destination)? {
             canonical(&destination)?;
         }
         let parent = destination.parent().ok_or("restore parent absent")?;
         beneath(&s.root, parent)?;
     }
     let db = s.root.join(&s.database.destination);
-    if db.exists() {
+    if present(&db)? {
         database(&db, &f.instance_id)?;
     }
     database(&s.database.file.path, &f.instance_id)?;
     for suffix in ["-wal", "-shm"] {
         ensure(
-            !PathBuf::from(format!("{}{}", s.database.file.path.display(), suffix)).exists(),
+            !present(&PathBuf::from(format!(
+                "{}{}",
+                s.database.file.path.display(),
+                suffix
+            )))?,
             "frozen database must be standalone without WAL/SHM",
         )?;
     }
@@ -372,6 +389,12 @@ fn validate(s: &Spec, f: &Fixture) -> Result<Vec<PathBuf>> {
         f.operator_gateway_journal.as_ref() == Some(&db),
         "fixture must bind restored operator gateway database",
     )?;
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{}", db.display(), suffix));
+        if present(&side)? {
+            canonical(&side)?;
+        }
+    }
     ensure(
         s.archives.iter().all(|a| {
             !paths
@@ -549,13 +572,13 @@ fn install(
             &json!({"relative":path,"recovery":saved,"old_exists":target.exists(),"replay_permitted":false}),
         )?;
         fs::File::open(case)?.sync_all()?;
-        if target.exists() {
+        if present(&target)? {
             durable_rename(&target, &saved)?;
         }
         if path == &s.database.destination {
             for suffix in ["-wal", "-shm"] {
                 let side = PathBuf::from(format!("{}{}", target.display(), suffix));
-                if side.exists() {
+                if present(&side)? {
                     canonical(&side)?;
                     durable_rename(
                         &side,

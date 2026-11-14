@@ -407,3 +407,23 @@ fn remaining_combined_archive_budget_is_enforced_before_file_creation() {
     );
     assert!(!out.join("world/file").exists());
 }
+#[test]
+fn dangling_restore_root_and_database_sidecar_aliases_fail_before_mutation() {
+    for sidecar in [false, true] {
+        let (setup, spec) = prepared();
+        let alias = if sidecar {
+            spec.root.join("runtime/gateway.sqlite-wal")
+        } else {
+            spec.root.join("server/world")
+        };
+        std::os::unix::fs::symlink(spec.root.join("missing-recovery-target"), &alias).unwrap();
+        assert!(validate(&spec, &setup.f).is_err());
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!spec.root.join("runtime/gateway.sqlite").exists());
+    }
+}
