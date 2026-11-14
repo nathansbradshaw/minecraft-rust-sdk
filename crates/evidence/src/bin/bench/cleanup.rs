@@ -322,7 +322,7 @@ mod tests {
             death_frames: 2,
             kills: 0,
         };
-        run(&mut c, &s.f, &s.case, s.f.expected_npc_position).unwrap();
+        run(&mut c, &s.f, &s.case, s.f.skeleton_npc().unwrap().1).unwrap();
         assert_eq!(c.kills, 1);
         assert_eq!(c.loads, c.initial);
         let result = json(&s.case.join("cleanup-npc-settlement.json"), 65536).unwrap();
@@ -340,7 +340,7 @@ mod tests {
             death_frames: usize::MAX,
             kills: 0,
         };
-        let npc = rcon::EntityUuid::parse(&s.f.npc_uuid).unwrap();
+        let npc = rcon::EntityUuid::parse(s.f.skeleton_npc().unwrap().0).unwrap();
         assert!(
             settle_after_kill(
                 &mut c,
