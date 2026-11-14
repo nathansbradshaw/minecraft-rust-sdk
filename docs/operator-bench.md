@@ -1,5 +1,9 @@
 # Run a bounded operator fixture
 
+For the separate no-NPC1200-second Brain acquisition path, see
+[qa-acquisition-lifecycle.md](qa-acquisition-lifecycle.md). Its source preparation
+and validation status are tracked separately from this120-second skeleton mode.
+
 The operator commands prepare, run and close one frozen fixture. Their receipts
 record failures and incomplete cleanup; they never award gameplay success.
 The isolated RCON list fast path checks the installation without an actor:

@@ -141,7 +141,8 @@ pub fn run(client: &mut dyn Console, f: &Fixture, case: &Path, last: [f64; 3]) -
         (last[0] / 16.).floor() as i32,
         (last[2] / 16.).floor() as i32,
     );
-    let npc = rcon::EntityUuid::parse(&f.npc_uuid)?;
+    let (npc_uuid, _) = f.skeleton_npc()?;
+    let npc = rcon::EntityUuid::parse(npc_uuid)?;
     let mut added = Vec::new();
     let mut possibly_added = Vec::new();
     let mut restored = BTreeSet::new();
@@ -332,9 +333,9 @@ mod tests {
             alive: true,
             death_frames: 0,
             kills: 0,
-            position: s.f.expected_npc_position,
+            position: s.f.skeleton_npc().unwrap().1,
         };
-        run(&mut c, &s.f, &s.case, s.f.expected_npc_position).unwrap();
+        run(&mut c, &s.f, &s.case, s.f.skeleton_npc().unwrap().1).unwrap();
         assert_eq!(c.loads, c.initial);
         assert_eq!(c.removed.len(), 8);
         assert!(!c.removed.contains(&(16, -45)));
@@ -353,9 +354,9 @@ mod tests {
             alive: false,
             death_frames: 0,
             kills: 0,
-            position: s.f.expected_npc_position,
+            position: s.f.skeleton_npc().unwrap().1,
         };
-        assert!(run(&mut c, &s.f, &s.case, s.f.expected_npc_position).is_err());
+        assert!(run(&mut c, &s.f, &s.case, s.f.skeleton_npc().unwrap().1).is_err());
         assert!(c.loads.is_empty());
         assert_eq!(
             json(&s.case.join("cleanup-result.json"), 65536).unwrap()["complete"],
@@ -373,9 +374,9 @@ mod tests {
             alive: true,
             death_frames: 2,
             kills: 0,
-            position: s.f.expected_npc_position,
+            position: s.f.skeleton_npc().unwrap().1,
         };
-        run(&mut c, &s.f, &s.case, s.f.expected_npc_position).unwrap();
+        run(&mut c, &s.f, &s.case, s.f.skeleton_npc().unwrap().1).unwrap();
         assert_eq!(c.kills, 1);
         assert_eq!(c.loads, c.initial);
         let result = json(&s.case.join("cleanup-npc-settlement.json"), 65536).unwrap();
@@ -392,9 +393,9 @@ mod tests {
             alive: false,
             death_frames: usize::MAX,
             kills: 0,
-            position: s.f.expected_npc_position,
+            position: s.f.skeleton_npc().unwrap().1,
         };
-        let npc = rcon::EntityUuid::parse(&s.f.npc_uuid).unwrap();
+        let npc = rcon::EntityUuid::parse(s.f.skeleton_npc().unwrap().0).unwrap();
         assert!(
             settle_after_kill(
                 &mut c,
