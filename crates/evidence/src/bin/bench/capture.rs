@@ -320,6 +320,6 @@ pub(super) fn native_with_space(
     }
     save(
         &case.join("capture-manifest.json"),
-        &json!({"case_id":f.case_id,"player_uuid":f.player_uuid,"trace_sha256":sha256(&trace_bytes),"original_rows_sha256":hash_file(&case.join("original-rows.json"))?,"all_original_actions":expected.len(),"outcomes":outcomes,"native_reports":files,"saved_inputs":stats_files,"handler_sidecars":handler_streams,"missing_sidecars_are_unknown":true,"projection_sha256":sha256(&projection),"non_json_lines_retained":non_json,"certifies_goal_completion":false,"aggregate_reports_warning":"Do not average shard percentiles or drop missing/uncertain attempts."}),
+        &json!({"case_id":f.case_id,"player_uuid":f.player_uuid,"trace_sha256":sha256(&trace_bytes),"original_rows_sha256":hash_file(&case.join("original-rows.json"))?,"all_original_actions":expected.len(),"action_scope":if f.is_combined(){"all actor prefixes after a pristine baseline"}else{"one frozen body prefix"},"action_limit":f.action_limit(),"trace_byte_limit":f.trace_bytes_limit(),"native_report_bytes":report_bytes,"outcomes":outcomes,"native_reports":files,"saved_inputs":stats_files,"handler_sidecars":handler_streams,"missing_sidecars_are_unknown":true,"projection_sha256":sha256(&projection),"non_json_lines_retained":non_json,"certifies_goal_completion":false,"aggregate_reports_warning":"Do not average shard percentiles or drop missing/uncertain attempts."}),
     )
 }

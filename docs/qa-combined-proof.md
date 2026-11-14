@@ -42,7 +42,9 @@ observation, then uses the shared finalizers. A healthy respawn, placed table,
 cursor output or model completion claim cannot replace original-life continuity,
 zero saved death delta and retained player inventory. Actual ordinary-skeleton
 attack evidence and real model/tool intervals in this same episode are separate
-required external checks. Freeze health/timing/attack criteria and operator
+required external checks. Native attack timestamps must overlap actual model/tool
+work. An attack confined to setup or the period after task completion is insufficient.
+Freeze health/timing/attack criteria and operator
 assists before GO. The helper awards no benchmark PASS.
 
 ## Bounded evidence without prefix omissions
