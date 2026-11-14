@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1/provider-investigation-v1/canonical-menu-questions-v1/opt-in-acquisition-v1/serialized-wire-budget-v1/task-lineage-v1/lua-invocation-v1";
 mod active_source;
+mod backend_timing;
 mod context_attestation;
 #[cfg(test)]
 mod conversation_refinement_tests;
@@ -443,9 +444,10 @@ impl Model {
         let content = envelope["message"]["content"]
             .as_str()
             .ok_or("Model content missing")?;
+        let backend = backend_timing::usage(&envelope);
         Ok((
             content.to_owned(),
-            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium"|"high")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":context_sha256,"context_attestation":attestation,"request_wire":prepared.metadata,"payload_repair":payload_repair,"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
+            json!({"model":model,"purpose":purpose,"backend_request_id":backend["backend_request_id"],"backend_timing":backend["backend_timing"],"backend_total_duration_ns":backend["backend_total_duration_ns"],"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium"|"high")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":context_sha256,"context_attestation":attestation,"request_wire":prepared.metadata,"payload_repair":payload_repair,"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
         ))
     }
     async fn request_transport(&self, body: &[u8]) -> Result<(Value, usize, u8)> {
