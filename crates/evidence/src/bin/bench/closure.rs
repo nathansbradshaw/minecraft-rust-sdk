@@ -55,7 +55,7 @@ fn snapshot(f: &Fixture, case: &Path) -> Result<bool> {
         "authoritative gateway bot ID/UUID differs",
     )?;
     // Any row blocks closure, including connecting or unrecognized states.
-    let sessions: u64 = tx.query_row("SELECT count(*) FROM sessions WHERE bot=?1", [bot], |r| {
+    let sessions: i64 = tx.query_row("SELECT count(*) FROM sessions WHERE bot=?1", [bot], |r| {
         r.get(0)
     })?;
     tx.commit()?;
