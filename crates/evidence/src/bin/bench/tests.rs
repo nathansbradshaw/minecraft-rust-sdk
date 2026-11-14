@@ -202,6 +202,40 @@ fn unsupported_runtime_socket_stops_before_actor_connection() {
     assert!(!s.case.join("stage-intent.json").exists());
 }
 #[test]
+fn actual_compiler_environment_names_pass_but_credentials_and_unknown_names_fail() {
+    let s = setup();
+    let mut fixture = mounts(&s.f);
+    // F10's original selected inspect output contained these names, never values.
+    fixture["env_names"] = json!([
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "CARGO_INCREMENTAL",
+        "CARGO_BUILD_JOBS",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "MC_SDK_CA_CERT",
+        "MC_SDK_SOURCE",
+        "PATH",
+        "RUSTUP_HOME",
+        "RUST_VERSION",
+        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+        "CC_x86_64_unknown_linux_gnu",
+        "CXX_x86_64_unknown_linux_gnu",
+        "PKG_CONFIG_ALLOW_CROSS",
+        "PKG_CONFIG_LIBDIR"
+    ]);
+    config::validate_mounts(&s.f, &fixture).unwrap();
+    for name in [
+        "GITHUB_TOKEN",
+        "CODEX_HOME",
+        "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+        "CARGO_UNREVIEWED",
+    ] {
+        let mut bad = fixture.clone();
+        bad["env_names"].as_array_mut().unwrap().push(json!(name));
+        assert!(config::validate_mounts(&s.f, &bad).is_err(), "{name}");
+    }
+}
+#[test]
 fn mounts_reject_rw_secret_alias_and_unreviewed_credentials() {
     let s = setup();
     let mut m = mounts(&s.f);
