@@ -8,6 +8,252 @@ pub struct RetainedInventory {
     pub item: String,
     pub minimum: u64,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct AcquisitionBasis {
+    actor: String,
+    life: String,
+    dimension: String,
+    epoch: String,
+}
+impl AcquisitionBasis {
+    fn matches(&self, o: &Observation) -> bool {
+        o.player["uuid"] == self.actor
+            && o.player["life_id"] == self.life
+            && o.player["dimension"] == self.dimension
+            && o.world["sample_clock"]["epoch"] == self.epoch
+    }
+}
+/// One persisted cancellation intention, separate from the original movement
+/// and its unchanged native receipt. A local pre-dispatch rejection is not a
+/// native cancellation effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryCancellation {
+    pub request: ActionRequest,
+    pub control_action_id: String,
+    pub outcome: Option<Outcome>,
+    pub condition: RetainedInventory,
+    pub observed_count: u64,
+    pub observation_revision: String,
+    pub actor: String,
+    pub life: String,
+    pub dimension: String,
+    pub sample_clock: serde_json::Value,
+    #[serde(default)]
+    pub local_pre_dispatch_rejected: bool,
+}
+pub(super) fn movement_basis(
+    condition: Option<&RetainedInventory>,
+    o: &Observation,
+) -> Result<Option<AcquisitionBasis>> {
+    if condition.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(AcquisitionBasis {
+        actor: text(&o.player, "uuid")?.into(),
+        life: text(&o.player, "life_id")?.into(),
+        dimension: text(&o.player, "dimension")?.into(),
+        epoch: text(&o.world["sample_clock"], "epoch")?.into(),
+    }))
+}
+fn validate_cancellation(j: &Journal, record: &InventoryCancellation) -> Result<()> {
+    let pending = j
+        .state
+        .pending
+        .as_ref()
+        .ok_or_else(|| local("Cancellation lost its original movement"))?;
+    let basis = pending
+        .basis
+        .as_ref()
+        .ok_or_else(|| local("Cancellation lacks original life binding"))?;
+    let original = &pending.request.action_id;
+    if record.control_action_id != *original
+        || record.request.action_id != format!("{original}-acquisition-cancel")
+        || !valid_id(&record.request.action_id)
+        || !matches!(&record.request.action,Action::CancelControl{action_id} if action_id==original)
+        || j.state.until_inventory.as_ref() != Some(&record.condition)
+        || record.observed_count < record.condition.minimum
+        || record.observation_revision.is_empty()
+        || record.actor != basis.actor
+        || record.life != basis.life
+        || record.dimension != basis.dimension
+        || record.sample_clock["epoch"] != basis.epoch
+    {
+        return Err(error(
+            ErrorCode::Conflict,
+            "Acquisition cancellation does not match the saved condition, original input and life",
+        ));
+    }
+    Ok(())
+}
+/// Resume only reads/reconciliation of an existing cancellation ID. Never POST
+/// its request again, even when the first response was lost or the ID is absent.
+pub(super) async fn settle_cancellation(
+    client: &Client,
+    j: &mut Journal,
+) -> Result<Option<Report>> {
+    let Some(record) = j
+        .state
+        .pending
+        .as_ref()
+        .and_then(|p| p.cancellation.clone())
+    else {
+        return Ok(None);
+    };
+    validate_cancellation(j, &record)?;
+    if record.outcome.as_ref().is_some_and(Outcome::terminal) {
+        return Ok(None);
+    }
+    let id = record.request.action_id;
+    let receipt = match client.action_status(&id).await {
+        Ok(receipt) => receipt,
+        Err(e) if e.code == ErrorCode::NotFound => {
+            let mut report=j.report("needs_reconciliation","The persisted cancellation ID is missing. Preserve it and the original movement; never replay either mutation.");
+            report.pending_action = Some(id);
+            return Ok(Some(report));
+        }
+        Err(e) => return Err(e),
+    };
+    if receipt.action_id != id {
+        return Err(error(
+            ErrorCode::Conflict,
+            "Cancellation receipt ID mismatch",
+        ));
+    }
+    let receipt = if matches!(
+        receipt.outcome,
+        Outcome::Prepared | Outcome::Dispatched | Outcome::Uncertain
+    ) {
+        client.reconcile(&id).await?
+    } else {
+        receipt
+    };
+    if receipt.action_id != id {
+        return Err(error(
+            ErrorCode::Conflict,
+            "Reconciled cancellation ID mismatch",
+        ));
+    }
+    j.state
+        .pending
+        .as_mut()
+        .and_then(|p| p.cancellation.as_mut())
+        .ok_or_else(|| local("Cancellation vanished"))?
+        .outcome = Some(receipt.outcome.clone());
+    j.save()?;
+    if matches!(
+        receipt.outcome,
+        Outcome::Prepared | Outcome::Dispatched | Outcome::Uncertain
+    ) {
+        let mut report=j.report("needs_reconciliation","Cancellation remains unresolved after explicit reconciliation. Its exact ID and original movement are retained without replay or effect credit.");
+        report.pending_action = Some(id);
+        return Ok(Some(report));
+    }
+    Ok(None)
+}
+/// Called only for the exact saved Running movement, at a bounded read cadence.
+pub(super) async fn cancel_running_if_satisfied(client: &Client, j: &mut Journal) -> Result<()> {
+    let Some(condition) = j.state.until_inventory.clone() else {
+        return Ok(());
+    };
+    let pending = j
+        .state
+        .pending
+        .as_ref()
+        .ok_or_else(|| local("Running movement absent"))?;
+    if pending.cancellation.is_some() {
+        return Ok(());
+    }
+    // Upgraded older journals did not retain a per-intention life. They can
+    // still finish normally, but cannot authorize an in-flight cancellation.
+    let Some(basis) = pending.basis.clone() else {
+        return Ok(());
+    };
+    if !matches!(pending.request.action, Action::StartMove { .. }) {
+        return Err(error(
+            ErrorCode::Conflict,
+            "Acquisition cancellation requires the saved navigation movement",
+        ));
+    }
+    let id = pending.request.action_id.clone();
+    let observed = client.observe().await?;
+    if menu::item_count(&observed, &condition.item)? < condition.minimum {
+        return Ok(());
+    }
+    let fresh = menu::observe_fresh(client).await?;
+    validate_fresh(&observed, &fresh, &j.state.actor, j.state.goal.dimension())?;
+    if !basis.matches(&fresh) {
+        return Err(error(
+            ErrorCode::Conflict,
+            "Running movement life/epoch changed; no cancellation dispatched",
+        ));
+    }
+    let count = menu::item_count(&fresh, &condition.item)?;
+    if count < condition.minimum
+        || fresh.player["control"]["action_id"] != id
+        || fresh.player["control"]["outcome"] != "running"
+        || fresh.player["control"]["input_released"] == true
+    {
+        return Ok(());
+    }
+    let request = ActionRequest {
+        action_id: format!("{id}-acquisition-cancel"),
+        action: Action::CancelControl {
+            action_id: id.clone(),
+        },
+    };
+    if !valid_id(&request.action_id) {
+        return Err(error(
+            ErrorCode::InvalidRequest,
+            "Cancellation ID exceeds the durable-ID contract",
+        ));
+    }
+    request.action.validate()?;
+    let record = InventoryCancellation {
+        request: request.clone(),
+        control_action_id: id,
+        outcome: None,
+        condition,
+        observed_count: count,
+        observation_revision: fresh.revision.clone(),
+        actor: basis.actor,
+        life: basis.life,
+        dimension: basis.dimension,
+        sample_clock: fresh.world["sample_clock"].clone(),
+        local_pre_dispatch_rejected: false,
+    };
+    j.state
+        .pending
+        .as_mut()
+        .ok_or_else(|| local("Running movement vanished"))?
+        .cancellation = Some(record);
+    j.save()?; // Prepared once before POST; interruption never causes a retry.
+    let response = client.act(&request).await;
+    let record = j
+        .state
+        .pending
+        .as_mut()
+        .and_then(|p| p.cancellation.as_mut())
+        .ok_or_else(|| local("Cancellation vanished after dispatch"))?;
+    match response {
+        Ok(receipt) => {
+            if receipt.action_id != request.action_id {
+                return Err(error(
+                    ErrorCode::Conflict,
+                    "Cancellation dispatch receipt ID mismatch",
+                ));
+            }
+            record.outcome = Some(receipt.outcome);
+        }
+        Err(e) if client.local_arbiter.is_some() && e.code == ErrorCode::LocalPreempted => {
+            record.outcome = Some(Outcome::Rejected);
+            record.local_pre_dispatch_rejected = true;
+        }
+        Err(e) => return Err(e),
+    }
+    j.save()?;
+    Ok(())
+}
 impl RetainedInventory {
     pub fn validate(&self) -> Result<()> {
         if !registry_id(&self.item) || !(1..=1_000_000).contains(&self.minimum) {
@@ -294,6 +540,8 @@ mod tests {
             scene: "scene".into(),
             target: [1., 1., 1.],
             outcome: Some(Outcome::Rejected),
+            basis: None,
+            cancellation: None,
             arrival_verification: Some(
                 serde_json::json!({"kind":"local_pre_dispatch_rejection","native_effect_verified":false,"gateway_dispatch_attempted":false}),
             ),
