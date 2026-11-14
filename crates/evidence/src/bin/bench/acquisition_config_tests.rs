@@ -15,7 +15,7 @@ fn update_config(f: &mut Fixture, edit: impl FnOnce(&mut Value)) {
     fs::write(&file, serde_json::to_vec(&cfg).unwrap()).unwrap();
     f.artifacts[index].file.sha256 = hash_file(&file).unwrap();
 }
-fn acquisition() -> super::tests::Setup {
+pub(super) fn acquisition() -> super::tests::Setup {
     let mut setup = super::tests::setup();
     let config = setup.f.config_path().unwrap().to_owned();
     let admission = setup.f.handler_args[3].clone();
