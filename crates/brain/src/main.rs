@@ -11,6 +11,21 @@ async fn main() {
 }
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 3 && args[0] == "model-wire-preview" {
+        let context: serde_json::Value =
+            serde_json::from_slice(&private_read(std::path::Path::new(&args[1]), 131072)?)?;
+        let (sol, development) = match args[2].to_str() {
+            Some("plan") => (false, false),
+            Some("develop") => (true, true),
+            Some("fallback") => (false, true),
+            _ => return Err("Preview mode must be plan, develop or fallback".into()),
+        };
+        println!(
+            "{}",
+            minecraft_sdk_brain::model::request_wire_preview(&context, sol, development)?
+        );
+        return Ok(());
+    }
     if args.len() == 1 && args[0] == "decision-worker" {
         return minecraft_sdk_brain::worker::serve().await;
     }

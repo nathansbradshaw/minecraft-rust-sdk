@@ -1426,7 +1426,7 @@ impl Brain {
                 Err(e) => {
                     let retry_at = model::retry_at(e.as_ref());
                     self.journal
-                        .event("model_error", json!({"error":e.to_string(),"turn":turn,"retry_at_utc":retry_at,"unchanged_failure_polling":false}))?;
+                        .event("model_error", json!({"error":e.to_string(),"request_wire":model::failure_metadata(e.as_ref()),"turn":turn,"retry_at_utc":retry_at,"unchanged_failure_polling":false}))?;
                     if daily_unavailable {
                         self.journal.event("model_allocation_unavailable",json!({"development":develop,"retry_at_utc":retry_at,"other_model_work_allowed":true,"allowances_changed":false}))?;
                         continue;

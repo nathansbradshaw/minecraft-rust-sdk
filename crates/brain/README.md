@@ -190,6 +190,22 @@ may already have consumed an admission; the broker ledger remains authoritative.
 Usage records include attempt count and separate prompt/context hashes. HTTP
 refusals and model JSON/schema errors do not receive this transport retry.
 
+Requests fit the **complete serialized HTTP JSON within65,536 bytes**, including
+the escaped context, system prompt and schema; each message remains within32 KiB.
+Optional historical views may be omitted whole with explicit hash/size metadata.
+Current observations, goal/completion contracts, pending IDs, latest feedback and
+repair contracts remain unchanged. Optional plans and source are complete or
+honestly unavailable. If required content cannot fit, no request is submitted.
+A typed HTTP413 permits one strictly smaller, changed request with the same
+model/purpose/contracts; a second refusal or inability to compact stops. It
+never permits an unchanged retry, model hopping, gameplay replay or more allowance.
+`request_wire`/`payload_repair` and failure records preserve bounded diagnostics;
+failed admissions remain unknown until checked against the broker ledger.
+Use `minecraft-sdk-brain model-wire-preview PRIVATE_CONTEXT.json plan` to inspect
+the actual production serializer/fitting metadata without inference or gameplay.
+Modes `develop` and `fallback` inspect coding-purpose Sol and Luna respectively.
+The preview emits hashes/counts and final-context attestation, never the payload.
+
 `model-probe HTTPS_ENDPOINT ALLOCATED_KEY routine|develop LABEL` checks an
 allocated inference capability without connecting a character or executing a
 returned tool. Record its actual admission and outcome; it proves inference,
