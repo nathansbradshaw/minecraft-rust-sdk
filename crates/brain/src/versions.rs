@@ -294,7 +294,7 @@ impl Journal {
         let mut imported = 0;
         for _ in 0..64 {
             let rows: Vec<(i64, String, Option<String>)> = {
-                let mut q=self.db.prepare("SELECT e.id,e.data,(SELECT json_extract(g.data,'$.goal') FROM events g WHERE g.id<e.id AND g.kind IN ('brain_started','player_goal_selected','agent_goal_selected') ORDER BY g.id DESC LIMIT 1) FROM events e WHERE e.kind='choice' AND e.id>?1 ORDER BY e.id LIMIT 64")?;
+                let mut q=self.db.prepare("SELECT e.id,e.data,(SELECT json_extract(g.data,'$.goal') FROM events g WHERE g.id<e.id AND g.kind IN ('brain_started','player_goal_selected','agent_goal_selected','conversation_goal_selected','conversation_goal_refined') ORDER BY g.id DESC LIMIT 1) FROM events e WHERE e.kind='choice' AND e.id>?1 ORDER BY e.id LIMIT 64")?;
                 q.query_map([cursor], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<std::result::Result<_, _>>()?
             };

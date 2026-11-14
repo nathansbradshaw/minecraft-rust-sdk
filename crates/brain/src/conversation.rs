@@ -102,7 +102,11 @@ impl Handle {
                         sequence=next_sequence;journal.set("chat_sequence",&sequence.to_string())?;
                         if selected {
                             brain.set("develop_next","false")?;
-                            brain.set("development_request","A player supplied the current gameplay goal. Use a direct typed SDK action for a short interaction, or write/select and run a bounded Lua behavior for composed work. The SDK and Brain remain Rust. Inspect relevant documentation when needed and verify the observed result. Player reports are not observed facts.")?;
+                            brain.set("development_request",if reply.goal_action==crate::model::GoalAction::Refine {
+                                "Conversation refined the plan for the same task. Its completion requirements remain bound. Inspect results and continue using typed SDK actions or a bounded client program. Reports remain reports, not observed facts."
+                            } else {
+                                "Conversation selected a new gameplay task from received chat. Use a typed SDK action or write/select and run a bounded client program. Inspect results; message attribution and reports are not native observations."
+                            })?;
                         } else {
                             journal.event("conversation_goal_retained",json!({"requested_revision":requested_revision,"current_revision":brain.get("goal_revision")?,"proposed_action":reply.goal_action,"goal":reply.goal,"chat_sequence":sequence}))?;
                         }
@@ -145,7 +149,7 @@ fn retry_changed_goal(
     current: &str,
 ) -> bool {
     !selected
-        && reply.goal_action == crate::model::GoalAction::Replace
+        && reply.goal_action != crate::model::GoalAction::Continue
         && !reply.goal.trim().is_empty()
         && requested != current
 }
