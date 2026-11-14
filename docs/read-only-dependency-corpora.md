@@ -40,8 +40,10 @@ pinned helper must support the new command; older helper binaries fail before
 the actor connects when this option is used.
 
 Each actual-tree witness is bounded to65536 entries,2GiB, depth32 and a15-second
-cooperative scan deadline, with a30-second host command deadline. Symlinks,
-hard-linked regular files, special files, unreadable entries and detected
+cooperative scan deadline, with a30-second host command deadline.
+Entry names are reserved against one global discovery budget before buffering;
+the successful witness still reports the visited-entry count in sorted tree order.
+Symlinks, hard-linked regular files, special files, unreadable entries and detected
 in-flight changes are incomplete. Roots and filenames must be canonical/UTF8.
 Dependencies needing source-tree writes are unsupported: keep build outputs in
 the ordinary writable target/cache instead of weakening the read-only mount.

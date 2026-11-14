@@ -12,6 +12,8 @@ const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 struct Scan {
     hash: Sha256,
     entries: u64,
+    discovered: u64,
+    entry_limit: u64,
     bytes: u64,
     started: Instant,
 }
@@ -39,7 +41,7 @@ impl Scan {
             return Err(invalid("dependency directory depth exceeds32"));
         }
         self.entries += 1;
-        if self.entries > MAX_ENTRIES {
+        if self.entries > self.entry_limit {
             return Err(invalid("dependency tree exceeds65536entries"));
         }
         let relative = path
@@ -62,10 +64,14 @@ impl Scan {
             let mut children = Vec::new();
             for entry in fs::read_dir(path)? {
                 self.deadline()?;
-                children.push(entry?.file_name());
-                if children.len() as u64 > MAX_ENTRIES {
-                    return Err(invalid("dependency directory exceeds entry bound"));
+                // Reserve globally before retaining a name. Parent sibling
+                // vectors remain alive during recursion, so per-directory caps
+                // do not bound the cumulative buffered names.
+                if self.discovered >= self.entry_limit {
+                    return Err(invalid("dependency discovered-entry budget exceeded"));
                 }
+                self.discovered += 1;
+                children.push(entry?.file_name());
             }
             children.sort_unstable();
             for child in children {
@@ -130,6 +136,8 @@ pub(super) fn inspect(root: &Path) -> io::Result<serde_json::Value> {
     let mut scan = Scan {
         hash: Sha256::new(),
         entries: 0,
+        discovered: 1,
+        entry_limit: MAX_ENTRIES,
         bytes: 0,
         started: Instant::now(),
     };
@@ -177,6 +185,8 @@ mod tests {
         let mut scan = Scan {
             hash: Sha256::new(),
             entries: 0,
+            discovered: 1,
+            entry_limit: MAX_ENTRIES,
             bytes: 0,
             started: Instant::now() - Duration::from_secs(16),
         };
@@ -194,5 +204,31 @@ mod tests {
         assert_ne!(before["sha256"], inspect(&root).unwrap()["sha256"]);
         fs::hard_link(&path, root.join("alias.rs")).unwrap();
         assert!(inspect(&root).is_err());
+    }
+    #[test]
+    fn nested_pending_names_share_one_global_discovery_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let mut current = root.clone();
+        for _ in 0..3 {
+            let first = current.join("a-first");
+            fs::create_dir(&first).unwrap();
+            for index in 0..5 {
+                fs::write(current.join(format!("z-sibling-{index}")), b"dependency").unwrap();
+            }
+            current = first;
+        }
+        let mut scan = Scan {
+            hash: Sha256::new(),
+            entries: 0,
+            discovered: 1,
+            entry_limit: 8,
+            bytes: 0,
+            started: Instant::now(),
+        };
+        let error = scan.walk(&root, &root, 0).unwrap_err();
+        assert!(error.to_string().contains("discovered-entry budget"));
+        assert_eq!(scan.discovered, 8);
+        assert_eq!(scan.entries, 2);
     }
 }
