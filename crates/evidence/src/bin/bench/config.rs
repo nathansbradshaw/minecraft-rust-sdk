@@ -30,6 +30,13 @@ pub struct OperatorRcon {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DependencyCorpus {
+    pub host_dir: PathBuf,
+    pub container_path: String,
+    pub sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fixture {
     pub version: u32,
     #[serde(default)]
@@ -54,6 +61,8 @@ pub struct Fixture {
     pub profile_name: String,
     pub operator_profile: Option<PathBuf>,
     pub operator_gateway_journal: Option<PathBuf>,
+    #[serde(default)]
+    pub read_only_dependency_corpora: Vec<DependencyCorpus>,
     pub model_key_name: Option<String>,
     pub allocated_model_actor_uuid: Option<String>,
     pub allocated_model_kind: Option<String>,
@@ -483,6 +492,76 @@ impl Fixture {
         }
         self.secrets()?;
         self.state_path()?;
+        self.validate_dependency_corpora()?;
+        Ok(())
+    }
+    fn validate_dependency_corpora(&self) -> Result<()> {
+        ensure(
+            self.read_only_dependency_corpora.len() <= 4,
+            "at most four reviewed dependency corpora",
+        )?;
+        for (i, corpus) in self.read_only_dependency_corpora.iter().enumerate() {
+            canonical(&corpus.host_dir)?;
+            ensure(
+                fs::symlink_metadata(&corpus.host_dir)?.is_dir() && valid_hash(&corpus.sha256, 64),
+                "reviewed dependency directory and tree digest required",
+            )?;
+            container_path(&corpus.container_path)?;
+            let dest = Path::new(&corpus.container_path);
+            ensure(
+                dest.starts_with(&self.container_workspace)
+                    || (dest.starts_with("/deps") && dest != Path::new("/deps")),
+                "dependency destination must be inside workspace or below /deps",
+            )?;
+            ensure(
+                !self.workspace.starts_with(&corpus.host_dir)
+                    && !self.secret_dir.starts_with(&corpus.host_dir)
+                    && !corpus.host_dir.starts_with(&self.secret_dir)
+                    && !self.host_profile()?.starts_with(&corpus.host_dir)
+                    && self
+                        .operator_gateway_journal
+                        .as_ref()
+                        .is_none_or(|p| !p.starts_with(&corpus.host_dir))
+                    && self
+                        .operator_rcon
+                        .as_ref()
+                        .is_none_or(|r| !r.password_file.starts_with(&corpus.host_dir)),
+                "dependency corpus overlaps private operator inputs or workspace root",
+            )?;
+            let state = self.state_path()?;
+            let config_path = self.config_path()?;
+            let config = self
+                .artifacts
+                .iter()
+                .find(|a| a.container_path == config_path)
+                .ok_or("config artifact absent")?;
+            let cfg = json(&config.file.path, 65536)?;
+            let program = cfg["workspace"]
+                .as_str()
+                .ok_or("program workspace absent")?;
+            ensure(
+                !Path::new(&self.container_workspace).starts_with(dest)
+                    && !Path::new(program).starts_with(dest)
+                    && !Path::new(&self.container_secret_dir).starts_with(dest)
+                    && !dest.starts_with(&self.container_secret_dir)
+                    && !Path::new(&state).starts_with(dest)
+                    && !dest.starts_with(&state)
+                    && self.artifacts.iter().chain(self.ca_file.iter()).all(|a| {
+                        !Path::new(&a.container_path).starts_with(dest)
+                            && !dest.starts_with(&a.container_path)
+                    }),
+                "dependency corpus overlaps pinned inputs, secrets, state or workspace root",
+            )?;
+            for other in &self.read_only_dependency_corpora[..i] {
+                ensure(
+                    !dest.starts_with(&other.container_path)
+                        && !Path::new(&other.container_path).starts_with(dest)
+                        && !corpus.host_dir.starts_with(&other.host_dir)
+                        && !other.host_dir.starts_with(&corpus.host_dir),
+                    "overlapping dependency corpora forbidden",
+                )?;
+            }
+        }
         Ok(())
     }
     pub fn secrets(&self) -> Result<Secrets> {
@@ -548,6 +627,7 @@ fn same_point(value: &Value, expected: [f64; 3]) -> bool {
 }
 /// Inspect only selected Docker fields, never Config.Env or full inspect output.
 pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
+    validate_dependency_mounts(f, value)?;
     ensure(
         value["id"].as_str() == f.container_id.as_deref()
             && value["started_at"].as_str() == f.container_started_at.as_deref(),
@@ -694,7 +774,11 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
                         a.file.path == Path::new(source) && a.container_path == dest && !rw
                     });
                 ensure(
-                    artifact || (Path::new(source) == f.workspace && dest == f.container_workspace),
+                    artifact
+                        || (Path::new(source) == f.workspace && dest == f.container_workspace)
+                        || f.read_only_dependency_corpora.iter().any(|c| {
+                            c.host_dir == Path::new(source) && c.container_path == dest && !rw
+                        }),
                     "unreviewed host bind mount forbidden",
                 )?;
             } else {
@@ -716,4 +800,53 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
         secret,
         "dedicated read-only secret directory mount required",
     )
+}
+/// Exact read-only bind plus no nested override or writable alias to its source.
+pub fn validate_dependency_mounts(f: &Fixture, value: &Value) -> Result<()> {
+    if f.read_only_dependency_corpora.is_empty() {
+        return Ok(());
+    }
+    let mounts = value["mounts"]
+        .as_array()
+        .ok_or("dependency mount inventory absent")?;
+    for corpus in &f.read_only_dependency_corpora {
+        let mut exact = 0;
+        for mount in mounts {
+            let dest = mount["Destination"]
+                .as_str()
+                .ok_or("mount destination absent")?;
+            let source = mount["Source"].as_str().unwrap_or("");
+            if dest == corpus.container_path {
+                exact += 1;
+                ensure(
+                    mount["Type"] == "bind"
+                        && mount["RW"] == false
+                        && Path::new(source) == corpus.host_dir,
+                    "dependency corpus must be an exact read-only bind",
+                )?;
+            } else {
+                ensure(
+                    !Path::new(dest).starts_with(&corpus.container_path),
+                    "nested mount overrides dependency corpus",
+                )?;
+            }
+            if mount["Type"] == "bind" && mount["RW"] == true && !source.is_empty() {
+                if let Ok(relative) = corpus.host_dir.strip_prefix(source) {
+                    ensure(
+                        Path::new(dest).join(relative) == Path::new(&corpus.container_path),
+                        "writable alias exposes dependency corpus",
+                    )?;
+                }
+                ensure(
+                    !Path::new(source).starts_with(&corpus.host_dir),
+                    "writable dependency subdirectory bind forbidden",
+                )?;
+            }
+        }
+        ensure(
+            exact == 1,
+            "missing or duplicate dependency read-only mount",
+        )?;
+    }
+    Ok(())
 }

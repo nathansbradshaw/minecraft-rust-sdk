@@ -12,6 +12,7 @@ mod capture;
 mod cleanup;
 mod closure;
 mod config;
+mod dependencies;
 mod io;
 mod process;
 mod rcon;
@@ -211,6 +212,7 @@ fn preflight(runner: &mut dyn Runner, f: &Fixture, case: &Path, label: &str) -> 
     )?;
     config::validate_mounts(f, &inspect)?;
     verify_container_artifacts(runner, f, case, label)?;
+    dependencies::preflight(runner, f, case, label)?;
     let uid = process::execute(
         runner,
         f,
