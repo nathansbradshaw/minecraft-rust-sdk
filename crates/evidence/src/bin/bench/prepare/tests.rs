@@ -427,3 +427,36 @@ fn dangling_restore_root_and_database_sidecar_aliases_fail_before_mutation() {
         assert!(!spec.root.join("runtime/gateway.sqlite").exists());
     }
 }
+#[test]
+fn rejected_frozen_wal_cannot_create_shm_or_change_original_database() {
+    let (setup, spec) = prepared();
+    let original = fs::read(&spec.database.file.path).unwrap();
+    let wal = PathBuf::from(format!("{}-wal", spec.database.file.path.display()));
+    let shm = PathBuf::from(format!("{}-shm", spec.database.file.path.display()));
+    private(
+        &wal,
+        b"synthetic retained opaque WAL; never open SQLite first",
+    );
+    assert!(validate(&spec, &setup.f).is_err());
+    assert!(!shm.exists());
+    assert_eq!(fs::read(&spec.database.file.path).unwrap(), original);
+    assert_eq!(
+        fs::read(wal).unwrap(),
+        b"synthetic retained opaque WAL; never open SQLite first"
+    );
+}
+#[test]
+fn cold_wal_mode_database_is_inspected_immutably_without_sidecar_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("synthetic path?#.sqlite");
+    private(&path, b"");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE metadata(key TEXT,value TEXT);CREATE TABLE sessions(bot TEXT);INSERT INTO metadata VALUES('instance','synthetic-instance');").unwrap();
+    drop(db);
+    let original = fs::read(&path).unwrap();
+    cold_database(&path, "synthetic-instance").unwrap();
+    for suffix in ["-wal", "-shm"] {
+        assert!(!PathBuf::from(format!("{}{}", path.display(), suffix)).exists());
+    }
+    assert_eq!(fs::read(path).unwrap(), original);
+}

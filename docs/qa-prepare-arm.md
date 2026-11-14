@@ -14,7 +14,12 @@ Never apply this command to an active arm or a production installation.
    zero-player/zero-session closure witness. Every prior service PID must be
    absent; even PID reuse blocks rather than granting permission to signal it.
    All declared loopback listeners must be free. Existing working and frozen
-   gateway databases must have the fixture's instance and zero sessions.
+   gateway databases must be checkpointed standalone files with the fixture's
+   instance and zero sessions. Cold WAL/SHM presence is rejected before SQLite
+   opens either original; immutable read-only inspection cannot create sidecars.
+   An uncheckpointed prior database requires separate operator investigation,
+   not an automatic checkpoint or deletion. After owned services start, ordinary
+   read-only inspection includes their live WAL session state.
 2. Create an exclusive `.prepare-arm.lock`. Decode the declared gzip/ustar
    snapshots into a new private staging tree. Only named roots, ordinary files
    and directories are accepted; links, devices, PAX/GNU extensions, duplicate

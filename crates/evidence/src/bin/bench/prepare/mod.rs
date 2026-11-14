@@ -152,11 +152,38 @@ fn parents(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 fn database(path: &Path, instance: &str) -> Result<()> {
+    database_open(path, instance, false)
+}
+fn cold_database(path: &Path, instance: &str) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        ensure(
+            !present(&PathBuf::from(format!("{}{}", path.display(), suffix)))?,
+            "stopped database must be checkpointed and standalone before inspection",
+        )?;
+    }
+    database_open(path, instance, true)
+}
+fn database_open(path: &Path, instance: &str, immutable: bool) -> Result<()> {
     read(path, 64 * 1024 * 1024)?;
-    let db = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
+    let mut flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let location = if immutable {
+        use std::os::unix::ffi::OsStrExt;
+        let mut uri = String::from("file:");
+        for byte in path.as_os_str().as_bytes() {
+            if byte.is_ascii_alphanumeric() || b"/._-".contains(byte) {
+                uri.push(char::from(*byte));
+            } else {
+                uri.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        uri.push_str("?immutable=1");
+        flags |= rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        PathBuf::from(uri)
+    } else {
+        path.to_path_buf()
+    };
+    let db = rusqlite::Connection::open_with_flags(location, flags)?;
     db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF")?;
     ensure(
         db.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))? == "ok",
@@ -372,29 +399,13 @@ fn validate(s: &Spec, f: &Fixture) -> Result<Vec<PathBuf>> {
     }
     let db = s.root.join(&s.database.destination);
     if present(&db)? {
-        database(&db, &f.instance_id)?;
+        cold_database(&db, &f.instance_id)?;
     }
-    database(&s.database.file.path, &f.instance_id)?;
-    for suffix in ["-wal", "-shm"] {
-        ensure(
-            !present(&PathBuf::from(format!(
-                "{}{}",
-                s.database.file.path.display(),
-                suffix
-            )))?,
-            "frozen database must be standalone without WAL/SHM",
-        )?;
-    }
+    cold_database(&s.database.file.path, &f.instance_id)?;
     ensure(
         f.operator_gateway_journal.as_ref() == Some(&db),
         "fixture must bind restored operator gateway database",
     )?;
-    for suffix in ["-wal", "-shm"] {
-        let side = PathBuf::from(format!("{}{}", db.display(), suffix));
-        if present(&side)? {
-            canonical(&side)?;
-        }
-    }
     ensure(
         s.archives.iter().all(|a| {
             !paths
