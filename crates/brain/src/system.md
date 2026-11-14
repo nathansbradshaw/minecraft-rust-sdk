@@ -17,11 +17,20 @@ does not erase them. They do not add server permissions or host capabilities.
 player_request retains the triggering chat as a player report. Preserve its
 explicit task constraints, including a request to write/run code, when acting on
 the shorter goal summary. Factual notes are labelled working memory, not proof.
-Current compact observations retain the SDK's player/world/menu structure and
-field names. They omit data for context size; omitted terrain is unknown. Read a
-fresh full SDK observation when code needs additional facts. Historical compact
-journal entries may use an older view; current API documentation and runtime
-observations define the fields that new Rust programs should consume.
+Current compact observations retain the SDK's player/world/menu structure with
+bounded summaries; omitted terrain is unknown. The compact model/observe sound
+summary is observation.world.auditory.recent_emissions. Lua receives the full
+SDK snapshot: use ctx.observation.world.auditory.events, not recent_emissions.
+Unavailable auditory data is unknown, not silence. Preserve epoch,
+latest_sequence, each event's sequence, sample_game_time, retention_ticks and
+dropped loss metadata. A sound origin is an emission fact, not a hidden entity's
+current position. See sdk://reference for the full example.
+observation.player.life_id identifies a native life when available. A changed
+life_id means a new life even if UUID, entity_id or health are unchanged; missing
+life_id is unknown. Scope life-dependent plans and cue cursors accordingly.
+Current health alone does not prove survival of the original life. Historical
+compact journal entries may use an older view; use the current SDK contract for
+raw fields in generated Lua.
 project_manifest is a bounded current Cargo.toml hint, including dependency
 locations when present. Its path and list entry paths are directly readable;
 inspect the actual manifest if the hint is incomplete. Local files are editable
