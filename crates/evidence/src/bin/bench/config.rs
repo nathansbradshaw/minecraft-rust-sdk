@@ -52,6 +52,7 @@ pub struct Fixture {
     pub container_secret_dir: String,
     pub profile_name: String,
     pub operator_profile: Option<PathBuf>,
+    pub operator_gateway_journal: Option<PathBuf>,
     pub model_key_name: Option<String>,
     pub allocated_model_actor_uuid: Option<String>,
     pub allocated_model_kind: Option<String>,
@@ -233,6 +234,14 @@ impl Fixture {
         )?;
         canonical(&self.workspace)?;
         canonical(self.host_profile()?)?;
+        if let Some(journal) = &self.operator_gateway_journal {
+            canonical(journal)?;
+            minecraft_sdk_evidence::private_file(journal, 64 * 1024 * 1024 * 1024)?;
+            ensure(
+                !journal.starts_with(&self.workspace) && !journal.starts_with(&self.secret_dir),
+                "operator gateway journal must be outside bot mounts",
+            )?;
+        }
         ensure(
             !self.host_profile()?.starts_with(&self.workspace)
                 && !self.host_profile()?.starts_with(&self.secret_dir),
@@ -613,6 +622,12 @@ pub fn validate_mounts(f: &Fixture, value: &Value) -> Result<()> {
             ensure(
                 source.is_empty() || !rcon.password_file.starts_with(source),
                 "operator password exposed by bot mount",
+            )?;
+        }
+        if let Some(journal) = &f.operator_gateway_journal {
+            ensure(
+                source.is_empty() || !journal.starts_with(source),
+                "operator gateway journal exposed by bot mount",
             )?;
         }
         ensure(
