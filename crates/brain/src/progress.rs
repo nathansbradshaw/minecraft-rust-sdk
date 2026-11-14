@@ -107,6 +107,13 @@ fn fingerprint(root: &Path, state: Option<&Path>) -> Result<String> {
 }
 
 pub fn executed(tool: &str, result: &serde_json::Value, before: &str, after: &str) -> bool {
+    if tool == "craft_once" {
+        // A historical journal result or partial/preempted batch is not new
+        // execution credit, even though bookkeeping or other body work changed.
+        return result["crafting_batch"]["new_batch_completed"] == true
+            && result["success"] == true
+            && !crate::tool_failed(result);
+    }
     if tool == "navigate" && crate::navigation::scheduling_preempted(result) {
         return false;
     }

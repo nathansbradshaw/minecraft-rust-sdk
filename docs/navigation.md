@@ -18,6 +18,13 @@ Lua's existing closed command table accepts the same input shape:
 Bare Lua navigation remains valid. The bridge uses the same typed brain request
 and validation; it does not add a general tool or host execution interface.
 
+While its saved movement is Running, the opt-in checks retained counts at a
+bounded250ms read cadence. A fulfilled count must be confirmed by a fresh sample
+bound to that movement's actor, life, dimension and epoch, with the exact current
+control ID. It then persists one `CancelControl` intention targeting only that
+ID before dispatch. A lost response is inspected/reconciled by the saved cancel
+ID, never reposted. Bare goals perform none of these reads or cancellations.
+
 After original pending input settles, a fresh same-actor/life observation can
 satisfy this condition without reaching the old drop coordinate. The report
 uses `inventory_satisfied` with `inventory_completion` count/revision/identity
@@ -27,8 +34,16 @@ Reaching the approach without the resource returns `inventory_missing`; inspect
 the actual drop or choose another approach. Missing/unreleased original input
 returns `needs_reconciliation` with its exact ID; it is never replayed or hidden.
 
-The opt-in uses journal version2, so older clients cannot silently drop its
-condition; ordinary journals remain version1. Changing/removing it on the same SDK
+`inventory_cancellation` records the cancellation request and outcome separately
+from the original movement. A cancelled movement remains Cancelled, never
+Observed. `actions` retains its completed-movement-intention count; the distinct
+cancellation request is separately exposed and recorded in the server journal.
+
+The opt-in uses journal version3, so older clients cannot silently drop its
+cancellation record; ordinary journals remain version1. Existing version2 opt-in
+journals upgrade without replay. Their already-pending movements lack a saved
+life basis, so they settle normally instead of authorizing an in-flight cancel.
+Changing/removing the condition on the same SDK
 journal path is a conflict; preserve that state. The brain uses a separate key
 for each condition, but a different journal cannot bypass an observed held-input
 lane. Fresh-observation support is required only for this opt-in. Budgets and

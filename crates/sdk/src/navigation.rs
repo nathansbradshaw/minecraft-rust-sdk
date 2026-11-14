@@ -12,7 +12,7 @@ use std::{
 
 const CAPABILITY: &str = "minecraft:movement_options";
 mod acquisition;
-pub use acquisition::{InventoryCompletion, RetainedInventory};
+pub use acquisition::{InventoryCancellation, InventoryCompletion, RetainedInventory};
 fn error(code: ErrorCode, message: impl Into<String>) -> ApiError {
     ApiError::new(code, message)
 }
@@ -142,6 +142,8 @@ pub struct Report {
     /// Caller condition evidence, distinct from arrival and action effects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_completion: Option<InventoryCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_cancellation: Option<InventoryCancellation>,
 }
 /// Cumulative diagnostic counters for this durable navigation journal.
 /// Read predictions and local intentions never certify retained game progress.
@@ -199,6 +201,10 @@ struct Attempt {
     scene: String,
     target: [f64; 3],
     outcome: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basis: Option<acquisition::AcquisitionBasis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancellation: Option<InventoryCancellation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     arrival_verification: Option<serde_json::Value>,
 }
@@ -283,7 +289,7 @@ impl Journal {
     ) -> Result<Self> {
         // Older clients accept only v1 and must reject an acquisition journal
         // rather than silently forgetting its condition during a downgrade.
-        let version = if until_inventory.is_some() { 2 } else { 1 };
+        let version = if until_inventory.is_some() { 3 } else { 1 };
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -310,9 +316,16 @@ impl Journal {
             if !m.is_file() || m.file_type().is_symlink() || m.len() > 16 * 1024 * 1024 {
                 return Err(local("Expected a bounded regular navigation state file"));
             }
-            let s: State =
+            let mut s: State =
                 serde_json::from_slice(&fs::read(path).map_err(local)?).map_err(local)?;
-            if s.version != version
+            let no_cancel_data = s
+                .pending
+                .iter()
+                .chain(s.history.iter())
+                .all(|a| a.basis.is_none() && a.cancellation.is_none());
+            let legacy_upgrade = version == 3 && s.version == 2 && no_cancel_data;
+            if (s.version != version && !legacy_upgrade)
+                || (version == 1 && !no_cancel_data)
                 || s.instance != instance
                 || s.actor != actor
                 || s.goal != goal
@@ -324,6 +337,7 @@ impl Journal {
                     "Navigation journal belongs to another goal, inventory condition, character, instance or version; preserve it and use a new path",
                 ));
             }
+            s.version = version;
             s
         } else {
             State {
@@ -418,6 +432,17 @@ impl Journal {
             journal: self.path.clone(),
             note: note.into(),
             inventory_completion: None,
+            inventory_cancellation: self
+                .state
+                .pending
+                .as_ref()
+                .and_then(|p| p.cancellation.clone())
+                .or_else(|| {
+                    self.state
+                        .history
+                        .last()
+                        .and_then(|a| a.cancellation.clone())
+                }),
         }
     }
 }
@@ -647,7 +672,11 @@ pub async fn navigate(
     Ok(report)
 }
 async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Report> {
+    let mut next_inventory_poll = std::time::Instant::now();
     loop {
+        if let Some(report) = acquisition::settle_cancellation(client, j).await? {
+            return Ok(report);
+        }
         let mut cancelled = false;
         if let Some(pending) = &j.state.pending {
             let id = pending.request.action_id.clone();
@@ -673,6 +702,13 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 return Err(error(ErrorCode::Conflict, "Navigation receipt ID mismatch"));
             }
             if !receipt.outcome.terminal() {
+                if receipt.outcome == Outcome::Running
+                    && options.until_inventory.is_some()
+                    && std::time::Instant::now() >= next_inventory_poll
+                {
+                    next_inventory_poll = std::time::Instant::now() + Duration::from_millis(250);
+                    acquisition::cancel_running_if_satisfied(client, j).await?;
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -1085,6 +1121,8 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
             scene,
             target: route.target,
             outcome: None,
+            basis: acquisition::movement_basis(options.until_inventory.as_ref(), &observation)?,
+            cancellation: None,
             arrival_verification: None,
         });
         j.save()?;
@@ -1126,6 +1164,7 @@ fn retire_local_preemption(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("navigation/acquisition_held_tests.rs");
     fn acquisition_condition() -> RetainedInventory {
         RetainedInventory {
             item: "fixture:resource".into(),
@@ -1168,9 +1207,296 @@ mod tests {
             scene: "fixture-scene".into(),
             target: [0.5, 1., 0.5],
             outcome: None,
+            basis: acquisition::movement_basis(
+                j.state.until_inventory.as_ref(),
+                &serde_json::from_value(acquisition_sample([0.5, 1., 0.5], 2)).unwrap(),
+            )
+            .unwrap(),
+            cancellation: None,
             arrival_verification: None,
         });
         j.save().unwrap();
+    }
+    fn acquisition_held_sample(count: u64, control: &str, position: [f64; 3]) -> serde_json::Value {
+        let mut sample = acquisition_sample(position, count);
+        sample["player"]["control"] =
+            serde_json::json!({"action_id":control,"outcome":"running","input_released":false});
+        sample
+    }
+    fn acquisition_receipt(
+        id: &str,
+        outcome: &str,
+        sample: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({"action_id":id,"outcome":outcome,"adapter_version":"fixture","error":null,
+            "evidence":{"native_effect_verified":outcome=="observed","input_released":outcome!="running","progress":{"frames_sent":4},"after":sample}})
+    }
+    fn acquisition_prepare_held(path: &Path, condition: Option<RetainedInventory>) {
+        let mut j = Journal::open_with_condition(
+            path,
+            goal(),
+            "instance",
+            "actor",
+            [0.5, 1., 0.5],
+            condition,
+        )
+        .unwrap();
+        acquisition_pending(&mut j);
+        let pending = j.state.pending.as_mut().unwrap();
+        pending.target = [5.5, 1., 0.5];
+        pending.request.action = Action::StartMove {
+            target: Position {
+                x: 5.5,
+                y: 1.,
+                z: 0.5,
+            },
+            jump: false,
+            max_ticks: 60,
+        };
+        j.save().unwrap();
+    }
+    #[tokio::test]
+    async fn acquisition_held_third_log_cancels_exact_running_id_once_but_bare_goal_continues() {
+        for opt_in in [false, true] {
+            let root = Temp::new();
+            let path = root.0.join("running.json");
+            let condition = opt_in.then(|| RetainedInventory {
+                minimum: 3,
+                ..acquisition_condition()
+            });
+            acquisition_prepare_held(&path, condition.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                let before = acquisition_held_sample(2, "original-pickup-leg", [0.5, 1., 0.5]);
+                respond(&listener, "GET /v1/server ", acquisition_info(), 200).await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    before.clone(),
+                    200,
+                )
+                .await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/actions/original-pickup-leg ",
+                    acquisition_receipt("original-pickup-leg", "running", before),
+                    200,
+                )
+                .await;
+                let picked = acquisition_held_sample(3, "original-pickup-leg", [0.5, 1., 0.5]);
+                if opt_in {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/observations ",
+                        picked.clone(),
+                        200,
+                    )
+                    .await;
+                    respond(&listener,"POST /v1/bots/fixture/observations/query ",serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":picked}),200).await;
+                    let (stream, request) = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        request(&listener, "POST /v1/bots/fixture/actions "),
+                    )
+                    .await
+                    .expect("must cancel without waiting for original terminal status");
+                    assert_eq!(
+                        request["action"],
+                        serde_json::json!({"kind":"cancel_control","action_id":"original-pickup-leg"})
+                    );
+                    assert_eq!(
+                        request["action_id"],
+                        "original-pickup-leg-acquisition-cancel"
+                    );
+                    reply(
+                        stream,
+                        acquisition_receipt(
+                            "original-pickup-leg-acquisition-cancel",
+                            "observed",
+                            serde_json::Value::Null,
+                        ),
+                        200,
+                    )
+                    .await;
+                }
+                let mut after = acquisition_sample(
+                    if opt_in {
+                        [0.5, 1., 0.5]
+                    } else {
+                        [5.5, 1., 0.5]
+                    },
+                    3,
+                );
+                let outcome = if opt_in { "cancelled" } else { "observed" };
+                after["player"]["control"] = serde_json::json!({"action_id":"original-pickup-leg","outcome":outcome,"input_released":true});
+                let terminal = acquisition_receipt("original-pickup-leg", outcome, after.clone());
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/actions/original-pickup-leg ",
+                    terminal.clone(),
+                    200,
+                )
+                .await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    after.clone(),
+                    200,
+                )
+                .await;
+                if opt_in {
+                    respond(&listener,"POST /v1/bots/fixture/observations/query ",serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":after}),200).await;
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/actions/original-pickup-leg ",
+                        terminal,
+                        200,
+                    )
+                    .await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "no extra move or cancellation replay"
+                );
+            });
+            let report = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    until_inventory: condition.clone(),
+                    timeout_ms: 2000,
+                    ..Options::default()
+                },
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(
+                report.status,
+                if opt_in {
+                    "inventory_satisfied"
+                } else {
+                    "reached"
+                }
+            );
+            assert_eq!(report.inventory_cancellation.is_some(), opt_in);
+            if opt_in {
+                assert!(report.remaining_distance > 1.);
+                assert_eq!(
+                    report.inventory_cancellation.unwrap().outcome,
+                    Some(Outcome::Observed)
+                );
+            }
+            let j = Journal::open_with_condition(
+                &path,
+                goal(),
+                "instance",
+                "actor",
+                [0.5, 1., 0.5],
+                condition,
+            )
+            .unwrap();
+            assert_eq!(
+                j.state.history.last().unwrap().outcome,
+                Some(if opt_in {
+                    Outcome::Cancelled
+                } else {
+                    Outcome::Observed
+                })
+            );
+        }
+    }
+    #[tokio::test]
+    async fn acquisition_held_same_count_in_foreign_life_dimension_or_epoch_never_cancels_or_completes()
+     {
+        for pointer in [
+            "/player/life_id",
+            "/player/dimension",
+            "/world/sample_clock/epoch",
+        ] {
+            let root = Temp::new();
+            let path = root.0.join("foreign.json");
+            let condition = RetainedInventory {
+                minimum: 3,
+                ..acquisition_condition()
+            };
+            acquisition_prepare_held(&path, Some(condition.clone()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                respond(&listener, "GET /v1/server ", acquisition_info(), 200).await;
+                let before = acquisition_held_sample(2, "original-pickup-leg", [0.5, 1., 0.5]);
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    before.clone(),
+                    200,
+                )
+                .await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/actions/original-pickup-leg ",
+                    acquisition_receipt("original-pickup-leg", "running", before),
+                    200,
+                )
+                .await;
+                let mut foreign = acquisition_held_sample(3, "original-pickup-leg", [0.5, 1., 0.5]);
+                *foreign.pointer_mut(pointer).unwrap() =
+                    serde_json::json!(if pointer.ends_with("dimension") {
+                        "fixture:other"
+                    } else {
+                        "foreign"
+                    });
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    foreign.clone(),
+                    200,
+                )
+                .await;
+                respond(&listener,"POST /v1/bots/fixture/observations/query ",serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":foreign}),200).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "foreign same-count fact must not dispatch any mutation"
+                );
+            });
+            let error = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    until_inventory: Some(condition.clone()),
+                    timeout_ms: 2000,
+                    ..Options::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(error.code, ErrorCode::Conflict);
+            let j = Journal::open_with_condition(
+                &path,
+                goal(),
+                "instance",
+                "actor",
+                [0.5, 1., 0.5],
+                Some(condition),
+            )
+            .unwrap();
+            assert!(
+                j.state.history.is_empty(),
+                "no completed movement or goal credit"
+            );
+            let original = j.state.pending.unwrap();
+            assert_eq!(original.request.action_id, "original-pickup-leg");
+            assert!(original.cancellation.is_none());
+            assert!(original.outcome.is_none());
+        }
     }
     #[test]
     fn acquisition_resume_changed_criterion_cannot_mix_existing_state() {
@@ -1188,7 +1514,7 @@ mod tests {
         .unwrap();
         acquisition_pending(&mut j);
         assert_eq!(
-            j.state.version, 2,
+            j.state.version, 3,
             "old clients must reject an opt-in journal rather than erase its condition"
         );
         drop(j);
@@ -2302,6 +2628,8 @@ mod tests {
             scene: "fixture".into(),
             target: [1.5, 1., 0.5],
             outcome: Some(Outcome::Observed),
+            basis: None,
+            cancellation: None,
             arrival_verification: Some(serde_json::json!({"target_reached":true,
                 "native_after_position":[1.535,1.,0.5],"entity_id":1,
                 "dimension":"fixture:world","epoch":"clock-a"})),
@@ -2400,6 +2728,8 @@ mod tests {
             scene: "wet-bank".into(),
             target,
             outcome: Some(Outcome::Observed),
+            basis: None,
+            cancellation: None,
             arrival_verification: Some(serde_json::json!({"target_reached":true,
                 "native_after_position":[0.5,62.52,0.5],"entity_id":1,
                 "dimension":"fixture:world","epoch":"clock-a"})),
@@ -2951,6 +3281,8 @@ mod tests {
             target: [1.5, 1., 0.5],
             outcome: None,
             source_node: None,
+            basis: None,
+            cancellation: None,
             arrival_verification: None,
         });
         j.save().unwrap();
@@ -3021,6 +3353,8 @@ mod tests {
                     target: [1.5, 1., 0.5],
                     outcome: None,
                     source_node: Some("canonical-source".into()),
+                    basis: None,
+                    cancellation: None,
                     arrival_verification: None,
                 });
                 j.save().unwrap();
@@ -3103,6 +3437,8 @@ mod tests {
                 target: [1.5, 1., 0.5],
                 outcome: None,
                 source_node: None,
+                basis: None,
+                cancellation: None,
                 arrival_verification: None,
             });
             j.save().unwrap();
@@ -3179,6 +3515,8 @@ mod tests {
             scene: "scene".into(),
             target: [x, 1., 0.5],
             outcome,
+            basis: None,
+            cancellation: None,
             arrival_verification: None,
         };
         let cancelled = attempt("cancel-only", 1.5, Some(Outcome::Cancelled));
@@ -3231,6 +3569,8 @@ mod tests {
                     target: [1.5, 1., 0.5],
                     outcome: None,
                     source_node: None,
+                    basis: None,
+                    cancellation: None,
                     arrival_verification: None,
                 });
                 j.save().unwrap();
@@ -3323,6 +3663,8 @@ mod tests {
                 target: [1.5, 1., 0.5],
                 outcome: None,
                 source_node: None,
+                basis: None,
+                cancellation: None,
                 arrival_verification: None,
             });
             j.save().unwrap();

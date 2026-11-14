@@ -134,11 +134,12 @@ pub struct Choice {
     #[serde(default)]
     pub experiment: bool,
 }
-pub const TOOLS: [&str; 19] = [
+pub const TOOLS: [&str; 20] = [
     "develop",
     "observe",
     "query",
     "navigate",
+    "craft_once",
     "sdk",
     "status",
     "reconcile",
@@ -166,7 +167,7 @@ pub(crate) fn validate_choice(choice: &Choice) -> Result<()> {
     )
 }
 pub fn schema() -> Value {
-    json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, Lua execution, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual input: Lua source for write; JSON old/new/expected_sha256 for edit; path or JSON path/start_line/end_line for read; shell command for terminal; relative .lua path for run (legacy exact Cargo binary also supported); typed action JSON for sdk. For navigate, a normal goal or explicit {goal,until_inventory:{item,minimum}} acquisition wrapper; retained inventory completion differs from positional arrival. For observe, use supported view JSON; menu_inspection retains answered menu pages. During investigation/alternatives choose an unresolved question or changed experiment, not a covered menu selector with new notes or page size."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write/edit; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
+    json!({"type":"object","description":"One command for the remote bot-container executor. Returning this record schedules its tool after inference; no inference-host tool is needed.","properties":{"tool":{"type":"string","enum":TOOLS,"description":"Container instruction to execute next: gameplay, workspace editing, Lua execution, investigation or goal management."},"input":{"type":"string","maxLength":10000,"description":"Actual input: Lua source for write; JSON old/new/expected_sha256 for edit; path or JSON path/start_line/end_line for read; shell command for terminal; relative .lua path for run (legacy exact Cargo binary also supported); typed action JSON for sdk. For craft_once, JSON {recipe,operation_id} only, path empty: one bounded prepare/take/store helper with its own harness-resolved journal; reuse the SAME operation_id after interruption. Requires suitable open menu and empty grid/cursor before a new batch. For navigate, a normal goal or explicit {goal,until_inventory:{item,minimum}} acquisition wrapper; retained inventory completion differs from positional arrival. For observe, use supported view JSON; menu_inspection retains answered menu pages. During investigation/alternatives choose an unresolved question or changed experiment, not a covered menu selector with new notes or page size."},"path":{"type":"string","maxLength":256,"description":"Relative destination for write/edit; empty for other instructions."},"summary":{"type":"string","maxLength":512},"notes":{"type":"string","maxLength":2048},"experiment":{"type":"boolean"}},"required":["tool","input","path","summary","notes","experiment"],"additionalProperties":false})
 }
 fn session_schema(development: bool) -> Value {
     let mut schema = schema();
