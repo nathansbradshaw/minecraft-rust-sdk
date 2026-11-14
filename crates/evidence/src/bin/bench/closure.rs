@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::os::unix::fs::MetadataExt;
 
 pub fn gateway_absent(f: &Fixture, case: &Path) -> Result<bool> {
-    let result = snapshot(f, case);
+    let result = snapshot(f, case, None);
     if let Err(error) = &result {
         let secrets = cleanup_host_profile(f)?;
         let error = secrets.scrub(error.to_string().as_bytes());
@@ -16,7 +16,11 @@ pub fn gateway_absent(f: &Fixture, case: &Path) -> Result<bool> {
     }
     result
 }
-fn snapshot(f: &Fixture, case: &Path) -> Result<bool> {
+pub fn combined_baseline(f: &Fixture, case: &Path, hash: &str) -> Result<()> {
+    snapshot(f, case, Some(hash))?;
+    Ok(())
+}
+fn snapshot(f: &Fixture, case: &Path, baseline: Option<&str>) -> Result<bool> {
     let path = f
         .operator_gateway_journal
         .as_ref()
@@ -58,6 +62,29 @@ fn snapshot(f: &Fixture, case: &Path) -> Result<bool> {
     let sessions: i64 = tx.query_row("SELECT count(*) FROM sessions WHERE bot=?1", [bot], |r| {
         r.get(0)
     })?;
+    if let Some(hash) = baseline {
+        let actions: i64 =
+            tx.query_row("SELECT count(*) FROM actions WHERE bot=?1", [bot], |r| {
+                r.get(0)
+            })?;
+        ensure(
+            sessions == 0 && actions == 0,
+            "combined requires pristine actor with zero sessions and prior action rows",
+        )?;
+        tx.commit()?;
+        let after = fs::symlink_metadata(path)?;
+        ensure(
+            before.dev() == after.dev() && before.ino() == after.ino(),
+            "authoritative journal identity changed before combined baseline",
+        )?;
+        save(
+            &case.join("combined-episode-baseline.json"),
+            &json!({"fixture_sha256":hash,
+            "instance_id":instance,"player_uuid":actor,"bot_id":bot,"sessions_before":sessions,"actions_before":actions,
+            "utc_ms":started,"read_only":true,"scope":"Pristine authoritative actor baseline before the sole connect; later capture must include all actor prefixes."}),
+        )?;
+        return Ok(true);
+    }
     tx.commit()?;
     let after = fs::symlink_metadata(path)?;
     ensure(
@@ -77,6 +104,43 @@ fn snapshot(f: &Fixture, case: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn combined_baseline_rejects_prior_actions_and_pending_sessions() {
+        for scenario in 0..3 {
+            let mut s = super::super::tests::setup();
+            let path =
+                s.f.workspace
+                    .parent()
+                    .unwrap()
+                    .join("pristine-operator.sqlite");
+            drop(create(&path).unwrap());
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE metadata(key TEXT,value TEXT); CREATE TABLE bots(id TEXT,uuid TEXT); CREATE TABLE sessions(bot TEXT,state TEXT); CREATE TABLE actions(bot TEXT,id TEXT);").unwrap();
+            db.execute(
+                "INSERT INTO metadata VALUES('instance',?1)",
+                [&s.f.instance_id],
+            )
+            .unwrap();
+            db.execute("INSERT INTO bots VALUES('owned',?1)", [&s.f.player_uuid])
+                .unwrap();
+            if scenario == 1 {
+                db.execute_batch("INSERT INTO actions VALUES('owned','prior-uncertain')")
+                    .unwrap();
+            }
+            if scenario == 2 {
+                db.execute_batch("INSERT INTO sessions VALUES('owned','connecting')")
+                    .unwrap();
+            }
+            drop(db);
+            let original = fs::read(&path).unwrap();
+            s.f.operator_gateway_journal = Some(path.clone());
+            assert_eq!(
+                combined_baseline(&s.f, &s.case, &"c".repeat(64)).is_ok(),
+                scenario == 0
+            );
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+    }
     #[test]
     fn journal_snapshot_binds_exact_identity_and_counts_all_session_states_without_writes() {
         for scenario in 0..7 {

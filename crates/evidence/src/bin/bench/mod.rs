@@ -69,7 +69,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     }
     if args.is_empty() || (args.len() == 1 && args[0] == "--help") {
         println!(
-            "mc-sdk-bench rcon-list LOOPBACK_ADDR PRIVATE_PASSWORD_FILE\nmc-sdk-bench preflight|stage|run|launch|acquire FIXTURE.json SHA256 CASE_DIR\nmc-sdk-bench nativecapture FIXTURE.json SHA256 NEW_CAPTURE_DIR GATEWAY.sqlite TRACE.log SPEC_TEMPLATE.json [SAVED_JSON ...]\nSee docs/operator-bench.md. Lifecycle commands make real connections only when the operator runs them; no command awards a PASS."
+            "mc-sdk-bench rcon-list LOOPBACK_ADDR PRIVATE_PASSWORD_FILE\nmc-sdk-bench preflight|stage|run|launch|acquire|combine FIXTURE.json SHA256 CASE_DIR\nmc-sdk-bench nativecapture FIXTURE.json SHA256 NEW_CAPTURE_DIR GATEWAY.sqlite TRACE.log SPEC_TEMPLATE.json [SAVED_JSON ...]\nSee docs/operator-bench.md. Lifecycle commands make real connections only when the operator runs them; no command awards a PASS."
         );
         return Ok(());
     }
@@ -93,7 +93,12 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         "operator evidence must be outside bot workspace and secret mount",
     )?;
     ensure(
-        free_bytes(case)? >= 500_000_000_000,
+        free_bytes(case)?
+            >= if fixture.is_combined() {
+                502_000_000_000
+            } else {
+                500_000_000_000
+            },
         "at least500GB free required",
     )?;
     let frozen = case.join("fixture.json");
@@ -112,15 +117,15 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         "preflight" if args.len() == 4 => preflight(&mut runner, &fixture, case, "preflight")?,
         "stage" if args.len() == 4 => {
             ensure(
-                !fixture.is_acquisition(),
-                "acquisition requires the combined acquire command",
+                !fixture.immediate_launch(),
+                "use acquire or combine for an immediate staged launch",
             )?;
             stage(&mut runner, &fixture, case, hash)?;
         }
         "run" if args.len() == 4 => {
             ensure(
-                !fixture.is_acquisition(),
-                "acquisition requires the combined acquire command",
+                !fixture.immediate_launch(),
+                "use acquire or combine for an immediate staged launch",
             )?;
             ensure(
                 fixture.operator_rcon.is_some(),
@@ -138,15 +143,16 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         }
         "launch" if args.len() == 4 => {
             ensure(
-                !fixture.is_acquisition(),
-                "acquisition requires the combined acquire command",
+                !fixture.immediate_launch(),
+                "use acquire or combine for an immediate staged launch",
             )?;
             launch(&mut runner, &mut SystemRunner::new(), &fixture, case, hash)?;
         }
-        "acquire" if args.len() == 4 => {
+        "acquire" | "combine" if args.len() == 4 => {
             ensure(
-                fixture.is_acquisition(),
-                "acquire requires an explicit no-NPC acquisition fixture",
+                (command == "acquire" && fixture.is_acquisition())
+                    || (command == "combine" && fixture.is_combined()),
+                "command requires its explicit acquisition or combined fixture mode",
             )?;
             ensure(
                 fixture.operator_rcon.is_some(),
@@ -461,6 +467,9 @@ fn stage(runner: &mut dyn Runner, f: &Fixture, case: &Path, hash: &str) -> Resul
             && json(f.host_profile()?, 16384)?["session"].is_null(),
         "stage requires disconnected scoped profile",
     )?;
+    if f.is_combined() {
+        closure::combined_baseline(f, case, hash)?;
+    }
     // Durable intent precedes the one connection attempt. Re-running cannot allocate a new ID.
     save(
         &case.join("stage-intent.json"),
@@ -744,13 +753,14 @@ fn launch_inner(
     let mut npc_native_seen = false;
     let mut remote_identity = None;
     let mut controller_exit = None;
+    let (inner_seconds, outer_seconds) = f.child_deadlines();
     save(
         &case.join("recovery.json"),
         &json!({"container_id":f.target()?,"container_started_at":f.container_started_at,"scope":"Missing finalization is unknown, including SIGKILL/host loss. Verify ID/start before stopping only this owned container.","inspect_argv":[f.docker.path,"inspect",f.target()?],"stop_after_ownership_verification_argv":[f.docker.path,"stop","--time","2",f.target()?],"ordinary_disconnect_argv":[f.sdk.path,"disconnect",f.host_profile()?]}),
     )?;
     save(
         &case.join("launch-intent.json"),
-        &json!({"fixture_sha256":hash,"player_uuid":f.player_uuid,"life_id":expected_life,"duration_secs":f.duration_secs,"acquisition":f.is_acquisition(),"inner_child_secs":if f.is_acquisition(){1200}else{245},"outer_child_secs":if f.is_acquisition(){1210}else{255},"cleanup_budget_scope":"Finalization runs after the child deadline; this is not a deadline on the whole helper","utc_ms":utc_ms()?}),
+        &json!({"fixture_sha256":hash,"player_uuid":f.player_uuid,"life_id":expected_life,"duration_secs":f.duration_secs,"acquisition":f.is_acquisition(),"combined":f.is_combined(),"inner_child_secs":inner_seconds,"outer_child_secs":outer_seconds,"cleanup_budget_scope":"Finalization runs after the child deadline; this is not a deadline on the whole helper","utc_ms":utc_ms()?}),
     )?;
     let mut args = vec!["exec".into()];
     if let Some(ca) = &f.ca_file {
@@ -764,11 +774,7 @@ fn launch_inner(
         "timeout".into(),
         "--signal=TERM".into(),
         "--kill-after=5s".into(),
-        if f.is_acquisition() {
-            "1200s".into()
-        } else {
-            "245s".into()
-        },
+        format!("{inner_seconds}s"),
         f.handler.clone(),
     ]);
     args.extend(f.handler_args.clone());
@@ -777,7 +783,7 @@ fn launch_inner(
         f,
         &f.docker,
         args,
-        if f.is_acquisition() { 1210 } else { 255 },
+        outer_seconds,
         case,
         "handler",
         &mut |value| {

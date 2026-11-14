@@ -57,6 +57,7 @@ pub(super) fn output(text: String, success: bool) -> process::Output {
         success,
         timed_out: false,
         callback_error: None,
+        output_limit_exceeded: false,
     }
 }
 pub(super) struct Setup {
@@ -525,9 +526,20 @@ fn fake_launch_retains_fatal_tail_and_disconnects_without_pass() {
 }
 #[test]
 fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() {
+    for combined in [false, true] {
+        native_capture_scenario(combined);
+    }
+}
+fn native_capture_scenario(combined: bool) {
     use minecraft_sdk_core::{Action, ActionRequest, Outcome, Receipt};
     use minecraft_sdk_evidence::{ExpectedAction, ResourceUsage, Spec};
-    let s = setup();
+    let mut s = setup();
+    if combined {
+        s.f.mode = config::Mode::Combined;
+        let frozen = b"synthetic frozen combined fixture";
+        write(&s.case.join("fixture.json"), frozen);
+        save(&s.case.join("combined-episode-baseline.json"),&json!({"fixture_sha256":sha256(frozen),"instance_id":s.f.instance_id,"player_uuid":s.f.player_uuid,"bot_id":"owned","actions_before":0,"sessions_before":0})).unwrap();
+    }
     let dbpath = s.case.join("gateway.sqlite");
     write(&dbpath, b"");
     let db = rusqlite::Connection::open(&dbpath).unwrap();
@@ -547,7 +559,11 @@ fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() 
             2 => Outcome::Uncertain,
             _ => Outcome::Running,
         };
-        let id = format!("body-owned-{seq}");
+        let id = if combined && seq % 2 == 0 {
+            format!("lua-generated-{seq}")
+        } else {
+            format!("body-owned-{seq}")
+        };
         let receipt = Receipt {
             action_id: id.clone(),
             outcome,
@@ -576,7 +592,10 @@ fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() 
     let tracepath = s.case.join("input.log");
     write(&tracepath, &trace);
     write(&s.case.join("input.stderr"), b"fatal stderr preserved");
-    write(&s.case.join("input.status.json"), b"{\"exit_code\":1}");
+    write(
+        &s.case.join("input.status.json"),
+        b"{\"exit_code\":1,\"output_limit_exceeded\":false}",
+    );
     let spec = Spec {
         run_id: "test-run".into(),
         goal: "retain failures".into(),
@@ -608,7 +627,10 @@ fn native_capture_keeps_every_failed_running_uncertain_attempt_and_fatal_line() 
     };
     let specpath = s.case.join("template.json");
     write(&specpath, &serde_json::to_vec(&spec).unwrap());
-    capture::native(&s.f, &s.case, &dbpath, &tracepath, &specpath, &[]).unwrap();
+    capture::native_with_space(&s.f, &s.case, &dbpath, &tracepath, &specpath, &[], || {
+        Ok(503_000_000_000)
+    })
+    .unwrap();
     let manifest = json(&s.case.join("capture-manifest.json"), 65536).unwrap();
     assert_eq!(manifest["all_original_actions"], 131);
     assert_eq!(

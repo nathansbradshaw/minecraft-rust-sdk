@@ -13,7 +13,30 @@ pub fn native(
     template: &Path,
     stats: &[PathBuf],
 ) -> Result<()> {
-    let trace_bytes = read(trace, 16 * 1024 * 1024)?;
+    native_with_space(f, case, journal, trace, template, stats, || {
+        free_bytes(case)
+    })
+}
+pub(super) fn native_with_space(
+    f: &Fixture,
+    case: &Path,
+    journal: &Path,
+    trace: &Path,
+    template: &Path,
+    stats: &[PathBuf],
+    mut available: impl FnMut() -> Result<u64>,
+) -> Result<()> {
+    if f.is_combined() {
+        ensure(
+            available()? >= 502_000_000_000,
+            "combined capture needs2GB evidence headroom above500GB reserve",
+        )?;
+        ensure(
+            trace.with_extension("status.json").is_file(),
+            "combined capture requires original complete-stream status",
+        )?;
+    }
+    let trace_bytes = read(trace, f.trace_bytes_limit())?;
     ensure(
         f.secrets()?.scrub(&trace_bytes) == trace_bytes,
         "trace contains allocated credential; refusing credential log copy",
@@ -31,7 +54,7 @@ pub fn native(
                     let seq = value["sequence"].as_u64().ok_or("intent sequence absent")?;
                     let action: Action = serde_json::from_value(value["data"]["action"].clone())?;
                     ensure(
-                        sequences.insert(seq, action).is_none(),
+                        sequences.insert(seq, action).is_none() || f.is_combined(),
                         "duplicate original intent sequence",
                     )?;
                 }
@@ -61,10 +84,13 @@ pub fn native(
     original.write_all(&trace_bytes)?;
     original.sync_all()?;
     ensure(
-        prefixes.len() <= 1,
+        f.is_combined() || prefixes.len() <= 1,
         "multiple body epochs require separate explicit capture",
     )?;
-    let prefix = match (&f.trace_action_prefix, prefixes.first()) {
+    let prefix = if f.is_combined() {
+        String::new()
+    } else {
+        match (&f.trace_action_prefix, prefixes.first()) {
         (Some(expected), Some(found)) => {
             ensure(expected == found, "frozen action prefix differs")?;
             expected.clone()
@@ -75,13 +101,14 @@ pub fn native(
             "cannot infer original action epoch without a receipt; bind exact prefix explicitly"
                 .into(),
         ),
+    }
     };
     let intentions: BTreeMap<_, _> = sequences
         .into_iter()
         .map(|(seq, action)| (format!("{prefix}{seq}"), action))
         .collect();
     ensure(
-        intentions.len() <= 4096,
+        intentions.len() <= f.action_limit(),
         "too many actions for bounded capture",
     )?;
     minecraft_sdk_evidence::private_file(journal, 64 * 1024 * 1024 * 1024)?;
@@ -97,13 +124,41 @@ pub fn native(
     let bot: String = tx.query_row("SELECT id FROM bots WHERE uuid=?1", [&f.player_uuid], |r| {
         r.get(0)
     })?;
+    let actor_total: i64 =
+        tx.query_row("SELECT count(*) FROM actions WHERE bot=?1", [&bot], |r| {
+            r.get(0)
+        })?;
+    if f.is_combined() {
+        let baseline = json(
+            &trace
+                .parent()
+                .ok_or("trace parent absent")?
+                .join("combined-episode-baseline.json"),
+            16384,
+        )?;
+        let profile = json(f.host_profile()?, 16384)?;
+        ensure(
+            baseline["instance_id"] == f.instance_id
+                && baseline["player_uuid"] == f.player_uuid
+                && baseline["bot_id"] == bot
+                && profile["credential"]["bot_id"] == bot
+                && baseline["actions_before"] == 0
+                && baseline["sessions_before"] == 0
+                && baseline["fixture_sha256"] == sha256(&read(&case.join("fixture.json"), 65536)?),
+            "combined actor-wide capture requires its pristine same-fixture baseline",
+        )?;
+        ensure(
+            actor_total >= 0 && actor_total as u64 <= f.action_limit() as u64,
+            "combined actor-wide action count exceeds frozen bound; no truncated export",
+        )?;
+    }
     let mut rows = Vec::new();
     let mut expected = Vec::new();
     let mut seen = BTreeSet::new();
     let mut total = 0usize;
     {
-        let mut query=tx.prepare("SELECT id,intent,receipt FROM actions WHERE bot=?1 AND substr(id,1,length(?2))=?2 ORDER BY id LIMIT 4097")?;
-        let found = query.query_map(params![bot, prefix], |r| {
+        let mut query=tx.prepare("SELECT id,intent,receipt FROM actions WHERE bot=?1 AND (?2='' OR substr(id,1,length(?2))=?2) ORDER BY id LIMIT ?3")?;
+        let found = query.query_map(params![bot, prefix, (f.action_limit() + 1) as i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -122,7 +177,7 @@ pub fn native(
                 .saturating_add(intent.len())
                 .saturating_add(receipt.len());
             ensure(
-                total <= 16 * 1024 * 1024 && rows.len() < 4096,
+                total as u64 <= f.trace_bytes_limit() && rows.len() < f.action_limit(),
                 "original row capture exceeds budget",
             )?;
             let action: Action = serde_json::from_str(&intent)?;
@@ -140,19 +195,24 @@ pub fn native(
         }
     }
     tx.commit()?;
+    ensure(
+        !f.is_combined() || seen.len() as i64 == actor_total,
+        "combined snapshot omitted original actor rows",
+    )?;
     save(
         &case.join("original-rows.json"),
         &json!({"rows":rows,"authority":"Read-only original SQLite snapshot; running/uncertain are not fabricated terminal outcomes."}),
     )?;
-    let matches = seen.len() == intentions.len()
-        && expected.iter().all(|e| {
-            intentions.get(&e.request.action_id).is_some_and(|a| {
-                serde_json::to_value(a).ok() == serde_json::to_value(&e.request.action).ok()
-            })
-        });
+    let matches = f.is_combined()
+        || (seen.len() == intentions.len()
+            && expected.iter().all(|e| {
+                intentions.get(&e.request.action_id).is_some_and(|a| {
+                    serde_json::to_value(a).ok() == serde_json::to_value(&e.request.action).ok()
+                })
+            }));
     save(
         &case.join("intent-match.json"),
-        &json!({"exact_match":matches,"trace_count":intentions.len(),"stored_count":seen.len(),"non_json_lines_retained":non_json}),
+        &json!({"exact_match":if f.is_combined(){Value::Null}else{json!(matches)},"actor_wide_pristine_baseline":f.is_combined(),"trace_count":intentions.len(),"stored_count":seen.len(),"non_json_lines_retained":non_json,"scope":if f.is_combined(){"All actor prefixes from a pristine authoritative baseline; body-prefix intention matching is not asserted for model-generated actions."}else{"Exact frozen body-prefix intention matching"}}),
     )?;
     ensure(matches, "trace does not match ALL stored original actions")?;
     let mut spec: Spec = serde_json::from_slice(&read(template, 65536)?)?;
@@ -170,12 +230,19 @@ pub fn native(
     let mut files = Vec::new();
     let mut handler_streams = Vec::new();
     for (extension, name, limit) in [
-        ("stderr", "source-stderr.log", 16 * 1024 * 1024),
+        ("stderr", "source-stderr.log", f.trace_bytes_limit()),
         ("status.json", "source-status.json", 16384),
     ] {
         let path = trace.with_extension(extension);
         if path.exists() {
             let bytes = read(&path, limit)?;
+            if f.is_combined() && extension == "status.json" {
+                let status: Value = serde_json::from_slice(&bytes)?;
+                ensure(
+                    status["output_limit_exceeded"] == false,
+                    "combined trace truncation or old unknown stream-limit status; evidence incomplete",
+                )?;
+            }
             ensure(
                 f.secrets()?.scrub(&bytes) == bytes,
                 "handler sidecar contains allocated credential; refusing copy",
@@ -203,6 +270,7 @@ pub fn native(
         groups.push(&expected[begin..end]);
         begin = end;
     }
+    let mut report_bytes = 0usize;
     for (index, chunk) in groups.into_iter().enumerate() {
         spec.actions = chunk.to_vec();
         let name = format!("native-shard-{index:03}.json");
@@ -212,6 +280,14 @@ pub fn native(
             bytes.len() <= 8 * 1024 * 1024,
             "native shard exceeds evidence budget",
         )?;
+        report_bytes = report_bytes.saturating_add(bytes.len());
+        if f.is_combined() {
+            ensure(
+                report_bytes <= 512 * 1024 * 1024
+                    && available()? >= 500_000_000_000 + bytes.len() as u64,
+                "combined reports exceed bounded budget or disk reserve; original database must be retained",
+            )?;
+        }
         let mut out = create(&case.join(&name))?;
         out.write_all(&bytes)?;
         out.sync_all()?;

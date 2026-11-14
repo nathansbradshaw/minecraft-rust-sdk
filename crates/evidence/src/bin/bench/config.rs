@@ -7,6 +7,7 @@ pub enum Mode {
     #[default]
     Skeleton,
     Acquisition,
+    Combined,
 }
 
 #[derive(Clone, Deserialize)]
@@ -117,6 +118,29 @@ impl Fixture {
     pub fn is_acquisition(&self) -> bool {
         self.mode == Mode::Acquisition
     }
+    pub fn is_combined(&self) -> bool {
+        self.mode == Mode::Combined
+    }
+    pub fn immediate_launch(&self) -> bool {
+        self.is_acquisition() || self.is_combined()
+    }
+    pub fn child_deadlines(&self) -> (u64, u64) {
+        match self.mode {
+            Mode::Skeleton => (245, 255),
+            Mode::Acquisition => (1200, 1210),
+            Mode::Combined => (1325, 1335), // Admission120 + work1200 + child settlement.
+        }
+    }
+    pub fn trace_bytes_limit(&self) -> u64 {
+        if self.is_combined() {
+            128 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        }
+    }
+    pub fn action_limit(&self) -> usize {
+        if self.is_combined() { 32768 } else { 4096 }
+    }
     pub fn config_path(&self) -> Result<&str> {
         self.handler_args
             .get(if self.is_acquisition() { 1 } else { 0 })
@@ -194,7 +218,7 @@ impl Fixture {
             "invalid frozen identities",
         )?;
         match self.mode {
-            Mode::Skeleton => {
+            Mode::Skeleton | Mode::Combined => {
                 let (npc, position) = self.skeleton_npc()?;
                 ensure(
                     uuid(npc) && self.player_uuid != npc && position.iter().all(|p| p.is_finite()),
@@ -206,7 +230,11 @@ impl Fixture {
                 "acquisition forbids declared NPC identity and position",
             )?,
         }
-        let duration = if self.is_acquisition() { 1200 } else { 120 };
+        let duration = if self.mode == Mode::Skeleton {
+            120
+        } else {
+            1200
+        };
         ensure(
             self.duration_secs == duration
                 && self.expected_health == 20.0
@@ -365,9 +393,16 @@ impl Fixture {
                 self.handler_args.len() == 2 && self.handler_args[0] == "run",
                 "acquisition requires pinned Brain argv [run, CONFIG]",
             )?,
+            Mode::Combined => ensure(
+                self.handler_args.len() == 4
+                    && self.handler_args[1] == "task-kit"
+                    && self.handler_args[2] == "1200"
+                    && self.operator_gateway_journal.is_some(),
+                "combined requires task-kit1200 argv and authoritative operator journal",
+            )?,
         }
         ensure(
-            (!self.is_acquisition() && self.handler_args[1] != "task")
+            (!self.is_acquisition() && !self.is_combined() && self.handler_args[1] != "task")
                 || (self.model_key_name.is_some()
                     && self.allocated_model_kind.as_deref() == Some("operator-allocated-proxy")),
             "coding and acquisition modes require an explicitly allocated proxy key",
@@ -385,6 +420,14 @@ impl Fixture {
             .find(|a| a.container_path == config_path)
             .ok_or("config artifact absent")?;
         let cfg = json(&config.file.path, 65536)?;
+        if self.is_combined() {
+            ensure(
+                cfg["completion_inventory"]
+                    == json!({"minecraft:crafting_table":1,"minecraft:wooden_pickaxe":1})
+                    && cfg["goal"].as_str().is_some_and(|g| !g.trim().is_empty()),
+                "combined requires explicit goal and exact retained table/pickaxe completion contract",
+            )?;
+        }
         ensure(
             cfg["profile"] == self.container_profile()
                 && self

@@ -190,3 +190,61 @@ fn mode_and_input_accessors_reject_unknown_or_truncated_shapes_without_panicking
     assert!(setup.f.private_input_paths().is_err());
     assert!(setup.f.state_path().is_err());
 }
+fn combined() -> super::tests::Setup {
+    let mut s = super::tests::setup();
+    s.f.mode = Mode::Combined;
+    s.f.duration_secs = 1200;
+    s.f.handler_args[1] = "task-kit".into();
+    s.f.handler_args[2] = "1200".into();
+    let journal =
+        s.f.workspace
+            .parent()
+            .unwrap()
+            .join("synthetic-operator.sqlite");
+    drop(create(&journal).unwrap());
+    s.f.operator_gateway_journal = Some(journal);
+    update_config(&mut s.f, |cfg| {
+        cfg["goal"] =
+            json!("Create and retain the declared kit while surviving the admitted threat");
+        cfg["completion_inventory"] =
+            json!({"minecraft:crafting_table":1,"minecraft:wooden_pickaxe":1});
+    });
+    s
+}
+#[test]
+fn combined_mode_binds_kit_admission_deadlines_and_separate_evidence_limits() {
+    let s = combined();
+    s.f.validate().unwrap();
+    assert!(s.f.is_combined() && s.f.immediate_launch() && !s.f.is_acquisition());
+    assert_eq!(s.f.private_input_paths().unwrap().len(), 2);
+    assert_eq!(s.f.child_deadlines(), (1325, 1335));
+    assert_eq!(
+        (s.f.trace_bytes_limit(), s.f.action_limit()),
+        (128 * 1024 * 1024, 32768)
+    );
+    let legacy = super::tests::setup();
+    assert_eq!(legacy.f.child_deadlines(), (245, 255));
+    assert_eq!(
+        (legacy.f.trace_bytes_limit(), legacy.f.action_limit()),
+        (16 * 1024 * 1024, 4096)
+    );
+    assert_eq!(acquisition().f.child_deadlines(), (1200, 1210));
+}
+#[test]
+fn combined_mode_rejects_wrong_kit_goal_argv_duration_and_missing_authority() {
+    for scenario in 0..6 {
+        let mut s = combined();
+        match scenario {
+            0 => s.f.operator_gateway_journal = None,
+            1 => s.f.handler_args[1] = "task".into(),
+            2 => s.f.duration_secs = 120,
+            3 => s.f.npc_uuid = None,
+            4 => update_config(&mut s.f, |cfg| cfg["completion_inventory"] = json!({})),
+            _ => update_config(&mut s.f, |cfg| cfg["goal"] = json!("")),
+        }
+        assert!(
+            s.f.validate().is_err(),
+            "accepted invalid combined scenario{scenario}"
+        );
+    }
+}
