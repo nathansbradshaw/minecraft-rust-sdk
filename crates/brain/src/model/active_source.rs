@@ -115,11 +115,17 @@ mod tests {
             crate::progress::workspace_fingerprint_excluding_state(&root, &state).unwrap();
         let mut context = json!({"workspace":root,"workspace_source_scope":{"format":"workspace-excluding-state-v1","excluded_state":state},"goal_revision":"goal","last_tool_result":{"goal_revision":"goal"},"last_experiment":{"tool":"run","command":"behavior.lua","goal_revision":"goal","source_sha256":fingerprint,"result":{"language":"lua","lua_source":{"source_sha256":digest(text.as_bytes())}}}});
         assert_eq!(source(&context).unwrap()["content"], text);
+        context["last_experiment"]["command"] = json!(json!({"path":"behavior.lua","invocation_id":"same-source-new-work","args":{"parameter":"value"}}).to_string());
+        assert_eq!(source(&context).unwrap()["content"], text);
         context["last_experiment"]["result"]["lua_source"]["source_sha256"] = json!("stale");
         assert!(source(&context).is_none());
         context["last_experiment"]["result"]["lua_source"]["source_sha256"] =
             json!(digest(text.as_bytes()));
         context["last_experiment"]["command"] = json!("../program/behavior.lua");
+        assert!(source(&context).is_none());
+        context["last_experiment"]["command"] = json!(
+            json!({"path":"../program/behavior.lua","invocation_id":"bad","args":{}}).to_string()
+        );
         assert!(source(&context).is_none());
     }
 

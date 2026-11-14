@@ -360,7 +360,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
         ),
         "terminal" => terminal(brain, &choice.input).await,
         "run" => {
-            if choice.input.ends_with(".lua") {
+            if let Some(path) = crate::lua::path(&choice.input)? {
                 let mut result = match crate::lua::execute(brain, &choice.input).await {
                     Ok(result) => result,
                     Err(error) => {
@@ -368,8 +368,8 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
                     }
                 };
                 result["experiment"] = json!(true);
-                result["lua_source"] = crate::workspace::read(&brain.cfg.workspace, &choice.input)
-                    .unwrap_or(Value::Null);
+                result["lua_source"] =
+                    crate::workspace::read(&brain.cfg.workspace, &path).unwrap_or(Value::Null);
                 return Ok(result);
             }
             let command = run_command(&choice.input)?;

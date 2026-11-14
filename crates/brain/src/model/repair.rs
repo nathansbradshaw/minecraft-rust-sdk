@@ -155,7 +155,8 @@ pub(super) fn run_source_bounded(
         return None;
     }
     if experiment["tool"] == "run" && experiment["result"]["language"] == "lua" {
-        let relative = Path::new(experiment["command"].as_str()?);
+        let path = crate::lua::path(experiment["command"].as_str()?).ok()??;
+        let relative = Path::new(&path);
         if relative.is_absolute()
             || relative.extension()? != "lua"
             || !relative
