@@ -726,6 +726,7 @@ pub(super) fn evade_policy(
     let start = point(&o.player["position"])?;
     let mut threats = Vec::new();
     let mut visible_contacts = Vec::new();
+    let mut recalled_cover_origins = Vec::new();
     let mut projectile_danger = false;
     let mut incoming_directions = Vec::new();
     let mut blasts = Vec::new();
@@ -747,6 +748,9 @@ pub(super) fn evade_policy(
             .sqrt();
         if e["hostile"] == true && d < threat_radius(e) {
             threats.push((p, e["ranged_attack"] == true, super::aerial::diver(e)));
+            if e["visible"] != true && e["client_memory"]["kind"] == "last_visible_ranged_threat" {
+                recalled_cover_origins.push(p);
+            }
             if e["visible"] == true && visible_contacts.len() < 16 {
                 visible_contacts.push(p);
             }
@@ -880,7 +884,12 @@ pub(super) fn evade_policy(
         } else {
             threats
                 .iter()
-                .filter(|(e, _, _)| covered(p, *e, &obstacles))
+                // Preserve the old bearing in distance/lateral scoring, but
+                // do not certify a ballistic shadow against an unseen current
+                // shooter. F10 returned to such a shadow as its pursuer closed.
+                .filter(|(e, _, _)| {
+                    !recalled_cover_origins.contains(e) && covered(p, *e, &obstacles)
+                })
                 .map(|(_, ranged, _)| if *ranged { 24. } else { 4. })
                 .sum::<f64>()
         };
@@ -1168,10 +1177,53 @@ mod tests {
                 block["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
             }
         }
-        o.world["entities"] = json!([{"hostile":true,"visible":false,"ranged_attack":true,
-            "position":[7.179277791468074,1.,0.5],"client_memory":{
-                "kind":"last_visible_ranged_threat","age_ticks":2,"expires_after_ticks":160}}]);
+        o.world["entities"] = json!([{"hostile":true,"visible":true,"ranged_attack":true,
+            "position":[7.179277791468074,1.,0.5]}]);
         o
+    }
+    #[test]
+    fn f10_recalled_firing_point_cannot_pin_retreat_to_its_old_ballistic_shadow() {
+        // Translated F10 control106 player/last-seen shooter poses and75/88
+        // tick memory ages. Screen/floor and the single supplied route are
+        // synthetic: this isolates the stale-shadow policy, not native physics,
+        // the complete captured world, a real enemy position or Survival.
+        let mut o = guarded_floor();
+        o.player["position"] = json!([0.5042706505917, 1., 0.5042703396769]);
+        o.world["entities"][0]["position"] = json!([9.184398239827, 2., 2.5876947992598]);
+        let start = point(&o.player["position"]).unwrap();
+        let last_seen = point(&o.world["entities"][0]["position"]).unwrap();
+        let outward = [0.5, 1., -2.5];
+        let obstacles = boxes(&o);
+        assert!(covered(start, last_seen, &obstacles));
+        assert!(!covered(outward, last_seen, &obstacles));
+        let options = [Admitted {
+            target: outward,
+            jump: false,
+        }];
+        assert!(
+            evade_with_native(&o, &[], &[], &[], 3.5, &options).is_none(),
+            "a currently observed firing point retains its existing shadow preference"
+        );
+        for age in [16, 75, 88] {
+            o.world["entities"][0]["visible"] = json!(false);
+            o.world["entities"][0]["client_memory"] = json!({
+                "kind":"last_visible_ranged_threat","age_ticks":age,"expires_after_ticks":160,
+                "scope":"Last observed pose only; current position unknown"});
+            assert!(threatened(&o), "remembered danger is not forgotten");
+            assert!(
+                cover::plan(&o, &[], 3.5).is_none(),
+                "an unseen current shooter cannot justify returning to or holding its old shadow"
+            );
+            let route = evade_with_native(&o, &[], &[], &[], 3.5, &options)
+                .expect("the old shadow cannot veto the supplied outward route");
+            assert_eq!([route.target.x, route.target.y, route.target.z], outward);
+            assert!(route.cover_path.is_empty());
+            assert_eq!(
+                o.world["entities"][0]["position"],
+                json!(last_seen),
+                "no extrapolated hidden current position is introduced"
+            );
+        }
     }
     #[test]
     fn f06_far_visible_spider_does_not_disable_a_relevant_ranged_cover_plan() {
@@ -1674,11 +1726,11 @@ mod tests {
         );
     }
     #[test]
-    fn guarded_retreat_stays_beside_the_wall_and_settles_without_repeated_actions() {
+    fn currently_observed_archer_cover_stays_beside_the_wall_without_repeated_actions() {
         let mut o = world();
         o.player = json!({"position":[-0.5,1.,-1.5],"on_ground":true});
-        o.world["entities"] = json!([{"visible":false,"hostile":true,"ranged_attack":true,
-            "position":[11.5,1.,-2.8],"client_memory":{"kind":"last_visible_ranged_threat"}}]);
+        o.world["entities"] = json!([{"visible":true,"hostile":true,"ranged_attack":true,
+            "position":[11.5,1.,-2.8]}]);
         for b in o.world["blocks"].as_array_mut().unwrap() {
             let p = point(&b["position"]).unwrap();
             if p[0] == 0. && (1. ..=3.).contains(&p[1]) && (-2. ..=2.).contains(&p[2]) {
@@ -1686,7 +1738,7 @@ mod tests {
                 b["collision"] = json!([[0., 0., 0., 1., 1., 1.]]);
             }
         }
-        let first = evade(&o).expect("Guard toward far end while archer is hidden");
+        let first = evade(&o).expect("Guard against the currently observed firing point");
         assert!(
             (first.target.x + 0.5).abs() < 0.01 && first.target.z > 0.5,
             "{first:?}"
