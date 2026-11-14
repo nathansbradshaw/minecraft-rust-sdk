@@ -378,19 +378,7 @@ pub async fn execute(brain: &mut Brain, choice: &Choice) -> Result<Value> {
             result["experiment"] = json!(true);
             Ok(result)
         }
-        "remember" => {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Memory {
-                kind: String,
-                text: String,
-            }
-            let m: Memory = serde_json::from_str(&choice.input)?;
-            brain.journal.remember(&m.kind, &m.text)?;
-            Ok(
-                json!({"stored":true,"kind":m.kind,"authority":"source-labelled memory; not native proof"}),
-            )
-        }
+        "remember" => crate::goal_plan::remember(brain, &choice.input),
         "goal" => {
             ensure(
                 !choice.input.trim().is_empty() && choice.input.len() <= 2048,
