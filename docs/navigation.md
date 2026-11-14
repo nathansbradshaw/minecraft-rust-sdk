@@ -1,5 +1,39 @@
 # Optional navigation
 
+For a collection approach, callers may explicitly set
+`Options::until_inventory` to `Some(RetainedInventory { item, minimum })`.
+`item` is one runtime registry ID and `minimum` is a positive retained count.
+The CLI accepts the same optional field in its existing `OPTIONS.json`:
+
+```json
+{"until_inventory":{"item":"yourmod:resource","minimum":1}}
+```
+
+The brain's `navigate` tool accepts either its original goal JSON or
+`{"goal":POSITION_OR_BLOCK_REACH_GOAL,"until_inventory":{"item":"yourmod:resource","minimum":1}}`.
+Choose the actual observed resource and required count; no harvesting strategy
+or item list is imposed. Other pickups never stop an ordinary bare position goal.
+Lua's existing closed command table accepts the same input shape:
+`command={tool='navigate',input={goal=NORMAL_GOAL,until_inventory={item=ACTUAL_ID,minimum=n}}}`.
+Bare Lua navigation remains valid. The bridge uses the same typed brain request
+and validation; it does not add a general tool or host execution interface.
+
+After original pending input settles, a fresh same-actor/life observation can
+satisfy this condition without reaching the old drop coordinate. The report
+uses `inventory_satisfied` with `inventory_completion` count/revision/identity
+evidence and the original positional gap. This is neither positional arrival nor
+movement-effect or parent-task success. Cursor and menu outputs do not count.
+Reaching the approach without the resource returns `inventory_missing`; inspect
+the actual drop or choose another approach. Missing/unreleased original input
+returns `needs_reconciliation` with its exact ID; it is never replayed or hidden.
+
+The opt-in uses journal version2, so older clients cannot silently drop its
+condition; ordinary journals remain version1. Changing/removing it on the same SDK
+journal path is a conflict; preserve that state. The brain uses a separate key
+for each condition, but a different journal cannot bypass an observed held-input
+lane. Fresh-observation support is required only for this opt-in. Budgets and
+normal native admission remain unchanged.
+
 The Rust client supplies `navigation::navigate` and the CLI supplies
 `mc-sdk navigate PROFILE GOAL.json CLIENT_JOURNAL.json [OPTIONS.json]`.
 The matching adapter must advertise `minecraft:movement_options`. It computes

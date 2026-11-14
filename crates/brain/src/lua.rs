@@ -39,7 +39,7 @@ enum Command {
     Sdk(minecraft_sdk::Action),
     Status(String),
     Reconcile(String),
-    Navigate(minecraft_sdk::navigation::Goal),
+    Navigate(crate::navigation::ToolGoal),
 }
 impl Command {
     fn choice(&self) -> Result<Choice> {
@@ -379,6 +379,49 @@ pub async fn execute(brain: &mut Brain, path: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acquisition_resume_lua_navigation_shares_closed_brain_validation() {
+        let goal = r#"{kind='position',dimension='fixture:world',target={1,1,1},distance=0.5}"#;
+        let source = |input: &str| {
+            format!(
+                "return {{version=1,step=function() return {{state={{}},command={{tool='navigate',input={input}}}}} end}}"
+            )
+        };
+        let bare = step(&source(goal), &json!({}))
+            .unwrap()
+            .command
+            .unwrap()
+            .choice()
+            .unwrap();
+        let value: Value = serde_json::from_str(&bare.input).unwrap();
+        assert_eq!(value["kind"], "position");
+        assert!(value.get("until_inventory").is_none());
+        let acquisition =
+            format!("{{goal={goal},until_inventory={{item='fixture:resource',minimum=1}}}}");
+        let selected = step(&source(&acquisition), &json!({}))
+            .unwrap()
+            .command
+            .unwrap()
+            .choice()
+            .unwrap();
+        assert_eq!(selected.tool, "navigate");
+        let value: Value = serde_json::from_str(&selected.input).unwrap();
+        assert_eq!(value["until_inventory"]["minimum"], 1);
+        for input in [
+            format!("{{goal={goal},until_inventory={{item='fixture:resource',minimum=0}}}}"),
+            format!(
+                "{{goal={goal},until_inventory={{item='fixture:resource',minimum=1,actor='foreign'}}}}"
+            ),
+            format!(
+                "{{goal={goal},until_inventory={{item='fixture:resource',minimum=1}},console='forbidden'}}"
+            ),
+        ] {
+            assert!(
+                step(&source(&input), &json!({})).is_err(),
+                "invalid acquisition cannot acquire tool authority"
+            );
+        }
+    }
     #[test]
     fn scripts_are_bounded_pure_decisions_with_typed_sdk_validation() {
         let valid = "return {version=1, step=function(ctx) return {state={n=(ctx.state.n or 0)+1},command={tool='sdk',input={kind='look',yaw=0,pitch=0}}} end}";

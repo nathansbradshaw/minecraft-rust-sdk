@@ -198,6 +198,15 @@ SDK quick reference (Lua behaviors; Rust SDK and Brain):
   This opt-in can act on a fresh, strictly improving preview prefix instead of
   waiting for the entire local graph; native admission and full-search fallback
   still apply. The brain's navigate tool already enables it.
+  For caller-chosen acquisition, Options also accepts until_inventory:
+  Some(navigation::RetainedInventory { item:actual_runtime_item_id, minimum:n }).
+  A fresh same-life retained count can end that route as inventory_satisfied,
+  after original pending input is settled. This is not positional arrival or
+  parent-task completion. Cursor/menu outputs do not count. Bare goals remain
+  unchanged; unrelated item gains never globally stop navigation. The brain tool
+  exposes the same opt-in as {"goal":NORMAL_GOAL,"until_inventory":{"item":ACTUAL_ID,"minimum":n}}.
+  inventory_missing means the approach did not satisfy collection; inspect the
+  actual resource. Preserve/reconcile any needs_reconciliation original ID.
   After no_known_route, the brain's observe tool accepts {"view":"terrain"}.
   This read-only view groups current observed cells around the character into
   support, feet, head and above_head layers, with absolute positions and native
