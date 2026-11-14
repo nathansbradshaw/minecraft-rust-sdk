@@ -319,6 +319,18 @@ fuses, fire and water emergencies retain the fast policy. A quiet stalled body
 can briefly hold its completed input while a prediction arrives.
 
 Predictions are fenced by actor life, dimension, native clock, pose and terrain.
+One already-selected cover path may finish a remaining finite leg when first
+occlusion interrupts it and its owned preceding control is natively `Observed`,
+released, and at the expected endpoint. The original actor/life/clock and
+control ID remain bound; fresh known terrain, current threat guards and ordinary
+native movement admission still apply. Urgency, uncertain/cancelled input,
+foreign control, missing facts or reacquisition invalidate the continuation.
+The one continuation is consumed before dispatch, stops at its old waypoint,
+and cannot seed another hidden plan. It grants no hidden-cover reward, Hold,
+new goal or claim of protection. Multi-shooter plans, displaced endpoints and
+unknown remaining terrain have no continuation. Offline scene replay establishes
+the policy change only; Survival effectiveness requires a new native case.
+
 Changed scenes restart pagination; malformed, stale, hazardous or out-of-range
 candidates cannot become controls. The body ranks admissible candidates using
 its current threat/cover policy. A native prediction can supply a low-clearance

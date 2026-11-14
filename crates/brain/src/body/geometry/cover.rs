@@ -47,6 +47,65 @@ pub(super) enum Plan {
     Move(Escape),
     Hold,
 }
+/// Fresh terrain validation for an already selected remaining path only.
+/// Hidden enemy coordinates do not supply shielding, a new goal or Hold.
+pub(super) fn continue_route(
+    o: &Observation,
+    remaining: &[[f64; 3]],
+    blocked: &[[i32; 3]],
+    axis: f64,
+) -> Option<Escape> {
+    if o.player["on_ground"] != true
+        || o.player["in_water"] == true
+        || o.player["in_lava"] == true
+        || o.player["health"].as_f64().is_none_or(|h| h <= 0.)
+    {
+        return None;
+    }
+    let start = point(&o.player["position"])?;
+    let cells: Cells<'_> = o.world["blocks"]
+        .as_array()?
+        .iter()
+        .filter_map(|b| point(&b["position"]).map(|p| (p.map(|v| v as i32), b)))
+        .collect();
+    let obstacles = boxes(o);
+    let mut visible = Vec::new();
+    for e in o.world["entities"]
+        .as_array()?
+        .iter()
+        .filter(|e| e["visible"] == true && e["hostile"] == true)
+    {
+        let p = point(&e["position"])?;
+        if (0..3).map(|i| (start[i] - p[i]).powi(2)).sum::<f64>() < threat_radius(e).powi(2) {
+            if e["ranged_attack"] != true {
+                return None;
+            }
+            visible.push(p);
+        }
+    }
+    let target = remaining.iter().rev().copied().find(|p| {
+        p.iter().all(|v| v.is_finite())
+            && (p[1] - start[1]).abs() < 0.01
+            && (p[0] - start[0]).abs() <= axis
+            && (p[2] - start[2]).abs() <= axis
+            && (p[0] - start[0]).hypot(p[2] - start[2]) >= 0.35
+            && !blocked.contains(&target_key(*p))
+            && !toward_close_threat(o, *p)
+            && !closes_recalled_shooter(o, *p)
+            && avoids_contact(start, *p, &visible)
+            && segment(&cells, &obstacles, start, *p)
+    })?;
+    Some(Escape {
+        target: Position {
+            x: target[0],
+            y: target[1],
+            z: target[2],
+        },
+        jump: false,
+        reason: "finish one previously selected cover leg after occlusion; no safety claim".into(),
+        cover_path: Vec::new(),
+    })
+}
 pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<Plan> {
     if o.player["on_ground"] != true || o.player["in_water"] == true || o.player["in_lava"] == true
     {
