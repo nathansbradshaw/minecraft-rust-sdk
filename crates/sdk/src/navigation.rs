@@ -11,6 +11,8 @@ use std::{
 };
 
 const CAPABILITY: &str = "minecraft:movement_options";
+mod acquisition;
+pub use acquisition::{InventoryCompletion, RetainedInventory};
 fn error(code: ErrorCode, message: impl Into<String>) -> ApiError {
     ApiError::new(code, message)
 }
@@ -106,6 +108,9 @@ pub struct Options {
     /// Experimental client policy: act on a fresh, strictly improving preview
     /// prefix rather than waiting for full local enumeration. Off by default.
     pub eager_progress: bool,
+    /// Explicit caller-owned collection condition. Unrelated pickups never stop
+    /// ordinary position navigation. Requires fresh-observation capability.
+    pub until_inventory: Option<RetainedInventory>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -115,6 +120,7 @@ impl Default for Options {
             timeout_ms: 120000,
             blocked_blocks: Vec::new(),
             eager_progress: false,
+            until_inventory: None,
         }
     }
 }
@@ -133,6 +139,9 @@ pub struct Report {
     pub pending_action: Option<String>,
     pub journal: PathBuf,
     pub note: String,
+    /// Caller condition evidence, distinct from arrival and action effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_completion: Option<InventoryCompletion>,
 }
 /// Cumulative diagnostic counters for this durable navigation journal.
 /// Read predictions and local intentions never certify retained game progress.
@@ -223,6 +232,8 @@ struct State {
     instance: String,
     actor: String,
     goal: Goal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    until_inventory: Option<RetainedInventory>,
     prefix: String,
     sequence: u64,
     #[serde(default)]
@@ -258,7 +269,21 @@ fn private_options() -> OpenOptions {
     o
 }
 impl Journal {
+    #[cfg(test)]
     fn open(path: &Path, goal: Goal, instance: &str, actor: &str, p: [f64; 3]) -> Result<Self> {
+        Self::open_with_condition(path, goal, instance, actor, p, None)
+    }
+    fn open_with_condition(
+        path: &Path,
+        goal: Goal,
+        instance: &str,
+        actor: &str,
+        p: [f64; 3],
+        until_inventory: Option<RetainedInventory>,
+    ) -> Result<Self> {
+        // Older clients accept only v1 and must reject an acquisition journal
+        // rather than silently forgetting its condition during a downgrade.
+        let version = if until_inventory.is_some() { 2 } else { 1 };
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -287,24 +312,26 @@ impl Journal {
             }
             let s: State =
                 serde_json::from_slice(&fs::read(path).map_err(local)?).map_err(local)?;
-            if s.version != 1
+            if s.version != version
                 || s.instance != instance
                 || s.actor != actor
                 || s.goal != goal
+                || s.until_inventory != until_inventory
                 || !valid_id(&s.prefix)
             {
                 return Err(error(
                     ErrorCode::Conflict,
-                    "Navigation journal belongs to another goal, character, instance or version; preserve it and use a new path",
+                    "Navigation journal belongs to another goal, inventory condition, character, instance or version; preserve it and use a new path",
                 ));
             }
             s
         } else {
             State {
-                version: 1,
+                version,
                 instance: instance.into(),
                 actor: actor.into(),
                 goal,
+                until_inventory,
                 prefix: format!(
                     "nav-{:x}-{:x}-{:x}",
                     SystemTime::now()
@@ -390,6 +417,7 @@ impl Journal {
                 .map(|p| p.request.action_id.clone()),
             journal: self.path.clone(),
             note: note.into(),
+            inventory_completion: None,
         }
     }
 }
@@ -553,6 +581,9 @@ pub async fn navigate(
 ) -> Result<Report> {
     let started = std::time::Instant::now();
     goal.validate()?;
+    if let Some(condition) = &options.until_inventory {
+        condition.validate()?;
+    }
     if options.max_steps == 0
         || options.max_nodes == 0
         || options.timeout_ms == 0
@@ -576,12 +607,30 @@ pub async fn navigate(
             "Server does not advertise movement options",
         ));
     }
+    if options.until_inventory.is_some()
+        && !info
+            .capabilities
+            .iter()
+            .any(|c| c == menu::FRESH_OBSERVATION_CAPABILITY)
+    {
+        return Err(error(
+            ErrorCode::UnsupportedCapability,
+            "Inventory-conditioned navigation requires fresh observations",
+        ));
+    }
     let observation = client.observe().await?;
     let pose = observed_pose(&observation)?;
     let actor = observation.player["uuid"]
         .as_str()
         .ok_or_else(|| error(ErrorCode::NotReady, "Player identity unavailable"))?;
-    let mut journal = Journal::open(path, goal, expected, actor, pose.position)?;
+    let mut journal = Journal::open_with_condition(
+        path,
+        goal,
+        expected,
+        actor,
+        pose.position,
+        options.until_inventory.clone(),
+    )?;
     let run = tokio::time::timeout(
         Duration::from_millis(options.timeout_ms),
         run(client, &mut journal, &options),
@@ -685,7 +734,7 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
             }
             j.save()?;
         }
-        let observation = client.observe().await?;
+        let mut observation = client.observe().await?;
         let pose = observed_pose(&observation)?;
         j.state.position = pose.position;
         if observation.player["uuid"].as_str() != Some(&j.state.actor) {
@@ -701,7 +750,13 @@ async fn run(client: &Client, j: &mut Journal, options: &Options) -> Result<Repo
                 "Replan the goal explicitly in the observed dimension",
             ));
         }
-        if j.state.goal.gap(pose.position) <= 0.001 {
+        if let Some(report) = acquisition::check(client, j, &mut observation).await? {
+            return Ok(report);
+        }
+        // The optional condition may have fetched a newer native frame. All
+        // subsequent route validation must use that frame, not its old trigger.
+        let pose = observed_pose(&observation)?;
+        if j.state.until_inventory.is_none() && j.state.goal.gap(pose.position) <= 0.001 {
             j.save()?;
             return Ok(j.report("reached","Observed player pose satisfies the requested distance; gameplay effects need their own verification"));
         }
@@ -1071,6 +1126,478 @@ fn retire_local_preemption(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn acquisition_condition() -> RetainedInventory {
+        RetainedInventory {
+            item: "fixture:resource".into(),
+            minimum: 1,
+        }
+    }
+    fn acquisition_sample(p: [f64; 3], count: u64) -> serde_json::Value {
+        let mut o = observation(p);
+        o["player"]["life_id"] = serde_json::json!("life1");
+        o["player"]["inventory"] =
+            serde_json::json!([{"slot":0,"item":"fixture:resource","count":count}]);
+        o["player"]["control"] = serde_json::Value::Null;
+        o["world"]["sample_clock"] = serde_json::json!({"epoch":"clock","nanos":"3"});
+        o
+    }
+    fn acquisition_info() -> serde_json::Value {
+        let mut i = info("instance");
+        i["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(menu::FRESH_OBSERVATION_CAPABILITY));
+        i
+    }
+    fn acquisition_pending(j: &mut Journal) {
+        j.state.pending = Some(Attempt {
+            request: ActionRequest {
+                action_id: "original-pickup-leg".into(),
+                action: Action::StartMove {
+                    target: Position {
+                        x: 0.5,
+                        y: 1.,
+                        z: 0.5,
+                    },
+                    jump: false,
+                    max_ticks: 60,
+                },
+            },
+            origin: [0.5, 1., 0.5],
+            source_node: None,
+            scene: "fixture-scene".into(),
+            target: [0.5, 1., 0.5],
+            outcome: None,
+            arrival_verification: None,
+        });
+        j.save().unwrap();
+    }
+    #[test]
+    fn acquisition_resume_changed_criterion_cannot_mix_existing_state() {
+        let root = Temp::new();
+        let path = root.0.join("condition.json");
+        let condition = acquisition_condition();
+        let mut j = Journal::open_with_condition(
+            &path,
+            goal(),
+            "instance",
+            "actor",
+            [0.5, 1., 0.5],
+            Some(condition.clone()),
+        )
+        .unwrap();
+        acquisition_pending(&mut j);
+        assert_eq!(
+            j.state.version, 2,
+            "old clients must reject an opt-in journal rather than erase its condition"
+        );
+        drop(j);
+        let original = fs::read(&path).unwrap();
+        for changed in [
+            None,
+            Some(RetainedInventory {
+                minimum: 2,
+                ..condition.clone()
+            }),
+            Some(RetainedInventory {
+                item: "fixture:other".into(),
+                ..condition.clone()
+            }),
+        ] {
+            assert!(
+                matches!(Journal::open_with_condition(&path,goal(),"instance","actor",[0.5,1.,0.5],changed),Err(e) if e.code==ErrorCode::Conflict)
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                original,
+                "criterion conflict cannot retire original pending ID"
+            );
+        }
+        let j = Journal::open_with_condition(
+            &path,
+            goal(),
+            "instance",
+            "actor",
+            [0.5, 1., 0.5],
+            Some(condition),
+        )
+        .unwrap();
+        assert_eq!(
+            j.state.pending.unwrap().request.action_id,
+            "original-pickup-leg"
+        );
+    }
+    #[tokio::test]
+    async fn acquisition_resume_unrequested_pickup_does_not_finish_bare_position() {
+        let root = Temp::new();
+        let mut journal = Journal::open(
+            &root.0.join("bare.json"),
+            goal(),
+            "instance",
+            "actor",
+            [0.5, 1., 0.5],
+        )
+        .unwrap();
+        let mut observation: Observation =
+            serde_json::from_value(acquisition_sample([0.5, 1., 0.5], 99)).unwrap();
+        let client = client("http://127.0.0.1:1/".into());
+        assert!(
+            acquisition::check(&client, &mut journal, &mut observation)
+                .await
+                .unwrap()
+                .is_none(),
+            "no condition means no inventory check, network request or early finish"
+        );
+        assert_eq!(journal.state.version, 1);
+        assert!(journal.state.goal.gap(journal.state.position) > 1.);
+    }
+    #[tokio::test]
+    async fn acquisition_resume_f09_gain_stops_only_opt_in_without_another_movement() {
+        for pending in [false, true] {
+            let root = Temp::new();
+            let path = root.0.join("condition.json");
+            if pending {
+                let mut j = Journal::open_with_condition(
+                    &path,
+                    goal(),
+                    "instance",
+                    "actor",
+                    [0.5, 1., 0.5],
+                    Some(acquisition_condition()),
+                )
+                .unwrap();
+                acquisition_pending(&mut j);
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                let sample = acquisition_sample([0.5, 1., 0.5], 1);
+                let receipt = serde_json::json!({"action_id":"original-pickup-leg","outcome":"observed","adapter_version":"fixture","error":null,
+                    "evidence":{"native_effect_verified":true,"input_released":true,"after":sample}});
+                respond(&listener, "GET /v1/server ", acquisition_info(), 200).await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    sample.clone(),
+                    200,
+                )
+                .await;
+                if pending {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/actions/original-pickup-leg ",
+                        receipt.clone(),
+                        200,
+                    )
+                    .await;
+                }
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    sample.clone(),
+                    200,
+                )
+                .await;
+                let (stream, query) =
+                    request(&listener, "POST /v1/bots/fixture/observations/query ").await;
+                assert_eq!(query["capability"], menu::FRESH_OBSERVATION_CAPABILITY);
+                reply(stream,serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":sample}),200).await;
+                if pending {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/actions/original-pickup-leg ",
+                        receipt,
+                        200,
+                    )
+                    .await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "satisfied collection cannot start another mutation or route preview"
+                );
+            });
+            let report = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    until_inventory: Some(acquisition_condition()),
+                    ..Options::default()
+                },
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(report.status, "inventory_satisfied");
+            assert!(
+                report.remaining_distance > 1.,
+                "retain actual unmet positional gap"
+            );
+            assert!(report.pending_action.is_none());
+            let proof = report.inventory_completion.unwrap();
+            assert_eq!(proof.observed_count, 1);
+            assert!(proof.owned_input_settled);
+            assert_eq!(
+                proof.settled_action_id.as_deref(),
+                pending.then_some("original-pickup-leg")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn acquisition_resume_never_bypasses_missing_or_held_original_input() {
+        for missing in [false, true] {
+            let root = Temp::new();
+            let path = root.0.join("condition.json");
+            if missing {
+                let mut j = Journal::open_with_condition(
+                    &path,
+                    goal(),
+                    "instance",
+                    "actor",
+                    [0.5, 1., 0.5],
+                    Some(acquisition_condition()),
+                )
+                .unwrap();
+                acquisition_pending(&mut j);
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                let mut sample = acquisition_sample([0.5, 1., 0.5], 1);
+                if !missing {
+                    sample["player"]["control"] = serde_json::json!({"action_id":"original-pickup-leg","outcome":"running","input_released":false});
+                }
+                respond(&listener, "GET /v1/server ", acquisition_info(), 200).await;
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    sample.clone(),
+                    200,
+                )
+                .await;
+                if missing {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/actions/original-pickup-leg ",
+                        serde_json::to_value(ApiError::new(
+                            ErrorCode::NotFound,
+                            "Preserved original ID missing",
+                        ))
+                        .unwrap(),
+                        404,
+                    )
+                    .await;
+                } else {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/observations ",
+                        sample.clone(),
+                        200,
+                    )
+                    .await;
+                    respond(&listener,"POST /v1/bots/fixture/observations/query ",serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":sample}),200).await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "no new movement, cancel or replay may erase the unresolved lane"
+                );
+            });
+            let report = navigate(
+                &c,
+                goal(),
+                &path,
+                Options {
+                    until_inventory: Some(acquisition_condition()),
+                    ..Options::default()
+                },
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(report.status, "needs_reconciliation");
+            assert_eq!(
+                report.pending_action.as_deref(),
+                Some("original-pickup-leg")
+            );
+            assert!(
+                report
+                    .inventory_completion
+                    .is_none_or(|p| !p.owned_input_settled)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn acquisition_resume_cursor_and_output_do_not_satisfy_retained_condition() {
+        let root = Temp::new();
+        let path = root.0.join("condition.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut sample = acquisition_sample([5.5, 1., 0.5], 0);
+            sample["menu"] = serde_json::json!({"carried":{"item":"fixture:resource","count":9},"slots":[{"item":"fixture:resource","count":9}]});
+            respond(&listener, "GET /v1/server ", acquisition_info(), 200).await;
+            for _ in 0..2 {
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    sample.clone(),
+                    200,
+                )
+                .await;
+            }
+            respond(
+                &listener,
+                "POST /v1/bots/fixture/observations/query ",
+                serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":sample}),
+                200,
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let report = navigate(
+            &c,
+            goal(),
+            &path,
+            Options {
+                until_inventory: Some(acquisition_condition()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(report.status, "inventory_missing");
+        let proof = report.inventory_completion.unwrap();
+        assert_eq!(proof.observed_count, 0);
+        assert!(!proof.condition_satisfied);
+    }
+    #[tokio::test]
+    async fn acquisition_resume_fresh_displacement_and_lost_count_replace_stale_route_basis() {
+        for cached_at_goal in [false, true] {
+            let root = Temp::new();
+            let path = root.0.join("fresh.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+            let fresh_position = if cached_at_goal {
+                [0.5, 1., 0.5]
+            } else {
+                [2.5, 1., 0.5]
+            };
+            let server = tokio::spawn(async move {
+                let cached = acquisition_sample(
+                    if cached_at_goal {
+                        [5.5, 1., 0.5]
+                    } else {
+                        [0.5, 1., 0.5]
+                    },
+                    u64::from(!cached_at_goal),
+                );
+                let mut fresh = acquisition_sample(fresh_position, 0);
+                fresh["revision"] = serde_json::json!("newer-native");
+                fresh["world"]["sample_clock"]["nanos"] = serde_json::json!("4");
+                respond(&listener, "GET /v1/server ", acquisition_info(), 200).await;
+                for _ in 0..2 {
+                    respond(
+                        &listener,
+                        "GET /v1/bots/fixture/observations ",
+                        cached.clone(),
+                        200,
+                    )
+                    .await;
+                }
+                respond(&listener,"POST /v1/bots/fixture/observations/query ",serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":fresh}),200).await;
+                let (stream, query) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    request(&listener, "POST /v1/bots/fixture/observations/query "),
+                )
+                .await
+                .expect("fresh outside-goal facts must continue route validation");
+                assert_eq!(query["capability"], CAPABILITY);
+                reply(stream,serde_json::json!({"format":"minecraft-movement-options-v1","origin":{"position":fresh_position,"dimension":"fixture:world"},"scene":"new-native-basis","options":[],"complete":true,"next_offset":null,"retry_after_ms":0}),200).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "new native pose must be used rather than treating it as an origin mismatch"
+                );
+            });
+            let report = tokio::time::timeout(
+                Duration::from_secs(3),
+                navigate(
+                    &c,
+                    goal(),
+                    &path,
+                    Options {
+                        until_inventory: Some(acquisition_condition()),
+                        ..Options::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(report.status, "no_known_route");
+            assert_eq!(report.position, fresh_position);
+            assert!(report.inventory_completion.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn acquisition_resume_missing_resource_cannot_hide_held_input() {
+        let root = Temp::new();
+        let path = root.0.join("held.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = client(format!("http://{}/", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut sample = acquisition_sample([5.5, 1., 0.5], 0);
+            sample["player"]["control"] = serde_json::json!({"action_id":"earlier-held-id","outcome":"running","input_released":false});
+            respond(&listener, "GET /v1/server ", acquisition_info(), 200).await;
+            for _ in 0..2 {
+                respond(
+                    &listener,
+                    "GET /v1/bots/fixture/observations ",
+                    sample.clone(),
+                    200,
+                )
+                .await;
+            }
+            respond(
+                &listener,
+                "POST /v1/bots/fixture/observations/query ",
+                serde_json::json!({"format":"minecraft-fresh-observation-v1","observation":sample}),
+                200,
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let report = navigate(
+            &c,
+            goal(),
+            &path,
+            Options {
+                until_inventory: Some(acquisition_condition()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(report.status, "needs_reconciliation");
+        assert_eq!(report.pending_action.as_deref(), Some("earlier-held-id"));
+        assert!(!report.inventory_completion.unwrap().owned_input_settled);
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {

@@ -66,6 +66,12 @@ pub(super) fn plan(o: &Observation, blocked: &[[i32; 3]], axis: f64) -> Option<P
         if (0..3).map(|i| (p[i] - start[i]).powi(2)).sum::<f64>() >= threat_radius(enemy).powi(2) {
             continue;
         }
+        // A remembered firing point is a retreat bearing, not the current
+        // position of a mobile pursuer. Its old shadow cannot justify waiting
+        // here or returning to cover after an outward escape.
+        if enemy["visible"] != true {
+            return None;
+        }
         if enemy["ranged_attack"] != true {
             return None;
         }

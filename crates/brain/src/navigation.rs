@@ -2,7 +2,7 @@
 use crate::{Brain, Journal, Result, digest, ensure, private_read, private_write};
 use minecraft_sdk::{
     Client, Profile,
-    navigation::{Goal, Options},
+    navigation::{Goal, Options, RetainedInventory},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,6 +17,39 @@ struct Request {
     journal: PathBuf,
     result: PathBuf,
     options: Options,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ToolGoal {
+    Acquisition(AcquisitionGoal),
+    Position(Goal),
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcquisitionGoal {
+    goal: Goal,
+    until_inventory: RetainedInventory,
+}
+impl ToolGoal {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Position(goal) => goal.validate()?,
+            Self::Acquisition(request) => {
+                request.goal.validate()?;
+                request.until_inventory.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+fn parse_goal(input: &str) -> Result<(Goal, Option<RetainedInventory>)> {
+    let request = serde_json::from_str::<ToolGoal>(input)?;
+    request.validate()?;
+    let result = match request {
+        ToolGoal::Position(goal) => (goal, None),
+        ToolGoal::Acquisition(goal) => (goal.goal, Some(goal.until_inventory)),
+    };
+    Ok(result)
 }
 pub async fn worker(path: &Path) -> Result<()> {
     ensure(
@@ -66,7 +99,23 @@ fn journal_key(instance: &str, actor: &Value, goal: &Goal) -> String {
             .as_bytes(),
     )
 }
-fn classify_slice(result: &mut Value, goal: &Goal) {
+fn acquisition_key(
+    instance: &str,
+    actor: &Value,
+    goal: &Goal,
+    condition: Option<&RetainedInventory>,
+) -> String {
+    let original = journal_key(instance, actor, goal);
+    match condition {
+        None => original,
+        Some(condition) => digest(
+            json!([original, "until-inventory-v1", condition])
+                .to_string()
+                .as_bytes(),
+        ),
+    }
+}
+fn classify_slice(result: &mut Value, goal: &Goal, condition: Option<&RetainedInventory>) {
     let transport_ok =
         result["success"] == true && result["exit_code"] == 0 && result["timed_out"] == false;
     let status = result["navigation"]["report"]["status"]
@@ -76,9 +125,29 @@ fn classify_slice(result: &mut Value, goal: &Goal) {
     let resumable =
         transport_ok && status == "budget_exhausted" && result["navigation"]["error"].is_null();
     let preempted = transport_ok && preemption_report(result);
-    result["success"] = json!(transport_ok && status == "reached");
+    let evidence = &result["navigation"]["report"]["inventory_completion"];
+    let inventory_satisfied = status == "inventory_satisfied"
+        && condition.is_some_and(|condition| {
+            evidence["condition"]["item"] == condition.item
+                && evidence["condition"]["minimum"] == condition.minimum
+                && evidence["observed_count"]
+                    .as_u64()
+                    .is_some_and(|n| n >= condition.minimum)
+                && evidence["condition_satisfied"] == true
+                && evidence["owned_input_settled"] == true
+                && ["observation_revision", "actor", "life"]
+                    .iter()
+                    .all(|key| evidence[*key].as_str().is_some_and(|s| !s.is_empty()))
+                && result["navigation"]["report"]
+                    .get("pending_action")
+                    .is_some_and(Value::is_null)
+        });
+    result["success"] = json!(
+        transport_ok && ((condition.is_none() && status == "reached") || inventory_satisfied)
+    );
     result["navigation_slice"] = json!({"format":"navigation-slice-v1",
         "completed":result["success"],"can_resume":resumable||preempted,"goal":goal,
+        "until_inventory":condition,"completion_kind":if inventory_satisfied{Some("retained_inventory")}else if condition.is_none()&&status=="reached"{Some("position")}else{None},
         "paused_for_control":preempted,
         "resume_condition":if preempted{"Wait for changed, ready body/control facts; writing code and conversation remain available"}else{"Reobserve and continue the bounded slice"},
         "resume_tool":"navigate","scope":"Local bounded helper outcome, not proof of task completion. A normal slice deadline can resume the same goal/journal; pending IDs are inspected rather than replayed. Investigate unchanged slices without native movement or new read work; do not poll indefinitely."});
@@ -206,7 +275,7 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
         input.len() <= 10000,
         "Bounded typed navigation goal required",
     )?;
-    let goal: Goal = serde_json::from_str(input)?;
+    let (goal, until_inventory) = parse_goal(input)?;
     let pause_revision = brain.journal.get("goal_revision")?;
     let body = brain
         .body
@@ -214,14 +283,15 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
         .map(|h| h.shared.view())
         .unwrap_or(Value::Null);
     let before_control = control_basis(&brain.observed, &body);
-    let key = journal_key(
+    let key = acquisition_key(
         &brain.server.instance_id,
         &brain.observed.player["uuid"],
         &goal,
+        until_inventory.as_ref(),
     );
     let sequence = brain.journal.event(
         "navigation_tool_intent",
-        json!({"goal":goal,"journal_key":key,"built_in_helper":true,"generated_skill":false}),
+        json!({"goal":goal,"until_inventory":until_inventory,"journal_key":key,"built_in_helper":true,"generated_skill":false}),
     )?;
     let stem = format!("navigation-{}-{sequence}", brain.run_id);
     let request_file = brain.cfg.state.join(format!("{stem}.request.json"));
@@ -236,6 +306,7 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
             timeout_ms: 30000.min(brain.cfg.tool_timeout_secs.saturating_mul(1000)),
             blocked_blocks: navigation_blocked_blocks(),
             eager_progress: true,
+            until_inventory,
             ..Options::default()
         },
     };
@@ -255,7 +326,11 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
     match response {
         Ok(response) => {
             result["navigation"] = response;
-            classify_slice(&mut result, &request.goal);
+            classify_slice(
+                &mut result,
+                &request.goal,
+                request.options.until_inventory.as_ref(),
+            );
             if result["navigation"]["report"]["status"] == "no_known_route" {
                 result["recommended_observation"] = json!({"tool":"observe","input":{"view":"terrain"},
                     "reason":"Inspect local support, foot space and headroom. Another distant target does not open an exhausted local graph. Diagnose the observed constraint before choosing a different method; this is not permission or a request to break blocks."});
@@ -292,6 +367,106 @@ pub async fn execute(brain: &mut Brain, input: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acquisition_resume_input_and_key_preserve_bare_goal_semantics() {
+        let bare = json!({"kind":"position","dimension":"fixture:world","target":[10.5,1.0,2.5],"distance":0.5});
+        let (goal, none) = parse_goal(&bare.to_string()).unwrap();
+        assert!(none.is_none());
+        assert_eq!(
+            acquisition_key("instance", &json!("own"), &goal, None),
+            journal_key("instance", &json!("own"), &goal)
+        );
+        let wrapped =
+            json!({"goal":bare,"until_inventory":{"item":"fixture:resource","minimum":1}});
+        let (same, condition) = parse_goal(&wrapped.to_string()).unwrap();
+        assert_eq!(same, goal);
+        let key = acquisition_key("instance", &json!("own"), &goal, condition.as_ref());
+        assert_ne!(key, journal_key("instance", &json!("own"), &goal));
+        for pointer in ["/until_inventory/minimum", "/until_inventory/item"] {
+            let mut changed = wrapped.clone();
+            *changed.pointer_mut(pointer).unwrap() = if pointer.ends_with("minimum") {
+                json!(2)
+            } else {
+                json!("fixture:other")
+            };
+            let (_, condition) = parse_goal(&changed.to_string()).unwrap();
+            assert_ne!(
+                key,
+                acquisition_key("instance", &json!("own"), &goal, condition.as_ref())
+            );
+        }
+        let mut bad = wrapped.clone();
+        bad["until_inventory"]["minimum"] = json!(0);
+        assert!(parse_goal(&bad.to_string()).is_err());
+        bad = wrapped;
+        bad["actor"] = json!("forged");
+        assert!(parse_goal(&bad.to_string()).is_err());
+    }
+    #[test]
+    fn acquisition_resume_completion_is_distinct_from_position_and_movement_effects() {
+        let goal = parse_goal(
+            r#"{"kind":"position","dimension":"fixture:world","target":[1,1,1],"distance":0.5}"#,
+        )
+        .unwrap()
+        .0;
+        let condition = RetainedInventory {
+            item: "fixture:resource".into(),
+            minimum: 1,
+        };
+        let successful = json!({"success":true,"exit_code":0,"timed_out":false,"navigation":{"report":{
+            "status":"inventory_satisfied","remaining_distance":1.29,"pending_action":null,
+            "inventory_completion":{"condition":{"item":"fixture:resource","minimum":1},"observed_count":1,
+                "condition_satisfied":true,"owned_input_settled":true,"observation_revision":"native-sample","actor":"own","life":"life1"}}}});
+        let mut result = successful.clone();
+        classify_slice(&mut result, &goal, Some(&condition));
+        assert_eq!(result["success"], true);
+        assert_eq!(
+            result["navigation_slice"]["completion_kind"],
+            "retained_inventory"
+        );
+        assert_eq!(result["navigation"]["report"]["remaining_distance"], 1.29);
+        assert!(
+            !crate::progress::executed("navigate", &result, "same-source", "same-source"),
+            "condition report cannot invent native movement or gain"
+        );
+        for (pointer, value) in [
+            (
+                "/navigation/report/inventory_completion/owned_input_settled",
+                json!(false),
+            ),
+            (
+                "/navigation/report/inventory_completion/observed_count",
+                json!(0),
+            ),
+            (
+                "/navigation/report/inventory_completion/condition/item",
+                json!("fixture:other"),
+            ),
+            ("/navigation/report/inventory_completion/life", json!("")),
+            (
+                "/navigation/report/pending_action",
+                json!("original-still-pending"),
+            ),
+        ] {
+            let mut bad = successful.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            classify_slice(&mut bad, &goal, Some(&condition));
+            assert_eq!(bad["success"], false, "{pointer}");
+        }
+        result = successful.clone();
+        classify_slice(&mut result, &goal, None);
+        assert_eq!(
+            result["success"], false,
+            "bare caller did not ask for an inventory stop"
+        );
+        result = successful;
+        result["navigation"]["report"]["status"] = json!("reached");
+        classify_slice(&mut result, &goal, Some(&condition));
+        assert_eq!(
+            result["success"], false,
+            "arrival cannot satisfy an opt-in resource condition"
+        );
+    }
     #[test]
     fn unavailable_navigation_becomes_a_nonexecuting_report_without_blocking_other_work() {
         let requested = crate::model::Choice {
@@ -352,7 +527,7 @@ mod tests {
         let mut result = json!({"success":true,"exit_code":0,"timed_out":false,
             "navigation":{"report":{"status":"preempted","pending_action":null}},
             "local_action_feedback":{"requests":[{"response":{"outcome":"cancelled"}}]}});
-        classify_slice(&mut result, &goal);
+        classify_slice(&mut result, &goal, None);
         result
     }
     #[test]
@@ -570,7 +745,7 @@ mod tests {
         let mut result = json!({"success":true,"exit_code":0,"timed_out":false,
             "navigation":{"report":{"status":"budget_exhausted","pending_action":"existing-id"}},
             "local_action_feedback":{"requests":[]}});
-        classify_slice(&mut result, &goal);
+        classify_slice(&mut result, &goal, None);
         assert!(resumable_slice(&result));
         assert_eq!(result["success"], false);
         assert!(!crate::tool_failed(&result));
@@ -592,7 +767,7 @@ mod tests {
         ] {
             let mut failure = json!({"success":true,"exit_code":0,"timed_out":false,
                 "navigation":{"report":{"status":status}}});
-            classify_slice(&mut failure, &goal);
+            classify_slice(&mut failure, &goal, None);
             assert!(!resumable_slice(&failure));
             assert!(crate::tool_failed(&failure));
         }

@@ -142,7 +142,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 None => navigation::Options::default(),
             };
             let report = navigation::navigate(&client, goal, state, options).await?;
-            if report.status != "reached" {
+            if !matches!(report.status.as_str(), "reached" | "inventory_satisfied") {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 std::process::exit(2);
             }

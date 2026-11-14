@@ -1,6 +1,7 @@
 //! Exact-owned NPC cleanup with a bounded loaded-chunk witness, never broad removal.
 use super::*;
 use std::collections::BTreeSet;
+use std::time::Instant;
 fn marked(text: &str) -> Option<bool> {
     let lower = text.to_ascii_lowercase();
     if lower.contains("is not marked for force loading") {
@@ -39,6 +40,53 @@ fn position(text: &str) -> Option<[f64; 3]> {
 // feedback. Accept that ONLY after positive location and confirmed exact kill above.
 fn absent_after_kill(text: &str) -> bool {
     text.trim().is_empty() || text.trim().eq_ignore_ascii_case("No entity was found")
+}
+fn settle_after_kill(
+    client: &mut dyn Console,
+    npc: &rcon::EntityUuid,
+    case: &Path,
+    budget: Duration,
+    interval: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut reads = 0;
+    loop {
+        let label = if reads == 0 {
+            "cleanup-npc-after".into()
+        } else {
+            format!("cleanup-npc-after-{reads}")
+        };
+        let after = rcon_execute(
+            client,
+            rcon::Command::ReadNpcPosition { npc: npc.clone() },
+            case,
+            &label,
+        )?;
+        reads += 1;
+        if absent_after_kill(&after.text) {
+            save(
+                &case.join("cleanup-npc-settlement.json"),
+                &json!({
+                    "absence_confirmed":true,"read_only_queries":reads,
+                    "elapsed_ms":started.elapsed().as_millis(),"kill_replayed":false
+                }),
+            )?;
+            return Ok(());
+        }
+        ensure(
+            position(&after.text).is_some(),
+            "ambiguous NPC settlement response",
+        )?;
+        ensure(
+            started.elapsed() < budget,
+            "NPC remained present after bounded read-only settlement",
+        )?;
+        std::thread::sleep(interval.min(budget.saturating_sub(started.elapsed())));
+        ensure(
+            started.elapsed() < budget,
+            "NPC absence settlement deadline exceeded",
+        )?;
+    }
 }
 pub fn run(client: &mut dyn Console, f: &Fixture, case: &Path, last: [f64; 3]) -> Result<()> {
     ensure(
@@ -114,15 +162,14 @@ pub fn run(client: &mut dyn Console, f: &Fixture, case: &Path, last: [f64; 3]) -
             killed.text.trim().starts_with("Killed "),
             "exact skeleton kill not confirmed",
         )?;
-        let after = rcon_execute(
+        // A confirmed kill can leave the dying entity queryable for its normal
+        // death animation. Poll reads only; the kill is never sent again.
+        settle_after_kill(
             client,
-            rcon::Command::ReadNpcPosition { npc },
+            &npc,
             case,
-            "cleanup-npc-after",
-        )?;
-        ensure(
-            absent_after_kill(&after.text),
-            "exact NPC absence not confirmed after kill",
+            Duration::from_secs(2),
+            Duration::from_millis(100),
         )
     })();
     // Restore only loads proven absent-before and successfully added by this run.
@@ -177,6 +224,8 @@ mod tests {
         initial: BTreeSet<(i32, i32)>,
         removed: Vec<(i32, i32)>,
         alive: bool,
+        death_frames: usize,
+        kills: usize,
     }
     impl Console for Fake {
         fn execute(&mut self, c: &rcon::Command) -> std::result::Result<rcon::Reply, rcon::Error> {
@@ -200,7 +249,10 @@ mod tests {
                     self.removed.push((*x, *z));
                     "Unmarked chunk [x,z] for force loading".into()
                 }
-                rcon::Command::ReadNpcPosition { .. } => if self.alive {
+                rcon::Command::ReadNpcPosition { .. } => if self.alive || self.death_frames > 0 {
+                    if !self.alive {
+                        self.death_frames -= 1;
+                    }
                     "Skeleton has the following entity data: [262.5d,64.0d,-709.5d]"
                 } else {
                     "No entity was found"
@@ -208,6 +260,7 @@ mod tests {
                 .into(),
                 rcon::Command::RemoveOwnedSkeleton { .. } => {
                     self.alive = false;
+                    self.kills += 1;
                     "Killed Skeleton".into()
                 }
                 _ => panic!("unexpected console command"),
@@ -227,6 +280,8 @@ mod tests {
             initial,
             removed: vec![],
             alive: true,
+            death_frames: 0,
+            kills: 0,
         };
         run(&mut c, &s.f, &s.case, s.f.skeleton_npc().unwrap().1).unwrap();
         assert_eq!(c.loads, c.initial);
@@ -245,6 +300,8 @@ mod tests {
             initial: BTreeSet::new(),
             removed: vec![],
             alive: false,
+            death_frames: 0,
+            kills: 0,
         };
         assert!(run(&mut c, &s.f, &s.case, s.f.skeleton_npc().unwrap().1).is_err());
         assert!(c.loads.is_empty());
@@ -252,5 +309,48 @@ mod tests {
             json(&s.case.join("cleanup-result.json"), 65536).unwrap()["complete"],
             false
         );
+    }
+    #[test]
+    fn confirmed_kill_waits_for_death_animation_without_another_kill() {
+        let s = super::super::tests::setup();
+        let initial = BTreeSet::from([(16, -45)]);
+        let mut c = Fake {
+            loads: initial.clone(),
+            initial,
+            removed: vec![],
+            alive: true,
+            death_frames: 2,
+            kills: 0,
+        };
+        run(&mut c, &s.f, &s.case, s.f.expected_npc_position).unwrap();
+        assert_eq!(c.kills, 1);
+        assert_eq!(c.loads, c.initial);
+        let result = json(&s.case.join("cleanup-npc-settlement.json"), 65536).unwrap();
+        assert_eq!(result["read_only_queries"], 3);
+        assert_eq!(result["kill_replayed"], false);
+    }
+    #[test]
+    fn settlement_deadline_keeps_presence_uncertain_without_mutation() {
+        let s = super::super::tests::setup();
+        let mut c = Fake {
+            loads: BTreeSet::new(),
+            initial: BTreeSet::new(),
+            removed: vec![],
+            alive: false,
+            death_frames: usize::MAX,
+            kills: 0,
+        };
+        let npc = rcon::EntityUuid::parse(&s.f.npc_uuid).unwrap();
+        assert!(
+            settle_after_kill(
+                &mut c,
+                &npc,
+                &s.case,
+                Duration::ZERO,
+                Duration::from_millis(1)
+            )
+            .is_err()
+        );
+        assert_eq!(c.kills, 0);
     }
 }
