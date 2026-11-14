@@ -412,8 +412,8 @@ mod tests {
     fn moved_npc_holds_its_actual_chunk_and_releases_only_owned_tickets() {
         for preexisting in [false, true] {
             let s = super::super::tests::setup();
-            let moved = [1865.0907, 81., 690.3366];
-            let chunk = (116, 43);
+            let moved = [262.5, 64., -661.5];
+            let chunk = (16, -42);
             let initial = if preexisting {
                 BTreeSet::from([chunk])
             } else {
@@ -428,12 +428,12 @@ mod tests {
                 kills: 0,
                 position: moved,
             };
-            run(&mut c, &s.f, &s.case, [1887.5, 89., 646.5]).unwrap();
+            run(&mut c, &s.f, &s.case, [262.5, 64., -709.5]).unwrap();
             assert_eq!(c.kills, 1);
             assert_eq!(c.loads, c.initial);
             assert_eq!(c.removed.contains(&chunk), !preexisting);
             let result = json(&s.case.join("cleanup-result.json"), 65536).unwrap();
-            assert_eq!(result["native_npc_chunk_before_kill"], json!([116, 43]));
+            assert_eq!(result["native_npc_chunk_before_kill"], json!([16, -42]));
             assert_eq!(result["complete"], true);
             assert!(c.removed.len() <= 10);
         }
