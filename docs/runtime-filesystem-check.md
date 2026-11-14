@@ -33,3 +33,18 @@ before stopping a container whose state is on tmpfs.
 The operator bench requires a pinned `runtime_check` artifact and runs it before
 its first connection, including standalone stage. Build and test the helper in
 the shared compiler lane before live use.
+
+The same pinned Linux helper supports `process-witness ABSOLUTE_ELF_PATH`.
+After READY, the bench invokes this once inside the frozen container rather than
+making a Docker request for each PID. It hashes the bounded regular ELF, scans
+at most64 `/proc` entries under a2-second internal deadline, and matches same-UID
+processes by device/inode with stable PID start times. It never reads command
+lines or environments. The outer Docker request has a10-second timeout; container
+identity verification is separate. This snapshot does not prove later immutability.
+
+The bench requires a complete `minecraft-runtime-process-witness-v1` result,
+the frozen executable path/hash, and exactly one matching process. It retains
+`ready-process-witness.json` and records binding failures in
+`remote-bind-failed.json`; rejected process callbacks also appear in the handler
+status. Older helper binaries do not implement this command and must be replaced
+and repinned before running the updated bench. No actor or gameplay call is made.
