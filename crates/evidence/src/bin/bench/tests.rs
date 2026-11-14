@@ -35,8 +35,11 @@ impl Runner for Fake {
         out.stderr = secrets.scrub(&out.stderr);
         for line in out.stdout.split(|b| *b == b'\n') {
             if let Ok(v) = serde_json::from_slice(line)
-                && on_line(&v).is_err()
+                && let Err(error) = on_line(&v)
             {
+                if out.callback_error.is_none() {
+                    out.callback_error = Some(error.to_string().chars().take(1024).collect());
+                }
                 out.success = false;
                 break;
             }
@@ -53,6 +56,7 @@ pub(super) fn output(text: String, success: bool) -> process::Output {
         stderr: Vec::new(),
         success,
         timed_out: false,
+        callback_error: None,
     }
 }
 pub(super) struct Setup {
@@ -631,6 +635,132 @@ fn closed_child_pipes_do_not_escape_process_deadline() {
         .unwrap();
     assert!(out.timed_out && !out.success);
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+#[ignore = "child fixture invoked only by the bounded callback test"]
+fn callback_line_child_fixture() {
+    std::io::stdout()
+        .write_all(b"\n{\"event\":\"first-callback\"}\n{\"event\":\"second-callback\"}\n")
+        .unwrap();
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+#[ignore = "child fixture invoked only by the bounded callback test"]
+fn callback_pending_child_fixture() {
+    std::io::stdout()
+        .write_all(b"\n{\"event\":\"pending-callback\"}")
+        .unwrap();
+    std::io::stdout().flush().unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn callback_rejection_keeps_first_bounded_cause_and_original_child_output() {
+    let args = [
+        "--exact",
+        "bench::tests::callback_line_child_fixture",
+        "--ignored",
+        "--nocapture",
+    ]
+    .map(str::to_owned);
+    let mut calls = 0;
+    let out = SystemRunner::new()
+        .run(
+            &std::env::current_exe().unwrap(),
+            &args,
+            5,
+            &Secrets(vec![]),
+            &mut |_| {
+                calls += 1;
+                Err(format!("native PID binding rejected: {}", "界".repeat(1100)).into())
+            },
+        )
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert!(!out.success && !out.timed_out);
+    assert_eq!(out.signal, Some(libc::SIGKILL));
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("first-callback")
+    );
+    let error = out.callback_error.unwrap();
+    assert!(error.starts_with("native PID binding rejected:"));
+    assert_eq!(error.chars().count(), 1024);
+}
+
+#[test]
+fn pending_json_callback_rejection_is_retained_despite_zero_child_exit() {
+    let args = [
+        "--exact",
+        "bench::tests::callback_pending_child_fixture",
+        "--ignored",
+        "--nocapture",
+    ]
+    .map(str::to_owned);
+    let out = SystemRunner::new()
+        .run(
+            &std::env::current_exe().unwrap(),
+            &args,
+            5,
+            &Secrets(vec![]),
+            &mut |_| Err("pending native witness rejected".into()),
+        )
+        .unwrap();
+    assert!(!out.success && !out.timed_out);
+    assert_eq!(out.exit_code, Some(0));
+    assert_eq!(out.signal, None);
+    assert_eq!(
+        out.callback_error.as_deref(),
+        Some("pending native witness rejected")
+    );
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("pending-callback")
+    );
+}
+
+#[test]
+fn callback_error_status_scrubs_both_secret_generations() {
+    let s = setup();
+    let mut profile = json(&s.f.profile(), 16384).unwrap();
+    profile["session"] =
+        json!({"session_id":"old-callback-session-secret","adapter_version":"test"});
+    fs::write(s.f.profile(), serde_json::to_vec(&profile).unwrap()).unwrap();
+    let mut fake = Fake {
+        replies: VecDeque::from([output("{}".into(), true)]),
+        calls: vec![],
+    };
+    let out = process::execute(
+        &mut fake,
+        &s.f,
+        &s.f.sdk,
+        vec!["connect".into(), s.f.profile().display().to_string()],
+        5,
+        &s.case,
+        "callback-secret",
+        &mut |_| {
+            Err(
+                "witness rejected old-callback-session-secret freshly-created-session-do-not-log"
+                    .into(),
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        out.callback_error.as_deref(),
+        Some("witness rejected [REDACTED] [REDACTED]")
+    );
+    let status = json(&s.case.join("callback-secret.status.json"), 65536).unwrap();
+    assert_eq!(
+        status["callback_error"],
+        "witness rejected [REDACTED] [REDACTED]"
+    );
+    assert!(!out.success);
 }
 
 #[test]

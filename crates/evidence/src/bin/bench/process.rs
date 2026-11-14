@@ -15,6 +15,7 @@ pub struct Output {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+    pub callback_error: Option<String>,
 }
 pub trait Runner {
     fn ca(&mut self, _: Option<&Path>) {}
@@ -117,6 +118,7 @@ impl Runner for SystemRunner {
         let mut timed_out = false;
         let mut interrupted = false;
         let mut failed = false;
+        let mut callback_error = None;
         let mut status = None;
         loop {
             if take_interrupt() {
@@ -143,8 +145,12 @@ impl Runner for SystemRunner {
                         while let Some(n) = pending.iter().position(|b| *b == b'\n') {
                             let line: Vec<_> = pending.drain(..=n).collect();
                             if let Ok(value) = serde_json::from_slice(&line)
-                                && on_line(&value).is_err()
+                                && let Err(error) = on_line(&value)
                             {
+                                if callback_error.is_none() {
+                                    callback_error =
+                                        Some(error.to_string().chars().take(1024).collect());
+                                }
                                 failed = true;
                                 let _ = child.kill();
                                 break;
@@ -187,8 +193,11 @@ impl Runner for SystemRunner {
             && !failed
             && !timed_out
             && let Ok(value) = serde_json::from_slice(&pending)
-            && on_line(&value).is_err()
+            && let Err(error) = on_line(&value)
         {
+            if callback_error.is_none() {
+                callback_error = Some(error.to_string().chars().take(1024).collect());
+            }
             failed = true;
         }
         Ok(Output {
@@ -199,6 +208,7 @@ impl Runner for SystemRunner {
             stdout: secrets.scrub(&stdout),
             stderr: secrets.scrub(&stderr),
             timed_out,
+            callback_error,
         })
     }
 }
@@ -236,6 +246,12 @@ pub fn execute(
     }
     out.stdout = secrets.scrub(&out.stdout);
     out.stderr = secrets.scrub(&out.stderr);
+    out.callback_error = out.callback_error.map(|error| {
+        String::from_utf8_lossy(&secrets.scrub(error.as_bytes()))
+            .chars()
+            .take(1024)
+            .collect()
+    });
     let mut stdout = create(&case.join(format!("{label}.stdout")))?;
     stdout.write_all(&out.stdout)?;
     stdout.sync_all()?;
@@ -244,7 +260,7 @@ pub fn execute(
     stderr.sync_all()?;
     save(
         &case.join(format!("{label}.status.json")),
-        &json!({"started_utc_ms":started,"finished_utc_ms":utc_ms()?,"success":out.success,"exit_code":out.exit_code,"signal":out.signal,"interrupted":out.interrupted,"timed_out":out.timed_out,"stdout_sha256":sha256(&out.stdout),"stderr_sha256":sha256(&out.stderr),"argv_retained":false}),
+        &json!({"started_utc_ms":started,"finished_utc_ms":utc_ms()?,"success":out.success,"exit_code":out.exit_code,"signal":out.signal,"interrupted":out.interrupted,"timed_out":out.timed_out,"callback_error":out.callback_error,"stdout_sha256":sha256(&out.stdout),"stderr_sha256":sha256(&out.stderr),"argv_retained":false}),
     )?;
     Ok(out)
 }

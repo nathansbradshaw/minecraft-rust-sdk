@@ -8,6 +8,9 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "linux")]
+#[path = "runtime_check/process.rs"]
+mod process_witness;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::other(message)
@@ -84,6 +87,23 @@ fn check(state: &Path) -> io::Result<()> {
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "process-witness" {
+        #[cfg(target_os = "linux")]
+        let result = process_witness::inspect(Path::new(&args[1]));
+        #[cfg(not(target_os = "linux"))]
+        let result: io::Result<serde_json::Value> = Err(invalid("process witness requires Linux"));
+        match result {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"format":"minecraft-runtime-process-witness-v1","complete":false,"error":error.to_string()})
+                );
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.len() != 1 {
         eprintln!("Usage: mc-sdk-runtime-check PRIVATE_STATE_DIR");
         std::process::exit(2);
