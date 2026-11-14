@@ -13,6 +13,7 @@ mod cleanup;
 mod closure;
 mod config;
 mod io;
+mod prepare;
 mod process;
 mod rcon;
 mod remote;
@@ -37,6 +38,9 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             libc::SIGTERM,
             interrupt_signal as *const () as libc::sighandler_t,
         );
+    }
+    if args.first().is_some_and(|a| a == "prepare") {
+        return prepare::run(&args);
     }
     if args.first().is_some_and(|a| a == "rcon-list") {
         ensure(
