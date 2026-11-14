@@ -99,7 +99,7 @@ fn oversized_rows_are_sized_before_fetch_and_explicitly_omitted_without_blocking
         page["data_complete"], false,
         "explicit omission is not complete data"
     );
-    assert!(serde_json::to_vec(&page).unwrap().len() + 1 <= 4096);
+    assert!(serde_json::to_vec(&page).unwrap().len() < 4096);
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn encoded_byte_bounds_and_partial_pages_never_skip_unreturned_rows() {
     let mut ids = Vec::new();
     for _ in 0..3 {
         let page = read(&path, cursor, 32, 4096).unwrap();
-        assert!(serde_json::to_vec(&page).unwrap().len() + 1 <= 4096);
+        assert!(serde_json::to_vec(&page).unwrap().len() < 4096);
         ids.extend(
             page["rows"]
                 .as_array()

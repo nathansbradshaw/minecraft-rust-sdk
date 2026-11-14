@@ -165,7 +165,7 @@ fn snapshot(tx: &Transaction<'_>, after: i64, limit: usize, max_bytes: usize) ->
         "scope":"Committed local journal snapshot; historical data, no game or model connection",
         "limits":{"rows":limit,"bytes":max_bytes},"native_connections_opened":0,"models_called":0});
     ensure(
-        serde_json::to_vec(&page)?.len() + 1 <= max_bytes,
+        serde_json::to_vec(&page)?.len() < max_bytes,
         "Diagnostic output exceeds byte limit",
     )?;
     Ok(page)
