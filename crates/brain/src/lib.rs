@@ -7,6 +7,7 @@ pub mod body;
 mod completion;
 pub mod containers;
 pub mod conversation;
+pub mod crafting;
 #[cfg(test)]
 mod development_replay;
 mod diagnostics;
@@ -419,9 +420,19 @@ impl Journal {
         Ok(json!(out))
     }
     fn activity(&self, choice: &model::Choice, result: &Value) -> Result<()> {
-        if !["sdk", "write", "edit", "terminal", "run", "navigate"].contains(&choice.tool.as_str())
+        if ![
+            "sdk",
+            "write",
+            "edit",
+            "terminal",
+            "run",
+            "navigate",
+            "craft_once",
+        ]
+        .contains(&choice.tool.as_str())
             || tool_failed(result)
             || navigation::scheduling_preempted(result)
+            || crafting::scheduling_preempted(result)
         {
             return Ok(());
         }
@@ -447,11 +458,13 @@ impl Journal {
         source: &str,
         goal_revision: &str,
     ) -> Result<bool> {
-        if choice.tool == "navigate" && navigation::scheduling_preempted(result) {
+        if navigation::scheduling_preempted(result) || crafting::scheduling_preempted(result) {
             return Ok(false);
         }
         let navigation = choice.tool == "navigate" && result["navigation"].is_object();
+        let crafting = choice.tool == "craft_once" && result["crafting"].is_object();
         if !navigation
+            && !crafting
             && (!["terminal", "run"].contains(&choice.tool.as_str())
                 || (choice.tool != "run"
                     && !choice.experiment
@@ -1535,7 +1548,9 @@ impl Brain {
             }
             let goal_changed = self.goal != requested_goal
                 || self.journal.get("goal_revision")?.unwrap_or_default() != requested_revision;
-            let paused = result.as_ref().is_ok_and(navigation::scheduling_preempted);
+            let paused = result.as_ref().is_ok_and(|value| {
+                navigation::scheduling_preempted(value) || crafting::scheduling_preempted(value)
+            });
             let mut executed = result
                 .as_ref()
                 .is_ok_and(|r| progress::executed(&choice.tool, r, &source_before, &source_after));
@@ -1981,7 +1996,7 @@ fn shrink_value(value: &mut Value) {
     }
 }
 fn tool_failed(v: &Value) -> bool {
-    if navigation::scheduling_preempted(v) {
+    if navigation::scheduling_preempted(v) || crafting::scheduling_preempted(v) {
         return false;
     }
     (v["success"] == false && !navigation::resumable_slice(v))
