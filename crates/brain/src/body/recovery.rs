@@ -25,25 +25,53 @@ fn basis(o: &Observation) -> String {
     )
 }
 
-/// A definite native refusal invalidates geometric guesses for this scene.
+fn life_scope(o: &Observation) -> Option<String> {
+    for value in [
+        &o.player["uuid"],
+        &o.player["life_id"],
+        &o.player["dimension"],
+        &o.world["sample_clock"]["epoch"],
+    ] {
+        value.as_str().filter(|s| !s.is_empty())?;
+    }
+    o.player["entity_id"].as_i64()?;
+    Some(crate::digest(
+        json!({"actor":o.player["uuid"],"life":o.player["life_id"],
+        "entity":o.player["entity_id"],"dimension":o.player["dimension"],
+        "clock":o.world["sample_clock"]["epoch"]})
+        .to_string()
+        .as_bytes(),
+    ))
+}
+/// A definite native refusal invalidates geometric guesses for this escape
+/// episode. A short successful fallback or changed pose is not evidence that
+/// the approximate planner can now handle the terrain. Discovery still binds
+/// every returned option to its own fresh pose/physics/scene, independently.
 /// Uncertainty never authorizes a retry or retires the original durable ID.
 #[derive(Default)]
 pub(super) struct Required {
-    rejected_basis: Option<String>,
+    rejected: bool,
+    scope: Option<String>,
 }
 impl Required {
     pub fn for_threat(&mut self, o: &Observation, threatened: bool, water_emergency: bool) -> bool {
-        self.active(o) && threatened && !water_emergency && o.player["on_ground"] == true
+        self.active(o) && threatened && !water_emergency
     }
     pub fn active(&mut self, o: &Observation) -> bool {
-        if self
-            .rejected_basis
-            .as_ref()
-            .is_some_and(|old| old != &basis(o))
-        {
-            self.rejected_basis = None;
+        if let Some(scope) = life_scope(o) {
+            if self.scope.as_ref().is_some_and(|old| old != &scope) {
+                self.episode_ended();
+            } else if self.rejected {
+                self.scope = Some(scope);
+            }
         }
-        self.rejected_basis.is_some()
+        // Missing identity facts cannot refund a refusal or authorize a
+        // heuristic mutation. The authenticated discovery path must settle it.
+        self.rejected
+    }
+    pub fn episode_ended(&mut self) {
+        self.rejected = false;
+        self.scope = None;
     }
     pub fn movement_rejected(&mut self, o: &Observation, receipt: &minecraft_sdk::Receipt) {
         if receipt.outcome == minecraft_sdk::Outcome::Rejected
@@ -53,7 +81,8 @@ impl Required {
                 .as_ref()
                 .is_some_and(|e| e.code == minecraft_sdk::ErrorCode::UnsupportedCapability)
         {
-            self.rejected_basis = Some(basis(o));
+            self.rejected = true;
+            self.scope = life_scope(o);
         }
     }
 }
@@ -345,7 +374,7 @@ impl Discovery {
 mod tests {
     use super::*;
     #[test]
-    fn only_definite_typed_rejection_requires_native_and_every_basis_change_retires_it() {
+    fn only_definite_typed_rejection_requires_native_until_life_or_episode_changes() {
         let o = observation();
         let receipt = |outcome, code, id: &str| minecraft_sdk::Receipt {
             action_id: id.into(),
@@ -397,12 +426,31 @@ mod tests {
         for (pointer, value) in [
             ("/player/uuid", json!("other")),
             ("/player/life_id", json!("new-life")),
+            ("/player/entity_id", json!(2)),
             ("/player/dimension", json!("minecraft:the_nether")),
+            ("/world/sample_clock/epoch", json!("other-clock")),
+        ] {
+            let mut required = Required::default();
+            required.movement_rejected(&o, &refusal);
+            assert!(required.active(&o));
+            let mut value_o = serde_json::to_value(&o).unwrap();
+            *value_o.pointer_mut(pointer).unwrap() = value;
+            let changed = serde_json::from_value(value_o).unwrap();
+            assert!(!required.active(&changed), "{pointer}");
+        }
+        for (pointer, value) in [
             ("/player/yaw", json!(90.)),
             ("/player/physics", json!({"changed":true})),
             ("/player/sprinting", json!(true)),
             ("/player/position", json!([1.5, 1., 0.5])),
+            ("/player/on_ground", json!(false)),
+            ("/player/velocity", json!([0., -0.3, 0.])),
             ("/world/blocks", json!([{"changed":true}])),
+            ("/world/entities", json!([])),
+            (
+                "/world/entities",
+                json!([{"uuid":"different-shooter","visible":true,"hostile":true,"position":[2.5,1.,0.5]}]),
+            ),
         ] {
             let mut required = Required::default();
             required.movement_rejected(&o, &refusal);
@@ -411,12 +459,76 @@ mod tests {
             let (parent, key) = pointer.rsplit_once('/').unwrap();
             value_o.pointer_mut(parent).unwrap()[key] = value;
             let changed = serde_json::from_value(value_o).unwrap();
-            assert!(!required.active(&changed), "{pointer}");
+            assert!(required.for_threat(&changed, true, false), "{pointer}");
         }
+        assert!(!unrelated.for_threat(&o, false, false));
+        assert!(
+            unrelated.for_threat(&o, true, false),
+            "a transient quiet frame does not end the existing escape episode"
+        );
+        let mut unknown = o.clone();
+        unknown.player.as_object_mut().unwrap().remove("life_id");
+        assert!(
+            unrelated.active(&unknown),
+            "missing scope facts cannot refund the constraint"
+        );
+        let mut unbound = Required::default();
+        unbound.movement_rejected(&unknown, &refusal);
+        assert!(unbound.active(&unknown));
+        assert!(
+            unbound.active(&o),
+            "first typed player scope binds an unbound refusal without refunding it"
+        );
+        unrelated.episode_ended();
+        assert!(
+            !unrelated.active(&o),
+            "the controller's actual safe handoff ends this episode"
+        );
+    }
+    #[test]
+    fn f11_small_fallbacks_do_not_refund_the_native_requirement_for_any_refused_family() {
+        // F11 exposed retries after short fallbacks, elevation changes and
+        // airborne observations. All poses here are synthetic; this checks
+        // episode admission, not captured terrain or native trajectory effects.
+        let mut o = observation();
+        let refusal = minecraft_sdk::Receipt {
+            action_id: "f11-original-refused-intention".into(),
+            outcome: minecraft_sdk::Outcome::Rejected,
+            adapter_version: "fixture".into(),
+            evidence: Value::Null,
+            error: Some(minecraft_sdk::ApiError::new(
+                minecraft_sdk::ErrorCode::UnsupportedCapability,
+                "No supported held-input trajectory",
+            )),
+        };
+        let mut required = Required::default();
+        for (index, position) in [
+            [0.5, 1., 0.5],
+            [-0.5, 1., -0.5],
+            [-1.5, 0.5, 0.5],
+            [-2.5, 0., 0.5],
+            [0.5, 0., 1.5],
+            [1.5, 0., 0.5],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            o.player["position"] = json!(position);
+            o.player["on_ground"] = json!(index != 2);
+            o.world["game_time"] = json!(index * 20);
+            if index == 0 {
+                required.movement_rejected(&o, &refusal);
+            }
+            assert!(
+                required.for_threat(&o, true, false),
+                "fallback/frame{index} cannot restore geometric authority"
+            );
+        }
+        assert_eq!(refusal.action_id, "f11-original-refused-intention");
     }
     fn observation() -> Observation {
         serde_json::from_value(json!({"revision":"fixture","player":{
-            "uuid":"own","entity_id":1,"dimension":"minecraft:overworld",
+            "uuid":"own","life_id":"life1","entity_id":1,"dimension":"minecraft:overworld",
             "position":[0.5,1.,0.5],"health":20.,"on_ground":true},
             "world":{"game_time":0,"sample_clock":{"epoch":"clock"},"blocks":[],
                 "entities":[{"visible":true,"hostile":true,"position":[4.5,1.,0.5]}]},"menu":null}))
@@ -428,6 +540,125 @@ mod tests {
             "options":[{"target":[-0.5,2.,0.5],"jump":true,"duration_ticks":16,
                 "max_ticks":100,"touched_blocks":["minecraft:stone","minecraft:air"]}],
             "complete":true,"next_offset":null})
+    }
+    #[tokio::test]
+    async fn f11_episode_keeps_constraint_but_requeries_native_options_for_the_new_pose() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(
+            Client::with_profile(&minecraft_sdk::Profile {
+                endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+                instance_id: "fixture".into(),
+                credential: minecraft_sdk::Credential {
+                    bot_id: "own".into(),
+                    player_uuid: "own".into(),
+                    key: "fixture".into(),
+                },
+                session: None,
+            })
+            .unwrap()
+            .without_local_arbiter(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(socket.read_u8().await.unwrap());
+                assert!(headers.len() < 8192);
+            }
+            let headers = std::str::from_utf8(&headers).unwrap();
+            assert!(
+                headers.starts_with("POST /v1/bots/own/observations/query "),
+                "no mutation/replay"
+            );
+            let size = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(size < 16384);
+            let mut bytes = vec![0; size];
+            socket.read_exact(&mut bytes).await.unwrap();
+            let query: ObservationQuery = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(query.capability, "minecraft:movement_options");
+            assert_eq!(query.input, json!({"offset":0,"limit":8}));
+            let mut fresh = page();
+            fresh["scene"] = json!("new-current-pose");
+            fresh["origin"]["position"] = json!([1.5, 1., 0.5]);
+            fresh["options"][0]["target"] = json!([2.5, 1., 0.5]);
+            fresh["options"][0]["jump"] = json!(false);
+            let body = fresh.to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), listener.accept())
+                    .await
+                    .is_err(),
+                "one fresh prefix, no full paging or mutation retry"
+            );
+        });
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&root.path().join("body.sqlite")).unwrap();
+        let mut o = observation();
+        let mut required = Required::default();
+        required.movement_rejected(
+            &o,
+            &minecraft_sdk::Receipt {
+                action_id: "original-refusal".into(),
+                outcome: minecraft_sdk::Outcome::Rejected,
+                adapter_version: "fixture".into(),
+                evidence: Value::Null,
+                error: Some(minecraft_sdk::ApiError::new(
+                    minecraft_sdk::ErrorCode::UnsupportedCapability,
+                    "native refusal",
+                )),
+            },
+        );
+        let mut discovery = Discovery::default();
+        discovery.basis = basis(&o);
+        discovery.accept(page(), &o, 3.5).unwrap();
+        assert_eq!(discovery.routes[0].target, [-0.5, 2., 0.5]);
+        o.player["position"] = json!([1.5, 1., 0.5]);
+        let options = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                assert!(
+                    required.for_threat(&o, true, false),
+                    "a fallback cannot restore guesses"
+                );
+                let options = discovery
+                    .tick(client.clone(), &o, true, true, 3.5, &journal)
+                    .await
+                    .unwrap();
+                assert!(
+                    options.iter().all(|r| r.target != [-0.5, 2., 0.5]),
+                    "old pose options are never reused"
+                );
+                if !options.is_empty() {
+                    break options;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].target, [2.5, 1., 0.5]);
+        assert!(
+            required.active(&o),
+            "obtaining a fresh prefix does not refund the episode"
+        );
+        server.await.unwrap();
     }
     #[test]
     fn busy_escape_preview_preserves_discovery_and_retries_without_a_pose_change() {
