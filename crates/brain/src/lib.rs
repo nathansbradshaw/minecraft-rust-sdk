@@ -467,6 +467,17 @@ impl Journal {
                 }
                 bound_value(result, 4096);
             }
+            // Backend attempt telemetry is operator evidence, not new input to
+            // the reasoner. Preserve it in the journal; omit only this clone.
+            if let Some(usage) = data.get_mut("usage").and_then(Value::as_object_mut) {
+                for key in [
+                    "backend_request_id",
+                    "backend_timing",
+                    "backend_total_duration_ns",
+                ] {
+                    usage.remove(key);
+                }
+            }
             out.push(json!({"kind":r.get::<_,String>(0)?,"data":data}));
         }
         out.reverse();
