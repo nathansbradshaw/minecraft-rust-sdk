@@ -1,11 +1,14 @@
 use crate::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1/provider-investigation-v1/canonical-menu-questions-v1/opt-in-acquisition-v1";
+pub(crate) const REQUEST_CONTRACT: &str = "allocated-model-work-purpose-v2/verified-gameplay-repair-v1/navigation-coding-checkpoint-v1/active-program-source-v1/provider-investigation-v1/canonical-menu-questions-v1/opt-in-acquisition-v1/serialized-wire-budget-v1";
 mod active_source;
 mod context_attestation;
 pub(crate) mod provider_investigation;
 mod repair;
+mod wire;
+#[cfg(test)]
+mod wire_tests;
 /// Inspect a source-bound coding repair without inference, execution or writes.
 pub fn compiler_repair_preview(context: &Value) -> Value {
     let mut preview = context.clone();
@@ -25,11 +28,14 @@ struct HttpFailure {
     status: u16,
     class: String,
     retry_at: Option<i64>,
+    wire: Option<Value>,
+    transport_attempts: u8,
 }
 #[derive(Debug)]
 struct TransportFailure {
     attempts: u8,
     kind: &'static str,
+    wire: Option<Value>,
 }
 impl std::fmt::Display for TransportFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,7 +78,56 @@ fn http_failure(status: u16, envelope: &Value, now: i64) -> HttpFailure {
         status,
         class,
         retry_at,
+        wire: None,
+        transport_attempts: 1,
     }
+}
+/// Bounded transport/fit metadata, never response bodies or prompt content.
+pub fn failure_metadata(error: &(dyn std::error::Error + Send + Sync + 'static)) -> Value {
+    if let Some(error) = error.downcast_ref::<HttpFailure>() {
+        return error.wire.clone().unwrap_or(Value::Null);
+    }
+    if let Some(error) = error.downcast_ref::<TransportFailure>() {
+        return error.wire.clone().unwrap_or(Value::Null);
+    }
+    error
+        .downcast_ref::<wire::Unfit>()
+        .map(|e| e.0.clone())
+        .unwrap_or(Value::Null)
+}
+
+fn choice_context(
+    context: &Value,
+    development: bool,
+) -> Result<(Value, Value, Option<repair::Transition>, bool)> {
+    let repair = repair::Transition::from_context(context);
+    let development = development || repair.is_some();
+    let mut context = context.clone();
+    let mut format = session_schema(development);
+    if let Some(repair) = &repair {
+        repair.prepare(&mut context, &mut format);
+        crate::fit_context(&mut context)?;
+    }
+    active_source::prepare(&mut context, development);
+    navigation_schema(&context, &mut format);
+    Ok((context, format, repair, development))
+}
+/// Offline production-request sizing and attestation; never prints content,
+/// executes a tool, connects a player or submits inference.
+pub fn request_wire_preview(context: &Value, use_sol: bool, development: bool) -> Result<Value> {
+    let (context, format, _, development) = choice_context(context, development)?;
+    let contract = wire::Contract {
+        model: if use_sol { "gpt-6.1-sol" } else { "gpt-6-luna" },
+        purpose: if development { "develop" } else { "plan" },
+        format: &format,
+        prompt: include_str!("system.md"),
+        tokens: 4096,
+    };
+    let prepared = contract.prepare(&context, wire::MAX_BYTES)?;
+    Ok(json!({"request_wire":prepared.metadata,
+        "context_attestation":context_attestation::summarize(&prepared.context,&crate::digest(prepared.context.to_string().as_bytes())),
+        "models_called":0,"native_mutations":0,"tools_executed":0,
+        "scope":"Offline actual serializer and final fitted context metadata; no prompt/context payload or native-effect claim."}))
 }
 /// Only an explicit, bounded daily-reset or pacing timestamp permits a retry.
 /// Authentication/schema/queue/provider failures still require investigation.
@@ -252,18 +307,7 @@ impl Model {
         use_sol: bool,
         development: bool,
     ) -> Result<(Choice, Value)> {
-        let repair = repair::Transition::from_context(context);
-        let development = development || repair.is_some();
-        let mut context = context.clone();
-        let mut format = session_schema(development);
-        if let Some(repair) = &repair {
-            repair.prepare(&mut context, &mut format);
-            crate::fit_context(&mut context)?;
-        }
-        active_source::prepare(&mut context, development);
-        // Suppress only the unavailable navigation command, not reasoning or
-        // code work. A body that remains urgent must not freeze the reasoner.
-        navigation_schema(&context, &mut format);
+        let (context, format, repair, development) = choice_context(context, development)?;
         let model = if use_sol { "gpt-6.1-sol" } else { "gpt-6-luna" };
         let (content, mut usage) = self
             .request(
@@ -318,30 +362,98 @@ impl Model {
         prompt: &str,
         tokens: u32,
     ) -> Result<(String, Value)> {
-        let serialized_context = serde_json::to_string(context)?;
-        ensure(
-            serialized_context.len() <= 32768,
-            "Model context exceeds its declared budget",
-        )?;
-        let context_sha256 = crate::digest(serialized_context.as_bytes());
-        let attestation = context_attestation::summarize(context, &context_sha256);
-        let body = json!({"model":model,"stream":false,"purpose":purpose,"options":{"num_predict":tokens},"format":format,"messages":[{"role":"system","content":prompt},{"role":"user","content":serialized_context}]});
+        let contract = wire::Contract {
+            model,
+            purpose,
+            format: &format,
+            prompt,
+            tokens,
+        };
+        let mut prepared = contract.prepare(context, wire::MAX_BYTES)?;
         let started = std::time::Instant::now();
-        let (envelope, response_bytes, attempts) = self.request_transport(&body).await?;
+        let mut payload_repair = Value::Null;
+        let (envelope, response_bytes, attempts) = match self
+            .request_transport(&prepared.bytes)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(mut error) => {
+                let Some(failure) = error
+                    .downcast_ref::<HttpFailure>()
+                    .filter(|e| e.status == 413)
+                else {
+                    return Err(error);
+                };
+                let initial_attempts = failure.transport_attempts;
+                payload_repair = json!({"original_failure":{"status":failure.status,"class":failure.class},
+                    "original_request":prepared.metadata,"max_changed_repairs":1,
+                    "repair_attempted":false,"allowances_changed":false,"gameplay_replayed":false,
+                    "failed_attempt_admissions":"unknown; broker ledger authoritative"});
+                let smaller =
+                    contract.prepare(&prepared.context, prepared.bytes.len().saturating_sub(1));
+                let next = match smaller {
+                    Ok(next)
+                        if next.bytes.len() < prepared.bytes.len()
+                            && next.bytes != prepared.bytes =>
+                    {
+                        next
+                    }
+                    _ => {
+                        payload_repair["reason"] =
+                            json!("No strictly smaller contract-preserving request available");
+                        error.downcast_mut::<HttpFailure>().unwrap().wire = Some(payload_repair);
+                        return Err(error);
+                    }
+                };
+                payload_repair["repair_attempted"] = json!(true);
+                payload_repair["changed_request"] = next.metadata.clone();
+                payload_repair["protected_context_unchanged"] = json!(
+                    prepared.metadata["protected_context_sha256"]
+                        == next.metadata["protected_context_sha256"]
+                );
+                {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "{}",
+                        json!({"event":"model_payload_repair","metadata":payload_repair})
+                    );
+                }
+                prepared = next;
+                match self.request_transport(&prepared.bytes).await {
+                    Ok((reply, bytes, attempts)) => (reply, bytes, initial_attempts + attempts),
+                    Err(mut error) => {
+                        payload_repair["changed_repair_exhausted"] = json!(true);
+                        if let Some(failure) = error.downcast_mut::<HttpFailure>() {
+                            failure.wire = Some(payload_repair);
+                        } else if let Some(failure) = error.downcast_mut::<TransportFailure>() {
+                            failure.wire = Some(payload_repair);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let context_sha256 = crate::digest(prepared.context.to_string().as_bytes());
+        let attestation = context_attestation::summarize(&prepared.context, &context_sha256);
         ensure(envelope["done"] == true, "Incomplete model response")?;
         let content = envelope["message"]["content"]
             .as_str()
             .ok_or("Model content missing")?;
         Ok((
             content.to_owned(),
-            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium"|"high")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":context_sha256,"context_attestation":attestation,"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
+            json!({"model":model,"purpose":purpose,"provider_model":envelope["provider_model"].as_str().filter(|s|s.len()<=64 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b"-_.".contains(&b))),"provider_reasoning_effort":envelope["reasoning_effort"].as_str().filter(|s|matches!(*s,"low"|"medium"|"high")),"provider_usage":{"input_tokens":envelope["usage"]["input_tokens"].as_u64(),"cached_input_tokens":envelope["usage"]["cached_input_tokens"].as_u64(),"output_tokens":envelope["usage"]["output_tokens"].as_u64()},"elapsed_ms":started.elapsed().as_millis(),"response_bytes":response_bytes,"prompt_sha256":crate::digest(prompt.as_bytes()),"context_sha256":context_sha256,"context_attestation":attestation,"request_wire":prepared.metadata,"payload_repair":payload_repair,"transport_attempts":attempts,"failed_attempt_admissions":"unknown; broker ledger remains authoritative","host_tools_executed":false}),
         ))
     }
-    async fn request_transport(&self, body: &Value) -> Result<(Value, usize, u8)> {
+    async fn request_transport(&self, body: &[u8]) -> Result<(Value, usize, u8)> {
         for attempt in 1..=2u8 {
             match self.request_once(body).await {
                 Ok((value, bytes)) => return Ok((value, bytes, attempt)),
-                Err(error) => {
+                Err(mut error) => {
+                    if let Some(failure) = error.downcast_mut::<HttpFailure>() {
+                        failure.transport_attempts = attempt;
+                        return Err(error);
+                    }
                     let Some(transport) = error.downcast_ref::<reqwest::Error>() else {
                         return Err(error);
                     };
@@ -359,6 +471,7 @@ impl Model {
                         return Err(Box::new(TransportFailure {
                             attempts: attempt,
                             kind,
+                            wire: None,
                         }));
                     }
                     // Inference returns data only. No SDK mutation is retried.
@@ -373,15 +486,40 @@ impl Model {
         }
         unreachable!()
     }
-    async fn request_once(&self, body: &Value) -> Result<(Value, usize)> {
-        let mut response = self.http.post(&self.endpoint).json(body).send().await?;
+    async fn request_once(&self, body: &[u8]) -> Result<(Value, usize)> {
+        // Submit the exact bytes measured above, rather than serialize a second time.
+        let mut response = self
+            .http
+            .post(&self.endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
+            .send()
+            .await?;
         let status = response.status().as_u16();
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            ensure(
-                bytes.len() + chunk.len() <= 32768,
-                "Model response exceeds budget",
-            )?;
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(error) if status == 200 => return Err(error.into()),
+                Err(_) => {
+                    return Err(Box::new(http_failure(
+                        status,
+                        &json!({"error":"error_response_incomplete"}),
+                        crate::now(),
+                    )));
+                }
+            };
+            if bytes.len() + chunk.len() > 32768 {
+                if status != 200 {
+                    return Err(Box::new(http_failure(
+                        status,
+                        &json!({"error":"error_response_exceeds_budget"}),
+                        crate::now(),
+                    )));
+                }
+                return Err("Model response exceeds budget".into());
+            }
             bytes.extend(chunk);
         }
         let envelope = response_envelope(status, &bytes)?;

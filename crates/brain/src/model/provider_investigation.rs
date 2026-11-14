@@ -389,6 +389,8 @@ mod tests {
             status,
             class: class.into(),
             retry_at: None,
+            wire: None,
+            transport_attempts: 1,
         }
     }
     #[test]
