@@ -1,6 +1,7 @@
 # Run one frozen acquisition arm
 
-Source preparation only: the acquisition path is not yet built or verified.
+Offline lifecycle tests cover clean exit, fatal output, timeout and changed
+container generation using simulated tools. Live acquisition validation is pending.
 Keep the existing120-second skeleton fixture unchanged. This separate operator
 mode runs the pinned, unmodified Brain entry point without a forced NPC or
 supplied solution code.
