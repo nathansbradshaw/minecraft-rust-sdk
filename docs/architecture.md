@@ -318,6 +318,18 @@ defense continue independently. Close threats, incoming projectiles, active
 fuses, fire and water emergencies retain the fast policy. A quiet stalled body
 can briefly hold its completed input while a prediction arrives.
 
+After a definite native trajectory refusal, movement instead requires fresh
+native options for that escape episode; hazards do not authorize another blind
+geometric guess. A ready page with zero usable options may follow its advancing
+cursor while incomplete, up to four ready pages of eight requested candidates
+per physical search. Reads retain 500 ms spacing, the 750 ms deadline and one
+busy-readiness retry. Continuations require the exact first origin, scene and
+pinned target; they stop at the first usable options, complete result, malformed
+or stale page, or exhausted budget. The existing single changed-threat hint
+refresh cannot refund these read budgets. Observations and independent defense
+continue, but an empty bounded search does not establish a safe escape or
+guarantee protection while another read is pending.
+
 Predictions are fenced by actor life, dimension, native clock, pose and terrain.
 One already-selected cover path may finish a remaining finite leg when first
 occlusion interrupts it and its owned preceding control is natively `Observed`,

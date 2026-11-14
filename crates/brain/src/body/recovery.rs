@@ -167,7 +167,10 @@ pub(super) struct Discovery {
     prefix_busy_retries: u8,
     preference: Option<[f64; 3]>,
     preference_refreshed: bool,
+    ready_pages: u8,
+    page_origin: Option<[f64; 3]>,
 }
+const MAX_PREFIX_READY_PAGES: u8 = 4;
 impl Default for Discovery {
     fn default() -> Self {
         Self {
@@ -182,6 +185,8 @@ impl Default for Discovery {
             prefix_busy_retries: 0,
             preference: None,
             preference_refreshed: false,
+            ready_pages: 0,
+            page_origin: None,
         }
     }
 }
@@ -207,6 +212,8 @@ impl Discovery {
         self.prefix_busy_retries = 0;
         self.preference = None;
         self.preference_refreshed = false;
+        self.ready_pages = 0;
+        self.page_origin = None;
         // Keep the request spacing even across movement/scene changes.
     }
     fn update_basis(&mut self, o: &Observation, first_prefix_only: bool, axis: f64) {
@@ -229,6 +236,7 @@ impl Discovery {
             && self.done
             && self.task.is_none()
             && !self.preference_refreshed
+            && self.ready_pages < MAX_PREFIX_READY_PAGES
             && self
                 .preference
                 .is_some_and(|p| geometry::toward_close_threat(o, p))
@@ -240,7 +248,13 @@ impl Discovery {
                 // reset or a new mutation allowance. In-flight/busy reads keep
                 // their exact target; request spacing survives this reset.
                 let basis = self.basis.clone();
+                let ready_pages = self.ready_pages;
+                let busy_retries = self.prefix_busy_retries;
                 self.reset(basis);
+                // A changed hint on this same physical basis does not refund
+                // the bounded read or readiness investigation allowances.
+                self.ready_pages = ready_pages;
+                self.prefix_busy_retries = busy_retries;
                 self.preference = next;
                 self.preference_refreshed = true;
             }
@@ -266,7 +280,13 @@ impl Discovery {
         if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
             let task = self.task.take().unwrap();
             let result = match task.await {
-                Ok(Ok(value)) => self.accept(value, o, axis),
+                Ok(Ok(value)) => {
+                    if first_prefix_only {
+                        self.accept_prefix(value, o, axis)
+                    } else {
+                        self.accept(value, o, axis)
+                    }
+                }
                 Ok(Err(error)) => Err(error.into()),
                 Err(error) => Err(error.to_string().into()),
             };
@@ -279,13 +299,24 @@ impl Discovery {
                 j.event("body_native_escape_options",json!({"scene":self.scene,
                     "next_offset":self.offset,"complete":self.done,"options":self.routes.len(),
                     "origin":o.player["position"],"revision":o.revision,
+                    "ready_pages":self.ready_pages,"ready_page_limit":MAX_PREFIX_READY_PAGES,
                     "scope":"Adapter predictions; native action admission and observed effect still required"}))?;
             }
             if first_prefix_only {
                 // Busy is readiness, not an empty completed prefix. Honor its
-                // existing bounded retry hint once for this exact basis; never
-                // page a ready response or repeatedly poll unchanged failures.
-                if self.received.is_some() || self.done || self.prefix_busy_retries >= 1 {
+                // existing bounded retry hint once. A ready EMPTY prefix with
+                // an advancing cursor is not proof that no route exists.
+                if self.received.is_some() {
+                    self.done |=
+                        !self.routes.is_empty() || self.ready_pages >= MAX_PREFIX_READY_PAGES;
+                    if !self.done {
+                        j.event("body_native_escape_empty_prefix_continues",json!({
+                            "next_offset":self.offset,"ready_pages":self.ready_pages,
+                            "ready_page_limit":MAX_PREFIX_READY_PAGES,"scene":self.scene,
+                            "origin":self.page_origin,"target":self.preference,
+                            "scope":"Bounded read-only continuation; no heuristic mutation or safety claim"}))?;
+                    }
+                } else if self.done || self.prefix_busy_retries >= 1 {
                     self.done = true;
                 } else {
                     self.prefix_busy_retries += 1;
@@ -330,6 +361,44 @@ impl Discovery {
             }));
         }
         Ok(self.routes.clone())
+    }
+    fn accept_prefix(&mut self, value: Value, o: &Observation, axis: f64) -> Result<()> {
+        let ready = value["origin"].is_object();
+        let origin = geometry::point(&value["origin"]["position"]);
+        if ready {
+            ensure(
+                self.ready_pages < MAX_PREFIX_READY_PAGES,
+                "Native prefix read budget exhausted",
+            )?;
+            ensure(
+                value["options"].as_array().is_some_and(|v| v.len() <= 8),
+                "Native prefix exceeded requested page limit",
+            )?;
+            ensure(
+                value["complete"] != true || value["next_offset"].is_null(),
+                "Complete native prefix has a continuation cursor",
+            )?;
+            if value["complete"] == false {
+                ensure(
+                    value["next_offset"]
+                        .as_u64()
+                        .is_some_and(|next| next <= (self.offset + 8) as u64),
+                    "Native prefix cursor exceeded requested evaluation budget",
+                )?;
+            }
+            if let Some(scene) = &self.scene {
+                ensure(
+                    value["scene"].as_str() == Some(scene.as_str()) && origin == self.page_origin,
+                    "Native prefix scene or exact origin changed across continuation",
+                )?;
+            }
+        }
+        self.accept(value, o, axis)?;
+        if ready && self.received.is_some() {
+            self.ready_pages += 1;
+            self.page_origin = origin;
+        }
+        Ok(())
     }
     fn accept(&mut self, value: Value, o: &Observation, axis: f64) -> Result<()> {
         let page: Page = serde_json::from_value(value)?;
@@ -745,6 +814,179 @@ mod tests {
             "options":[{"target":[-0.5,2.,0.5],"jump":true,"duration_ticks":16,
                 "max_ticks":100,"touched_blocks":["minecraft:stone","minecraft:air"]}],
             "complete":true,"next_offset":null})
+    }
+    fn empty_page(offset: usize) -> Value {
+        let mut p = page();
+        p["options"] = json!([]);
+        p["complete"] = json!(false);
+        p["next_offset"] = json!(offset + 2);
+        p
+    }
+    #[test]
+    fn empty_prefix_requires_exact_cursor_scene_origin_and_finite_read_budget() {
+        let o = observation();
+        for change in [
+            "no_progress",
+            "skip",
+            "scene",
+            "origin",
+            "complete_cursor",
+            "stale_pose",
+            "too_many",
+        ] {
+            let mut d = Discovery::default();
+            d.accept_prefix(empty_page(0), &o, 3.5).unwrap();
+            let mut next = empty_page(2);
+            let mut current = o.clone();
+            match change {
+                "no_progress" => next["next_offset"] = json!(2),
+                "skip" => next["next_offset"] = json!(11),
+                "scene" => next["scene"] = json!("different-scene"),
+                "origin" => next["origin"]["position"] = json!([0.501, 1., 0.5]),
+                "complete_cursor" => next["complete"] = json!(true),
+                "stale_pose" => current.player["position"] = json!([1.5, 1., 0.5]),
+                "too_many" => next["options"] = json!(vec![page()["options"][0].clone(); 9]),
+                _ => unreachable!(),
+            }
+            assert!(d.accept_prefix(next, &current, 3.5).is_err(), "{change}");
+            assert!(
+                d.routes.is_empty(),
+                "{change}: no stale or malformed route authority"
+            );
+        }
+        let mut d = Discovery::default();
+        for offset in [0, 2, 4, 6] {
+            d.accept_prefix(empty_page(offset), &o, 3.5).unwrap();
+        }
+        assert_eq!(d.ready_pages, MAX_PREFIX_READY_PAGES);
+        assert!(d.accept_prefix(empty_page(8), &o, 3.5).is_err());
+        assert_eq!(d.offset, 8);
+    }
+    #[test]
+    fn filtered_unusable_routes_continue_but_hint_refresh_cannot_refund_page_or_busy_budget() {
+        let mut o = preference_floor();
+        let mut d = Discovery::default();
+        d.update_basis(&o, true, 3.5);
+        let old_hint = d.preference.unwrap();
+        let mut unusable = empty_page(0);
+        unusable["options"] = page()["options"].clone();
+        unusable["options"][0]["touched_blocks"] = json!(["minecraft:lava"]);
+        d.accept_prefix(unusable, &o, 3.5).unwrap();
+        assert!(d.routes.is_empty());
+        assert_eq!(d.ready_pages, 1);
+        d.done = true;
+        d.prefix_busy_retries = 1;
+        o.world["entities"][0]["position"] = json!([old_hint[0], 1., old_hint[2]]);
+        d.update_basis(&o, true, 3.5);
+        assert!(
+            d.preference_refreshed,
+            "existing close-threat hint change should rearm once"
+        );
+        assert_eq!(d.ready_pages, 1);
+        assert_eq!(d.prefix_busy_retries, 1);
+        d.ready_pages = MAX_PREFIX_READY_PAGES;
+        d.done = true;
+        d.preference_refreshed = false;
+        let before = d.preference;
+        if let Some(hint) = before {
+            o.world["entities"][0]["position"] = json!([hint[0], 1., hint[2]]);
+        }
+        d.update_basis(&o, true, 3.5);
+        assert!(d.done && !d.preference_refreshed);
+        assert_eq!(
+            d.preference, before,
+            "cap cannot be refunded by another threat hint"
+        );
+    }
+    #[tokio::test]
+    async fn native_empty_prefix_search_stops_after_four_pages_without_polling_or_mutation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(
+            Client::with_profile(&minecraft_sdk::Profile {
+                endpoint: format!("http://{}/", listener.local_addr().unwrap()),
+                instance_id: "fixture".into(),
+                credential: minecraft_sdk::Credential {
+                    bot_id: "own".into(),
+                    player_uuid: "own".into(),
+                    key: "fixture".into(),
+                },
+                session: None,
+            })
+            .unwrap()
+            .without_local_arbiter(),
+        );
+        let mut server = tokio::spawn(async move {
+            for offset in [0, 2, 4, 6] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    assert!(bytes.len() < 8192);
+                }
+                let header = String::from_utf8(bytes).unwrap();
+                assert!(
+                    header.starts_with("POST /v1/bots/own/observations/query "),
+                    "read only"
+                );
+                let size = header
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                assert!(size < 8192);
+                let mut bytes = vec![0; size];
+                socket.read_exact(&mut bytes).await.unwrap();
+                let query: ObservationQuery = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(query.input, json!({"offset":offset,"limit":8}));
+                let body = empty_page(offset).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "no fifth page or mutation"
+            );
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("body.sqlite")).unwrap();
+        let mut d = Discovery::default();
+        let o = observation();
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                assert!(
+                    d.tick(client.clone(), &o, true, true, 3.5, &journal)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                if d.done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            for _ in 0..3 {
+                assert!(
+                    d.tick(client.clone(), &o, true, true, 3.5, &journal)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        })
+        .await;
+        let joined = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+        if joined.is_err() {
+            server.abort();
+        }
+        joined.expect("bounded prefix fixture").unwrap();
+        result.unwrap();
+        assert_eq!(d.ready_pages, 4);
+        assert!(d.task.is_none());
     }
     #[tokio::test]
     async fn f11_episode_keeps_constraint_but_requeries_native_options_for_the_new_pose() {
