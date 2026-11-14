@@ -16,6 +16,7 @@ pub mod feedback;
 mod gameplay_failure;
 mod goal_plan;
 mod handoff;
+pub mod journal_diagnostic;
 pub mod lua;
 pub mod memory;
 mod menu_evidence;

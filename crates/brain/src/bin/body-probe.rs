@@ -12,6 +12,11 @@ mod shore_probe;
 use probe_workload::Mode;
 #[tokio::main]
 async fn main() -> Result<()> {
+    let diagnostic_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(page) = minecraft_sdk_brain::journal_diagnostic::cli(&diagnostic_args)? {
+        println!("{page}");
+        return Ok(());
+    }
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() == 2 && args[0] == "navigation-worker" {
         return minecraft_sdk_brain::navigation::worker(Path::new(&args[1])).await;
