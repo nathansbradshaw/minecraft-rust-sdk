@@ -307,7 +307,7 @@ Missing or mismatched proof stays incomplete; the disconnect is not replayed.
 These separate snapshots provide no continuous admission fence or survival credit.
 
 Freeze the completion condition together with the task goal. A pure Lua helper
-pressure case must explicitly use and check `completion_inventory: []`; a kit
+pressure case must explicitly use and check `completion_inventory: {}`; a kit
 acquisition case must declare its required items. An inherited kit goal can keep
 a successfully run helper working beyond its intended completion. Never rewrite
 an already-run fixture or turn that observation into survival credit.
